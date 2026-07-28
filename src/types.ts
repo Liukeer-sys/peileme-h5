@@ -1,0 +1,23 @@
+﻿export type Answers = {
+  city?: string;
+  customCity?: string;
+  startDate?: string;
+  startDateParsed?: string;
+  startMonth?: string;
+  endDate?: string;
+  endDateParsed?: string;
+  endMonth?: string;
+  workSchedule?: string;
+  avgMonthlySalary?: number;
+  avgMonthlySalaryText?: string;
+  takeHomeSalary?: number;
+  bonusInfo?: string;
+  bonusLevel?: string;
+  terminationReason?: string;
+  terminationReasonType?: string;
+  terminationReasonText?: string;
+  postExitWish?: string;
+  hasWrittenNotice?: boolean;
+  hasAgreement?: boolean;
+  followUps: Record<string, string>;
+};

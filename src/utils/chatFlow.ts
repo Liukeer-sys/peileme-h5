@@ -1,0 +1,534 @@
+﻿import { baseQuestions } from "../data/questions";
+import { terminationTypes } from "../data/terminationTypes";
+import type { Answers } from "../types";
+
+export type ToneMode = "roast";
+
+type ParsedDate = {
+  raw: string;
+  month?: string;
+  uncertain?: boolean;
+};
+
+export const getNextQuestion = (stepIndex: number) => baseQuestions[stepIndex]?.message;
+
+const padMonth = (month: number) => String(Math.min(Math.max(month, 1), 12)).padStart(2, "0");
+
+export const parseLooseMonth = (value: string, now = new Date()): ParsedDate => {
+  const raw = value.trim();
+  if (!raw) return { raw, uncertain: true };
+  if (/还没|未定|不确定|没定|不知道|待定/.test(raw)) return { raw, uncertain: true };
+
+  const numeric = raw.match(/(20\d{2}|19\d{2})\s*[年.\/-]?\s*(1[0-2]|0?[1-9])?/);
+  if (numeric) {
+    const year = Number(numeric[1]);
+    const month = numeric[2] ? Number(numeric[2]) : 1;
+    return { raw, month: `${year}-${padMonth(month)}`, uncertain: !numeric[2] };
+  }
+
+  const yearOnly = raw.match(/(20\d{2}|19\d{2})/);
+  if (yearOnly) return { raw, month: `${Number(yearOnly[1])}-01`, uncertain: true };
+
+  const relativeYearMap: Record<string, number> = { 一: 1, 两: 2, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
+  const relative = raw.match(/(\d+|一|两|二|三|四|五|六|七|八|九|十)\s*年前/);
+  if (relative) {
+    const years = Number(relative[1]) || relativeYearMap[relative[1]] || 0;
+    return { raw, month: `${now.getFullYear() - years}-${padMonth(now.getMonth() + 1)}`, uncertain: true };
+  }
+
+  return { raw, uncertain: true };
+};
+
+export const parseMoneyAmount = (value: string) => {
+  const normalized = value.replace(/[,，\s]/g, "");
+  const match = normalized.match(/(\d+(?:\.\d+)?)(万|w|W|k|K)?/);
+  if (!match) return undefined;
+  const base = Number(match[1]);
+  if (!Number.isFinite(base)) return undefined;
+  const unit = match[2];
+  if (unit === "万" || unit === "w" || unit === "W") return Math.round(base * 10000);
+  if (unit === "k" || unit === "K") return Math.round(base * 1000);
+  return Math.round(base);
+};
+
+export const inferBonusLevel = (value: string, monthlySalary?: number) => {
+  if (/没有年终奖|没有|无/.test(value) || /^0(?:\.0+)?(?:元|块|个月|月)?$/.test(value.trim())) return "没有";
+  if (/不固定[，,]?但发得还算多/.test(value)) return "2个月工资左右";
+  if (/不固定[，,]?偶尔有一点|说不清|还没发|不固定|不清楚|说不准|不知道/.test(value)) return "不固定 / 说不准";
+  const amount = parseMoneyAmount(value);
+  if (amount && monthlySalary) {
+    const months = amount / monthlySalary;
+    if (months >= 2.5) return "3个月以上";
+    if (months >= 1.5) return "2个月工资左右";
+    if (months >= 0.5) return "1个月工资左右";
+  }
+  if (/3个月工资及以上|3|三/.test(value)) return "3个月以上";
+  if (/2|两|二/.test(value)) return "2个月工资左右";
+  if (/1|一/.test(value)) return "1个月工资左右";
+  return "不固定 / 说不准";
+};
+
+export const findTerminationTypeByAnswer = (value: string) => {
+  const direct = terminationTypes.find((item) => item.label === value);
+  if (direct) return direct;
+  if (/裁员|业务|部门|优化|调整/.test(value)) return terminationTypes.find((item) => item.id === "layoff")!;
+  if (/不胜任|绩效|pip|考核/.test(value.toLowerCase())) return terminationTypes.find((item) => item.id === "performance")!;
+  if (/违纪|制度|处分|开除/.test(value)) return terminationTypes.find((item) => item.id === "discipline")!;
+  if (/合同.*到期|不续签/.test(value)) return terminationTypes.find((item) => item.id === "contractEnd")!;
+  if (/试用期/.test(value)) return terminationTypes.find((item) => item.id === "probation")!;
+  if (/主动辞职|自己提|辞职申请/.test(value)) return terminationTypes.find((item) => item.id === "resignation")!;
+  if (/协商解除|解除协议|协议/.test(value)) return terminationTypes.find((item) => item.id === "mutual")!;
+  if (/口头|没说|不清楚/.test(value)) return terminationTypes.find((item) => item.id === "unclear")!;
+  return terminationTypes.find((item) => item.id === "other")!;
+};
+
+export const inferWrittenNotice = (value: string) => {
+  if (/没有书面|没书面|口头|只是说|电话/.test(value)) return false;
+  if (/书面|通知书|邮件|邮件通知|盖章|文件|聊天记录|微信|钉钉|飞书/.test(value)) return true;
+  return undefined;
+};
+
+export const inferAgreement = (value: string) => {
+  if (/没有协议|没协议|没让签/.test(value)) return false;
+  if (/协议|协商解除|补偿确认|离职申请|主动离职单|签字|签署/.test(value)) return true;
+  return undefined;
+};
+
+export const isDetailedTerminationDescription = (value: string) =>
+  value.length >= 18 || inferWrittenNotice(value) !== undefined || inferAgreement(value) !== undefined;
+
+const pick = (_seedText: string, copies: string[]) => copies[Math.floor(Math.random() * copies.length)];
+
+const parseMonthIndex = (value?: string) => {
+  if (!value) return undefined;
+  const [year, month] = value.split("-").map(Number);
+  if (!year || !month) return undefined;
+  return year * 12 + month - 1;
+};
+
+const getServiceMonths = (answers: Answers) => {
+  const start = parseMonthIndex(answers.startDateParsed || answers.startMonth);
+  const end = parseMonthIndex(answers.endDateParsed || answers.endMonth);
+  if (start === undefined || end === undefined) return undefined;
+  return end - start;
+};
+
+export const hasServiceDateConflict = (answers: Answers) => {
+  const months = getServiceMonths(answers);
+  return months !== undefined && months < 0;
+};
+
+const formatServiceDuration = (months: number) => {
+  const safeMonths = Math.max(0, months);
+  return `${Math.floor(safeMonths / 12)} 年 ${safeMonths % 12} 个月`;
+};
+
+const serviceDurationRoasts: Record<string, string[]> = {
+  under1: [
+    "工位还没坐热，公司先把人送走，招聘是办快闪活动吗。",
+    "这还没入戏呢，公司就开始放片尾字幕了。",
+    "这时间短得像试吃，公司还真把员工当免费样品。"
+  ],
+  m1to3: [
+    "刚摸清厕所在哪就要走，公司这体验卡到期得挺快。",
+    "三个月不到就翻脸，公司选人眼光和甩锅速度倒是都很稳定。",
+    "干了几个月就说不要，公司招聘的时候眼睛是外包的吗。",
+    "连公司八卦都没听全，就先听到自己要走，剧情推进挺赶。",
+    "入职材料可能还没归档，离职剧本已经写好了，公司效率蛮高的。"
+  ],
+  m3to6: [
+    "还没满半年就动手，公司算盘打得比绩效复盘还勤。",
+    "干了几个月才发现不合适，公司这反射弧能绕公司三圈。",
+    "这时间点很有味道，像 HR 一边说遗憾，一边盯着补偿线。",
+    "半年不到就清人，公司像是在拿员工做 A/B 测试。",
+    "你刚把流程摸顺，公司就把你从流程里删了。",
+    "这波不叫优化，叫公司用完新手保护期就开始翻脸。",
+    "几个月的活是真干了，走的时候公司倒想装成“没发生过”。",
+    "还没满半年就开始散伙，公司这算盘声已经不需要字幕了。"
+  ],
+  around6: [
+    "半年这个点动人，公司多少有点财务部写剧本的意思。",
+    "这时间挑得很精致，像是蹲在日历旁边精打细算出来的。",
+    "刚过半年的边儿，公司就开始抖机灵，真把劳动法当闯关游戏了。",
+    "半年附近下手，HR 的话术可能是软的，算盘一定是硬的。",
+    "刚到这个坎就变脸，公司这不是管理，是卡尺量人。"
+  ],
+  m6to12: [
+    "快一年了才说不合适，之前几个月公司是在闭眼管理吗。",
+    "这段时间最适合公司装糊涂：活让你干了，钱想少给点。",
+    "干了快一年还想轻飘飘带过，公司脸皮厚得很有复合材料感。",
+    "一年快到了才开始嫌弃，公司是突然恢复视力了吗。",
+    "快一年了才发现问题，说明问题可能不在你，在公司脑子开机太慢。",
+    "这时候让人走，像极了用到快该付钱了开始装坏。",
+    "活没少安排，关系不想承认，公司做人挺会省流量。",
+    "快一年了，公司才想起“合不合适”，这管理水平像靠星座排班。"
+  ],
+  around12: [
+    "卡一年边上动你，公司这时间点挑得很有财务审美。",
+    "一年这个坎很敏感，公司要是说巧合，那巧得挺不要脸。",
+    "刚到一年就开始变天，公司这天气预报像法务和财务一起写的。",
+    "一年整附近下手，算盘珠子已经崩到脸上了。",
+    "这不是离职时间，这是公司精算过的翻脸时间。",
+    "一年这个点很妙，妙得让人想查查是谁在背后按计算器。",
+    "公司要是说临时决定，日历可能第一个不同意。",
+    "刚到一年就准备送走，公司真是把时间管理用在了最恶心的地方。"
+  ],
+  y1to2: [
+    "干了一年多，活没少干，走的时候公司倒想按路人处理。",
+    "一年多的时间，公司用得挺顺手，扔得也挺顺手。",
+    "这工龄已经不是“刚来不合适”能糊弄过去的了，公司最好别装傻。",
+    "一年多了才说不要，公司这不是磨合失败，是脸皮成功。",
+    "人都用熟了，现在开始装陌生，公司是有选择性失忆吧。",
+    "一年多的工作不是空气，公司别想用一句调整直接吹散。",
+    "这时间不长不短，刚好够公司把人榨熟再甩锅。",
+    "干了一年多还被轻描淡写，公司这“体面”大概只体面给自己看。"
+  ],
+  y2to3: [
+    "两三年都熬过来了，公司现在开始演“我们只是短暂相识”。",
+    "这个年限已经能写进履历了，公司还想按临时关系处理，挺敢想。",
+    "两三年不是试用装，公司别把人用成老员工，赔的时候装新朋友。",
+    "这几年活是真干了，公司要是想轻轻揭过，那脸皮是真厚。",
+    "两三年够养熟一个岗位，也够看清一家公司有多抠。",
+    "用了这么久，现在说不要，公司这售后态度比盗版软件还差。",
+    "这年限已经不是小打小闹，公司想省钱的意图也不用藏了。",
+    "两三年青春交进去，公司出来一句调整，真会拿人当耗材。"
+  ],
+  y3to5: [
+    "三五年都交出去了，公司现在想装不熟，脸皮也是企业资产。",
+    "这个年限不算短了，公司要是还想一句“调整”带过，多少有点不要脸。",
+    "人都用熟了，现在想低成本丢掉，公司可真会过日子。",
+    "三五年够见证公司几轮画饼，最后连饼渣都想不给。",
+    "这年限一摆，公司还想省赔偿，算盘已经不是响，是扰民。",
+    "几年干下来，公司嘴上说感谢，手上在打折。"
+  ],
+  y5to8: [
+    "五年以上了还想轻轻放下，公司这是把人当办公椅，用旧了就扔。",
+    "五年起步，别听 HR 讲情怀，情怀不能抵赔偿。",
+    "这个工龄已经不是“小调整”，是公司准备从你身上省一笔大的。",
+    "五六七年都扛下来了，公司现在想便宜处理，梦做得挺完整。",
+    "用了这么多年，走的时候还想压价，公司真是抠得有耐心。",
+    "五年以上还被一句话打发，公司这不是优化，是人情和钱一起赖。",
+    "这工龄放在这儿，公司再装糊涂就有点侮辱日历了。",
+    "几年青春喂进去，公司吐出来一句“调整”，嘴真省事。"
+  ],
+  y8to10: [
+    "快十年了还这么处理，公司不是在裁人，是在考验自己的底线。",
+    "八九年不是一段工作，是半本人生账本，公司别想撕页。",
+    "快十年了，公司还想轻描淡写，脸皮厚度已经接近建筑材料。",
+    "这个年限一出来，HR 再讲漂亮话都像在给算盘镀金。",
+    "用了快十年，走的时候还想省，公司是把员工当长期订阅服务了。",
+    "八九年都耗进去了，公司要是还想低成本收尾，那不是抠，是坏。",
+    "快十年的人都能被随手处理，公司企业文化大概叫“用完即忘”。",
+    "这工龄已经有分量了，公司还想装没看见，眼神挺会挑时候坏。"
+  ],
+  y10plus: [
+    "十年以上青春喂进去，出来时还想便宜打包，公司挺敢做梦。",
+    "十年起步还被这么处理，公司这是把人当旧设备折旧完了。",
+    "十年以上不是履历，是人生切片，公司别想用一句优化切没。",
+    "这工龄拿出来，公司要是还想压价，那不是算盘，是铁锤。",
+    "十年都给了，公司最后给你来个“感谢付出”，谢谢它的废话文学。",
+    "十年以上还想便宜送走，公司是怎么做到既抠又自信的。",
+    "这已经不是离职，是公司把长期贡献当库存清理。",
+    "十年工龄摆在这儿，公司再装体面，就有点侮辱“体面”两个字。"
+  ]
+};
+
+const serviceDateConflictReplies = [
+  "这个时间线有点穿越，公司再离谱应该也没离谱到发明时光裁员。入职或离职时间可能填反了，帮我重新确认一下？",
+  "这个日期看起来不太对，离职时间早于入职时间了。公司可以乱来，时间线先别乱。",
+  "这里像是填反了，先把入职和离职时间重新确认一下，别让公司还没出手，咱们自己先把账算歪。",
+  "这个时间线有 bug，先别急着骂公司，咱先把日期捋顺，不然赔偿都不好算。"
+];
+
+const getServiceDurationBucket = (months: number) => {
+  if (months < 1) return "under1";
+  if (months < 3) return "m1to3";
+  if (months < 6) return "m3to6";
+  if (months === 6) return "around6";
+  if (months < 12) return "m6to12";
+  if (months === 12) return "around12";
+  if (months < 24) return "y1to2";
+  if (months < 36) return "y2to3";
+  if (months < 60) return "y3to5";
+  if (months < 96) return "y5to8";
+  if (months < 120) return "y8to10";
+  return "y10plus";
+};
+
+const getServiceDurationReply = (seed: string, answers: Answers) => {
+  const months = getServiceMonths(answers);
+  if (months === undefined) return "时间先记下了。月份如果只是大概也没关系，后面可以再校准。";
+  if (months < 0) return pick(seed, serviceDateConflictReplies);
+
+  const summary = `你在这家公司大概待了 ${formatServiceDuration(months)}。`;
+
+  return `${summary}${pick(seed, serviceDurationRoasts[getServiceDurationBucket(months)])}`;
+};
+const getRoastReply = (stepId: string, userAnswer: string, parsedData: Answers) => {
+  const city = parsedData.customCity || parsedData.city || userAnswer;
+  const salary = parsedData.avgMonthlySalary || parsedData.takeHomeSalary;
+  const seed = `${stepId}-${userAnswer}-${city}-${salary || ""}`;
+
+  if (stepId === "city") {
+    const cityReplies: Record<string, string[]> = {
+      上海: [
+        "上海啊，听起来很体面，钱包可能不太体面。",
+        "上海啊，白天给公司打工，晚上给房东上供。",
+        "上海这地方，工资看着高，活着也贵。"
+      ],
+      北京: [
+        "北京啊，通勤都够申请工伤了。",
+        "北京啊，地铁把人挤扁，公司把人榨干。"
+      ],
+      深圳: [
+        "深圳啊，老板画饼都带着融资味。",
+        "深圳啊，机会很多，命也挺费。",
+        "深圳啊，连谈梦想都像要融资。",
+        "深圳啊，公司最爱谈增长，轮到赔钱就开始谈困难。"
+      ],
+      广州: [
+        "广州啊，早茶可以叹，裁员不能随便叹口气就算了。",
+        "广州啊，肠粉都知道要加料，公司赔偿别想只给白粥。"
+      ],
+      杭州: [
+        "杭州啊，风景像天堂，工位像炼丹炉。",
+        "杭州啊，这些互联网公司最会把裁员说成“组织升级”。",
+        "杭州啊，听起来是人间天堂，上班卷得像下了地狱。"
+      ],
+      成都: [
+        "成都啊，生活巴适，公司不一定巴适。",
+        "成都啊，城市节奏慢，公司裁人可一点不慢。",
+        "成都啊，大家都说安逸，结果安逸的是老板，不是你。",
+        "成都啊，生活看起来挺松弛，公司算盘倒是打得很紧绷。",
+        "成都啊，说是来了就不想走，结果公司先想让你走。"
+      ],
+      西安: [
+        "西安啊，十三朝古都，轮到你这第十四朝就是打工人被优化。",
+        "西安啊，那你这时候肯定羡慕兵马俑，他们可有永久坑位。"
+      ],
+      武汉: [
+        "武汉啊，夏天热得要命，HR 的赔偿方案却令人心寒。",
+        "武汉啊，东湖那么大，老板的格局怎么就一小碗热干面。",
+        "武汉啊，热干面至少给芝麻酱，公司画饼连酱都不给。",
+        "武汉啊，九省通衢不是让老板九种理由通通裁你。",
+        "武汉啊，城市火辣辣，公司抠搜搜，打工人夹中间烤得刚刚好。"
+      ]
+    };
+    const otherCityReplies = [
+      `${city}收到，打工人到了哪儿都能被精准消耗，公司真是全国统一考试。`,
+      `行，${city}先记下，接下来看看公司准备怎么把算盘打到你脸上。`,
+      `懂了，${city}也逃不开 HR 全国统一进货的话术。`,
+      `收到，人在${city}，重点是公司别想把你当临期商品处理。`,
+      `行，先定位到${city}，接下来看看这家公司到底想省你多少钱。`
+    ];
+
+    return pick(seed, cityReplies[city] || otherCityReplies);
+  }
+
+  if (stepId === "startDate") {
+    return "好嘞，入职时间小赔记下了。公司通知你什么时候离职呢？选个大概年月就行。";
+  }
+
+  if (stepId === "endDate") {
+    return getServiceDurationReply(seed, parsedData);
+  }
+
+  if (stepId === "workSchedule") {
+    const workScheduleReplies: Record<string, string[]> = {
+      "基本双休，很少加班": [
+        `基本双休，算打工界珍稀动物了。希望公司别拿“我们平时挺人性化”来抵赔偿。`,
+        `双休且少加班，听起来还算做人，但裁人的时候做人不能只做人一半。`,
+        `这作息算正常，可别让公司把“正常上班”包装成额外恩赐。`,
+        `工作时间还算规矩，那接下来就看公司赔钱规不规矩了。`,
+        `没怎么加班是好事，但不代表公司可以少算你一分钱。`
+      ],
+      "双休，但工作日经常晚下班": [
+        `双休写在日历上，工作日晚上的时间却经常被公司顺走。`,
+        `周末倒是完整，周一到周五每天都像加长版。`,
+        `晚饭总在工位解决，加班费最好别只存在想象里。`
+      ],
+      大小周: [
+        `大小周，老板最爱的“周末薛定谔”：有时活着，有时死了。`,
+        `一周双休一周单休，公司嘴上叫安排灵活，身体上叫稳定消耗。`,
+        `大小周，打工人每两周才完整当一次人。`,
+        `公司发明大小周的时候，应该没问过周末本人同不同意。`
+      ],
+      "单休，但每天工时还算正常": [
+        `单休最阴的地方就是：每天不算太狠，但一年下来很会偷命。`,
+        `一周休一天，洗衣服睡个觉，周末就自动蒸发了。`,
+        `公司可能觉得你休一天够了，毕竟牛马不需要太多私人生活。`
+      ],
+      "长期高强度加班（如 996）": [
+        `996 啊，公司是把你当员工，还是当可充电耗材？`,
+        `长期高强度加班，听起来是奋斗，实际像公司把你租成基础设施。`,
+        `996 最恶心的地方是，白天归公司，晚上也归公司，最后身体还得自己修。`,
+        `这个强度下，公司要是还想赔偿打折，脸皮已经不能叫厚，得叫防弹。`,
+        `996 还能被优化，说明公司不是缺人，是缺德。`
+      ],
+      "排班 / 倒班，整体工时还算正常": [
+        `排班本身不等于加班，休息日和总工时才是重点。`,
+        `总工时还算规矩，生物钟每天拿着班表重新做人。`,
+        `别人盼周末，你盼排班表上那几个休字。`,
+        `班表轮着转，工资和赔偿可得稳稳算清楚。`
+      ],
+      "工作时间不固定，经常临时加班": [
+        `不固定加班，就是公司最爱用的“自愿奉献玄学”。`,
+        `工作时间不固定，意思就是公司的事永远急，你的生活永远可以等等。`,
+        `经常临时加班，公司嘴上说辛苦了，工资条上说没这回事。`
+      ]
+    };
+
+    const workScheduleAliases: Record<string, string> = {
+      "基本双休 / 很少加班": "基本双休，很少加班",
+      "996 / 长期高强度加班": "长期高强度加班（如 996）",
+      "长期高强度加班": "长期高强度加班（如 996）",
+      "排班 / 倒班": "排班 / 倒班，整体工时还算正常",
+      "工作时间不固定 / 经常临时加班": "工作时间不固定，经常临时加班"
+    };
+    const workScheduleKey = workScheduleAliases[userAnswer] || userAnswer;
+
+    return pick(seed, workScheduleReplies[workScheduleKey] || workScheduleReplies["工作时间不固定，经常临时加班"]);
+  }
+
+  if (stepId === "avgMonthlySalary") {
+    if (!salary) return "工资口径先按你说的存着。钱可以含糊，赔偿基数最好别含糊。";
+
+    if (["北京", "上海", "广州", "深圳"].includes(city)) {
+      if (salary < 6000) return `这个数在${city}，工资刚到账，房租恐怕要先吞掉大半。`;
+      if (salary < 10000) return `这个数在${city}，活是能活，就是每一笔消费都得细细斟酌。`;
+      if (salary < 15000) return `过万听着不错，但放到${city}，也就是从“活着”升级成“比较努力地活着”。`;
+      if (salary < 25000) return "这个数看着挺体面，但每月一放开消费，钱包立刻开始缩水。";
+      if (salary < 40000) return "可以，这收入真实不错！就是焦虑估计也跟着升舱了。";
+      return "可以，这个数在一线城市算是站稳脚跟了！就是焦虑估计也跟着升舱了。";
+    }
+
+    if (city === "杭州") {
+      if (salary < 5000) return "这个数在杭州，活着不难，活得松弛比较难。";
+      if (salary < 8000) return "这个数在杭州，日常能转，余额不能细看。";
+      if (salary < 12000) return "还行，算是杭州打工人的基础续命包，别太放飞就能撑住。";
+      if (salary < 20000) return "这个数在杭州算有点样子了，但体面的工资下压力恐怕也不小！";
+      if (salary < 30000) return "这个数在杭州已经挺能打了，生活开始有点选择空间。";
+      return "可以，杭州打工人高配版，钱包比普通人硬一点，焦虑也硬一点。";
+    }
+
+    if (["成都", "西安", "武汉"].includes(city)) {
+      if (salary < 4000) return `这个数在${city}，日子恐怕需要精打细算呢，但慢慢来也能过。`;
+      if (salary < 7000) return "这个数属于能过，但不能乱过，一乱花钱余额就开始提醒你。";
+      if (salary < 10000) return "还不错，至少点外卖的时候不用每次都先深呼吸。";
+      if (salary < 15000) return `这个数在${city}算挺能打了，生活开始有点余地。`;
+      if (salary < 20000) return `这个数已经进入${city}薪资体面区，日常开销基本不用太纠结。`;
+      return `可以，已经是${city}高配打工人，生活和选择都更从容一些。`;
+    }
+
+    if (salary < 4000) return `这个数在${city}主打一个朴素，花钱还是得稍微多想一步。`;
+    if (salary < 7000) return "能过，但不敢太会过，生活稍微任性一点就开始反噬。";
+    if (salary < 10000) return "还行，算是从“活着”往“生活”挪了一小步。";
+    if (salary < 15000) return `这个数在${city}挺能打了，至少不是每天都被余额教育。`;
+    if (salary < 20000) return `这个数在${city}已经挺体面了，生活开始有点松弛感。`;
+    return "可以，收入有点东西，日子基本可以按自己想法来过了。";
+  }
+
+  if (stepId === "bonusInfo") {
+    const bonusReplies: Record<string, string[]> = {
+      "没有年终奖": [
+        "没有年终奖，年底总结倒是照写，主打一个精神分红。",
+        "没有年终奖也正常，很多公司擅长把“辛苦了”当货币用。",
+        "年终奖为 0，情绪价值估计也没多给，挺环保。"
+      ],
+      "1个月工资左右": [
+        "一个月工资左右，属于公司还记得你是个人，但记得不多。",
+        "一个月年终奖，意思到了，诚意没完全到。",
+        "这个数比较标准，像公司从抽屉里摸出来的一点良心。",
+        "一个月左右，还行，至少不是纯靠“感谢付出”发电。"
+      ],
+      "2个月工资左右": [
+        "两个月左右，还可以，终于不是“谢谢参与奖”了。",
+        "这个数算有点东西，至少年底那一刻你短暂赢过生活。",
+        "两个月工资，属于公司难得没把良心藏太深。",
+        "这档还算能看，至少不像临时从预算边角料里抠出来的。"
+      ],
+      "3个月工资及以上": [
+        "三个月以上，可以，年终奖开始有点尊严了。",
+        "这个数算不错，难怪平时被压榨时还能幻想一下年底。",
+        "三个月以上，属于年底回血包，不是普通创可贴。",
+        "可以，这奖金至少让人感觉自己不是纯耗材。"
+      ],
+      "不固定，但发得还算多": [
+        "不固定但还算多，懂了，平时靠命硬，年底靠玄学回血。",
+        "这种奖金最会吊人胃口，发的时候像惊喜，不发的时候像失忆。",
+        "不固定但金额还行，属于公司给你画饼，偶尔真掉下来一块。",
+        "这个模式很刺激，钱包和心态一起坐过山车。"
+      ],
+      "不固定，偶尔有一点": [
+        "偶尔有一点，属于年终奖里的蚊子腿，不能说没有，但也别太感动。",
+        "偶尔发一点，主打一个“别说我没给”。",
+        "这个奖金更像气氛组，存在感有，实际作用一般。",
+        "有一点也行，至少不是纯靠老板一句“明年会更好”续命。"
+      ],
+      "说不清 / 还没发": [
+        "说不清就很真实，很多奖金发之前叫激励，发之后叫谜语。",
+        "还没发的话先记着，别让它从奖金变成都市传说。",
+        "说不清正常，奖金这东西在很多公司属于薛定谔收入。",
+        "还没到账就先别替它体面，钱没进卡都只能算故事。",
+        "这个先按不确定记，毕竟公司画过的饼不一定都能吃。"
+      ]
+    };
+
+    return pick(seed, bonusReplies[userAnswer] || bonusReplies["说不清 / 还没发"]);
+  }
+
+  if (stepId === "terminationReason") {
+    if (/主动辞职/.test(userAnswer)) return "让你主动辞职？好家伙，省钱算盘打得我隔着屏幕都听见了。";
+    if (/协商解除/.test(userAnswer)) return "协商解除，翻译一下：公司想优雅地把钱谈少一点。咱们先看纸面。";
+    if (/违纪|违反制度/.test(userAnswer)) return "违纪这顶帽子别急着戴，帽子大不大，得看证据够不够硬。";
+    if (/不胜任/.test(userAnswer)) return "不胜任？公司一句话不能当判决书，PIP 和培训记录先出来走两步。";
+    if (/裁员|业务调整|部门取消/.test(userAnswer)) return "裁员/调整收到。公司战略一拐弯，打工人钱包先系安全带。";
+    if (/合同到期/.test(userAnswer)) return "合同到期不续签，听着平静，实际里面很适合藏小账。";
+    if (/试用期/.test(userAnswer)) return "试用期被辞退也不是免赔金牌，公司别拿试用期当万能橡皮。";
+    if (/口头通知|没说清楚/.test(userAnswer)) return "只口头说？这话轻得像风，咱们得找点能落地的证据。";
+    return "行，你自己描述这类通常最有戏，也最容易藏坑。慢慢说，我接着。";
+  }
+
+  if (stepId === "terminationDetail") {
+    return pick(seed, [
+      "细节记下了。现在不是吵架时间，是把证据装进弹夹的时间。",
+      "好，这些材料线索很有用。公司讲故事，我们看截图。",
+      "收到，先把话术和材料分开放，别让 HR 的语气盖过事实。"
+    ]);
+  }
+
+  if (stepId === "postExitWish") {
+    if (/先吃|大吃特吃/.test(userAnswer)) return "可以，前司画的饼不顶饿，赔偿可得一分不少地算回来。";
+    if (/出门.*痛快/.test(userAnswer)) return "懂了，前司已经散场，你真正想看的好戏才刚开场。";
+    if (/去喝|喝酒|酒吧|庆祝|消愁|fancy.*bar/i.test(userAnswer)) return "这杯敬自由，但协议和收款数字得趁清醒看清楚。";
+    if (/宅家躺.*爽/.test(userAnswer)) return "可以，会议先关掉，剧和游戏打开，赔偿也得一分不少。";
+    if (/消愁/.test(userAnswer)) return "这杯先记公司账上，伤心可以有，签字可不能迷糊。";
+    if (/练出新肉身|健身|暴打/.test(userAnswer)) return "很好，先拿赔偿，再练核心，肉体和钱包都要硬起来。";
+    if (/看看世界|海岛|躺平/.test(userAnswer)) return "远方可以慢慢看，赔偿先别含糊。我们把该拿的算清楚再出发。";
+    if (/自己当老板|创业/.test(userAnswer)) return "老板有眼无珠，不赏识我们没关系，咱们来自己当老板。";
+    if (/给自己.*升级|电脑|磨吧/.test(userAnswer)) return "下一段工作先不急，自己的生活可以先升级。";
+    return "好，这个愿望先记下。接下来给你把离职身价算出来。";
+  }
+
+  return "收到，这条先记进打工人账本。公司可以糊弄，咱们不糊涂。";
+};
+
+export const getReply = (_tone: ToneMode, stepId: string, userAnswer: string, parsedData: Answers) => getRoastReply(stepId, userAnswer, parsedData);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
