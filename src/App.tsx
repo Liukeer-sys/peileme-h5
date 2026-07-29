@@ -129,6 +129,7 @@ export default function App() {
         },
         { id: `q-${baseQuestions[0].id}`, from: "system", text: baseQuestions[0].message, avatarState: xiaoPeiAvatarStateByMessageIntent.question }
       );
+      trackTimer(() => setOptionsPaused(false), MESSAGE_STAGGER_MS * 4);
     }
   }, [restored]);
 
