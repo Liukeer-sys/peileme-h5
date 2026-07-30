@@ -25,8 +25,7 @@ type AccountPanelProps = {
 
 const moduleNames: Record<string, string> = {
   caseLawPack: "案例法条包",
-  evidencePack: "离职证据包",
-  documentReview: "文件签署分析"
+  evidencePack: "离职证据包"
 };
 
 export default function AccountPanel({ open, onClose }: AccountPanelProps) {

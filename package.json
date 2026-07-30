@@ -4,10 +4,14 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "vite --config vite.main.config.ts",
+    "dev:web:ai": "vite --config vite.ai.config.ts",
     "dev:api": "tsx watch server/index.ts",
     "build": "npm run build:web && npm run build:api",
-    "build:web": "tsc && vite build",
+    "build:web:main": "tsc && vite build --config vite.main.config.ts",
+    "build:web:ai": "tsc && vite build --config vite.ai.config.ts",
+    "build:web": "npm run build:web:main && npm run build:web:ai && npm run verify:web:artifacts",
+    "verify:web:artifacts": "tsx scripts/verify-web-artifacts.ts",
     "build:api": "tsc -p server/tsconfig.json && tsc -p tsconfig.scripts.json",
     "start:api": "node server-dist/index.js",
     "db:migrate": "tsx server/migrate.ts",
@@ -20,7 +24,8 @@
     "test:api": "node scripts/run-api-tests.mjs",
     "test:watch": "vitest",
     "test:e2e:production": "playwright test",
-    "preview": "vite preview"
+    "preview": "vite preview --config vite.main.config.ts",
+    "preview:web:ai": "vite preview --config vite.ai.config.ts"
   },
   "dependencies": {
     "@alicloud/pop-core": "^1.8.0",

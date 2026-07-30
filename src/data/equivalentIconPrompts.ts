@@ -5,7 +5,6 @@ const baseStyle =
 
 const categorySubjectMap: Record<string, string> = {
   数码: "精致数码设备小物件，圆润边角，玻璃屏幕轻微高光",
-  AI会员: "抽象 AI 会员卡和发光小星标，科技感但柔和",
   会员: "圆角会员卡和小皇冠，轻微金色高光",
   咖啡: "一杯外带咖啡，奶油色杯套，杯口有轻微热气",
   奶茶: "一杯奶茶，圆润透明杯身，珍珠和吸管",
@@ -30,12 +29,6 @@ const itemSubjectMap: Record<string, string> = {
   "iphone-17-pro-256": "一部无品牌智能手机，深色屏幕，奶油色边框",
   "macbook-pro-14-m4": "一台无品牌轻薄笔记本电脑，半开屏幕",
   "airpods-pro-5": "一副无品牌无线耳机和小充电盒",
-  "chatgpt-pro": "一张 AI Pro 会员卡，旁边有柔和发光星星",
-  "chatgpt-plus": "一张 AI Plus 会员卡，圆角卡片和小光点",
-  "claude-pro": "一张 AI 助手会员卡，抽象对话气泡和星标",
-  "cursor-pro": "一张代码编辑器会员卡，抽象光标和小窗口",
-  "github-copilot": "一张编程助手会员卡，抽象代码符号和小星星",
-  "perplexity-pro": "一张搜索问答会员卡，放大镜和柔和光圈",
   "luckin-99": "一杯 9.9 元工作日外带咖啡，无品牌杯子",
   "manner-latte": "一杯热拿铁，奶油色杯子和细腻热气",
   "starbucks-tall-latte": "一杯无品牌 tall size 拿铁，绿色点缀但无 logo",

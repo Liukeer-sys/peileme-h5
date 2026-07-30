@@ -1,5 +1,7 @@
 node_modules
 dist
+dist-main
+dist-ai
 server-dist
 .git
 .env

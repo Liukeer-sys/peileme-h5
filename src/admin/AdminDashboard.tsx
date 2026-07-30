@@ -133,7 +133,7 @@ export default function AdminDashboard() {
         body: {
           description: inviteDescription || undefined,
           maxUses: Number(inviteUses) || 1,
-          grants: ["caseLawPack", "evidencePack", "documentReview"]
+          grants: ["caseLawPack", "evidencePack"]
         }
       });
       setInviteDescription("");

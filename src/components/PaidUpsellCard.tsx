@@ -3,11 +3,10 @@ import { buildEvidenceChecklist, getEvidenceCompleteness, priorityLabels } from 
 import { getLaborLawArticle, getLaborLawPack, type LaborLawArticle, type LaborLawCitation } from "../data/laborLawReferences";
 import type { Answers } from "../types";
 import type { CalculationResult } from "../utils/calculate";
-import { formatMoney } from "../utils/calculate";
 import { useAuth } from "../auth/AuthContext";
-import { api, ApiError, track } from "../lib/api";
+import { track } from "../lib/api";
 
-type PaidModuleKey = "caseLawPack" | "evidencePack" | "documentReview";
+type PaidModuleKey = "caseLawPack" | "evidencePack";
 type CaseLawSectionKey = "laws";
 
 import type { ReactNode } from 'react';
@@ -43,8 +42,6 @@ type PaidUpsellCardProps = PaidCoreProps & {
   onRequireAuth?: () => void;
   onOpenAccount?: () => void;
 };
-
-const hrOfferTypes = ["给 N", "给 N+1", "给 2N", "只给工资不赔偿", "要求当天签字", "其他条件"];
 
 const caseLawSections: Array<{
   key: CaseLawSectionKey;
@@ -401,19 +398,14 @@ export default function PaidUpsellCard({
   result,
   answers,
   showIntro = true,
-  assessmentId,
   onRequireAuth,
   onOpenAccount
 }: PaidUpsellCardProps) {
   const { user, grants } = useAuth();
-  const [hrOfferType, setHrOfferType] = useState(hrOfferTypes[1]);
-  const [hrOfferAmount, setHrOfferAmount] = useState("");
-  const [uploadedFiles, setUploadedFiles] = useState<string[]>([]);
   const [selectedEvidence, setSelectedEvidence] = useState<Record<string, boolean>>({});
   const [paidModules, setPaidModules] = useState<Record<PaidModuleKey, boolean>>({
     caseLawPack: false,
-    evidencePack: false,
-    documentReview: false
+    evidencePack: false
   });
   const [paywallModule, setPaywallModule] = useState<PaidModuleKey | null>(null);
   const [activeLegalCase, setActiveLegalCase] = useState<ActiveLegalCase | null>(null);
@@ -424,29 +416,9 @@ export default function PaidUpsellCard({
   useEffect(() => {
     setPaidModules({
       caseLawPack: grants.some((grant) => grant.module === "caseLawPack"),
-      evidencePack: grants.some((grant) => grant.module === "evidencePack"),
-      documentReview: grants.some((grant) => grant.module === "documentReview")
+      evidencePack: grants.some((grant) => grant.module === "evidencePack")
     });
   }, [grants]);
-
-  const expectedAmount = Math.round((result.lowAmount + result.highAmount) / 2);
-  const numericOffer = Number(hrOfferAmount || 0);
-  const hrScore = useMemo(() => {
-    if (hrOfferType === "给 2N") return 92;
-    if (hrOfferType === "只给工资不赔偿") return 12;
-    if (hrOfferType === "要求当天签字") return 24;
-    if (numericOffer > 0) return Math.max(8, Math.min(96, Math.round((numericOffer / Math.max(expectedAmount, 1)) * 100)));
-    if (hrOfferType === "给 N+1") return 78;
-    if (hrOfferType === "给 N") return 62;
-    return 42;
-  }, [expectedAmount, hrOfferType, numericOffer]);
-
-  const hrVerdict =
-    hrScore >= 80
-      ? "方案力度还行，但签字前要看有没有放弃追责、保密、竞业和付款时间的坑。"
-      : hrScore >= 50
-        ? "方案有一定力度，但离你理论上应得的金额或安全签署条件还有距离。"
-        : "警报偏高。别被“今天签就打款”带节奏，先看条款，再谈金额。";
 
   const evidenceChecklist = useMemo(() => buildEvidenceChecklist(result, answers), [answers, result]);
   const evidenceCompleteness = getEvidenceCompleteness(evidenceChecklist, selectedEvidence);
@@ -539,38 +511,6 @@ export default function PaidUpsellCard({
       return;
     }
     onOpenAccount?.();
-  };
-
-  const handleFileChange = async (files: FileList | null) => {
-    if (!files?.length) return;
-    if (!user) {
-      onRequireAuth?.();
-      return;
-    }
-    const selected = Array.from(files);
-    const formData = new FormData();
-    selected.forEach((file) => formData.append("files", file));
-    if (assessmentId) formData.append("assessmentId", assessmentId);
-    showToast("正在安全上传…");
-    try {
-      const response = await api<{ files: Array<{ original_name: string }> }>("/api/uploads", {
-        method: "POST",
-        auth: true,
-        body: formData
-      });
-      setUploadedFiles((current) => [
-        ...current,
-        ...response.files.map((file) => file.original_name)
-      ]);
-      showToast("材料已加密通道上传，并保存到你的账号。");
-      track("document_uploaded", {
-        assessmentId,
-        count: response.files.length,
-        types: selected.map((file) => file.type)
-      });
-    } catch (error) {
-      showToast(error instanceof ApiError ? error.message : "上传失败，请稍后重试");
-    }
   };
 
   const toggleEvidence = (item: string) => {
@@ -687,56 +627,8 @@ export default function PaidUpsellCard({
         {!paidModules.evidencePack && <button className="paid-preview-cta" type="button" onClick={() => setPaywallModule("evidencePack")}>解锁完整离职证据包</button>}
       </article>
 
-      <article className={paidModules.documentReview ? "paid-card paid-feature-card lavender active" : "paid-card paid-feature-card paid-preview-card lavender active"}>
-        <div className="compact-conscience-head">
-          <div className="feature-badge">签</div>
-          <div>
-            <p className="paid-module-lead">HR给的文件能不能签？</p>
-            <h2>离职文件签署决策</h2>
-          </div>
-        </div>
-        <p className="compact-conscience-copy">上传解除协议、离职协议或 HR 聊天截图，先看有没有“签了就亏”的风险条款。</p>
-        <div className="inline-fields compact-inline-fields">
-          <select value={hrOfferType} onChange={(event) => setHrOfferType(event.target.value)}>
-            {hrOfferTypes.map((item) => (
-              <option key={item}>{item}</option>
-            ))}
-          </select>
-          <input
-            value={hrOfferAmount}
-            inputMode="numeric"
-            placeholder="HR 报价金额，可不填"
-            onChange={(event) => setHrOfferAmount(event.target.value)}
-          />
-        </div>
-        <div className="score-box conscience-score compact-score-box">
-          <strong>HR 良心指数：{hrScore} / 100</strong>
-          <span>你当前测算中位数：{formatMoney(expectedAmount)}</span>
-          <span>HR 条件：{hrOfferType}{numericOffer > 0 ? `，${formatMoney(numericOffer)}` : ""}</span>
-          <b>{hrVerdict}</b>
-        </div>
-        <label className="upload-box compact-upload">
-          <input type="file" multiple accept="image/*,.pdf" onChange={(event) => void handleFileChange(event.target.files)} />
-          <span>{uploadedFiles.length ? `已选择 ${uploadedFiles.length} 个文件` : "上传 HR 文件 / 截图 / PDF"}</span>
-        </label>
-        {uploadedFiles.length > 0 && (
-          <div className="document-list compact-list">
-            {uploadedFiles.slice(0, 3).map((file) => (
-              <span key={file}>已上传：{file}</span>
-            ))}
-          </div>
-        )}
-        <div className={paidModules.documentReview ? "review-output" : "review-output locked-output"}>
-          <strong>整体结论：不建议直接签</strong>
-          <span>可能涉及放弃追责、确认自愿离职、遗漏奖金和年假折算。</span>
-          <span>建议明确补偿金额、付款时间、社保公积金和工资奖金结清方式。</span>
-          {!paidModules.documentReview && <button type="button" onClick={() => setPaywallModule("documentReview")}>解锁签署风险分析</button>}
-        </div>
-        {!paidModules.documentReview && <button className="paid-preview-cta" type="button" onClick={() => setPaywallModule("documentReview")}>解锁签署风险分析</button>}
-      </article>
-
       <p className="legal-note paid-legal-note">
-        本功能仅提供离职协议风险初步识别和材料整理参考，不构成正式法律意见。重大争议或高金额案件建议咨询专业律师。
+        本功能提供政策测算、法规依据和证据整理参考，不构成正式法律意见。重大争议或高金额案件建议咨询专业律师。
       </p>
 
       {toast && <div className="paid-toast">{toast}</div>}
@@ -745,8 +637,8 @@ export default function PaidUpsellCard({
         <div className="paywall-overlay" role="dialog" aria-modal="true">
           <div className="paywall-modal paid-card">
             <div className="card-label">完整内容权限</div>
-            <h2>{user ? "兑换邀请码解锁" : "登录后解锁完整分析"}</h2>
-            <p>{user ? "在个人中心输入有效邀请码，即可开通案例法条包、证据包和文件签署分析。" : "登录后可保存测算、上传私有材料，并使用邀请码解锁完整内容。"}</p>
+            <h2>{user ? "兑换邀请码解锁" : "登录后解锁完整内容"}</h2>
+            <p>{user ? "在个人中心输入有效邀请码，即可开通案例法条包和证据包。" : "登录后可保存测算，并使用邀请码解锁完整内容。"}</p>
             <button className="primary-button" type="button" onClick={() => unlockModule(paywallModule)}>
               {user ? "前往个人中心兑换" : "登录 / 注册"}
             </button>
@@ -796,7 +688,6 @@ export default function PaidUpsellCard({
     </section>
   );
 }
-
 
 
 

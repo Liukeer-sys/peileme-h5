@@ -19,7 +19,7 @@ export type User = {
 };
 
 type Grant = {
-  module: "caseLawPack" | "evidencePack" | "documentReview";
+  module: string;
   expires_at: string | null;
 };
 
@@ -262,11 +262,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     ]
   );
 
-  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+  return <AuthContext value={value}>{children}</AuthContext>;
 }
 
 export const useAuth = () => {
   const context = useContext(AuthContext);
-  if (!context) throw new Error("useAuth must be used within AuthProvider");
+  if (!context) throw new Error("useAuth requires an auth context");
   return context;
 };
