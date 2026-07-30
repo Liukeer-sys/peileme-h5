@@ -1,10 +1,9 @@
 import bcrypt from "bcryptjs";
-import { spawnSync } from "node:child_process";
-import path from "node:path";
 import request from "supertest";
 import {
   afterAll,
   beforeAll,
+  beforeEach,
   describe,
   expect,
   it
@@ -13,21 +12,9 @@ import { createApp } from "../app.js";
 import { closePool, getPool, query } from "../db.js";
 import { runMigrations } from "../migrate.js";
 import { seedPolicyFoundation } from "../modules/policy/seed.js";
-
-const runImport = (script: string, csv: string) => {
-  const result = spawnSync(
-    path.resolve("node_modules/.bin/tsx"),
-    [path.resolve(script), path.resolve(csv)],
-    {
-      cwd: path.resolve("."),
-      encoding: "utf8",
-      env: process.env
-    }
-  );
-  if (result.status !== 0) {
-    throw new Error(`${script} failed: ${result.stderr || result.stdout}`);
-  }
-};
+import { signAccessToken, type AuthUser } from "../security.js";
+import { importAdministrativeRegions } from "../../scripts/import-administrative-regions.js";
+import { importRegionalParameters } from "../../scripts/import-regional-parameters.js";
 
 const authHeader = (token: string) => ({
   authorization: `Bearer ${token}`
@@ -69,11 +56,14 @@ let adminToken = "";
 let analystToken = "";
 let userToken = "";
 let otherUserToken = "";
-let firstAssessmentId = "";
-let firstOutput: unknown;
+let passwordHash = "";
 
 beforeAll(async () => {
   await runMigrations();
+  passwordHash = await bcrypt.hash("PolicyPass123", 4);
+});
+
+beforeEach(async () => {
   await query(`
     TRUNCATE TABLE
       admin_audit_logs,
@@ -97,12 +87,10 @@ beforeAll(async () => {
     RESTART IDENTITY CASCADE
   `);
 
-  runImport(
-    "scripts/import-administrative-regions.ts",
+  await importAdministrativeRegions(
     "database/seeds/administrative-regions.csv"
   );
-  runImport(
-    "scripts/import-regional-parameters.ts",
+  await importRegionalParameters(
     "database/seeds/regional-parameters.csv"
   );
   await query(
@@ -112,11 +100,10 @@ beforeAll(async () => {
      )
      VALUES (
        '429999', '已撤销测试地区', 'prefecture', '420000', 'retired',
-       '测试区划', 'https://example.test/regions', DATE '2026-01-01'
+       '测试区划', 'https://www.mca.gov.cn/test/regions', DATE '2026-01-01'
      )`
   );
 
-  const passwordHash = await bcrypt.hash("PolicyPass123", 4);
   await query(
     `INSERT INTO users(
        email, display_name, password_hash, role, email_verified_at
@@ -130,18 +117,33 @@ beforeAll(async () => {
   );
   await seedPolicyFoundation();
 
-  const app = createApp();
-  const login = async (identifier: string) =>
-    (
-      await request(app)
-        .post("/api/auth/login")
-        .send({ identifier, password: "PolicyPass123" })
-        .expect(200)
-    ).body.accessToken as string;
-  adminToken = await login("policy-admin@peileme.test");
-  analystToken = await login("policy-analyst@peileme.test");
-  userToken = await login("policy-user@peileme.test");
-  otherUserToken = await login("other-policy-user@peileme.test");
+  const users = await query<{
+    id: string;
+    role: AuthUser["role"];
+    email: string;
+    phone: string | null;
+    display_name: string;
+    status: AuthUser["status"];
+  }>(
+    `SELECT id, role, email, phone, display_name, status
+       FROM users
+      WHERE email LIKE '%@peileme.test'`
+  );
+  const tokenFor = async (email: string) => {
+    const user = users.rows.find((row) => row.email === email)!;
+    return signAccessToken({
+      id: user.id,
+      role: user.role,
+      email: user.email,
+      phone: user.phone,
+      displayName: user.display_name,
+      status: user.status
+    });
+  };
+  adminToken = await tokenFor("policy-admin@peileme.test");
+  analystToken = await tokenFor("policy-analyst@peileme.test");
+  userToken = await tokenFor("policy-user@peileme.test");
+  otherUserToken = await tokenFor("other-policy-user@peileme.test");
 });
 
 afterAll(async () => {
@@ -189,8 +191,7 @@ describe("versioned policy public API", () => {
       .send(calculationBody())
       .expect(201);
 
-    firstAssessmentId = response.body.assessmentId;
-    firstOutput = response.body.result;
+    const assessmentId = response.body.assessmentId;
     expect(response.body).toMatchObject({
       ruleVersion: 1,
       accuracy: "estimated",
@@ -202,7 +203,15 @@ describe("versioned policy public API", () => {
           regionCode: "420000",
           regionName: "湖北省",
           fallback: true,
-          amountFen: 240000
+          amountFen: 240000,
+          parameterType: "minimum_monthly_wage",
+          sourceName:
+            "人力资源社会保障部劳动关系司：全国各省、自治区、直辖市最低工资标准情况（截至2026年1月1日）",
+          sourceUrl:
+            "https://www.mohrss.gov.cn/SYrlzyhshbzb/laodongguanxi_/fwyd/202601/t20260112_565296.html",
+          sourcePublishedAt: "2026-01-12",
+          reviewedBy: null,
+          reviewedAt: null
         },
         employeeAverageMonthlyWage: {
           source: "database",
@@ -211,7 +220,14 @@ describe("versioned policy public API", () => {
           regionCode: "420100",
           regionName: "武汉市",
           fallback: false,
-          amountFen: 940975
+          amountFen: 940975,
+          parameterType: "employee_average_monthly_wage",
+          sourceName: "武汉市统计局：关于2024年劳动工资统计数据的公告",
+          sourceUrl:
+            "https://tjj.wuhan.gov.cn/xwzx/tzgg/202506/t20250620_2598379.shtml",
+          sourcePublishedAt: "2025-06-20",
+          reviewedBy: null,
+          reviewedAt: null
         }
       }
     });
@@ -230,20 +246,21 @@ describe("versioned policy public API", () => {
       output: unknown;
       input_hash: string;
       regional_parameter_ids: string[];
+      parameter_provenance: unknown;
     }>(
       `SELECT a.id AS assessment_id, a.user_id, a.product_channel, a.status,
               a.accuracy_level, prv.version, a.input_snapshot,
               a.result_snapshot, pcs.input, pcs.output, pcs.input_hash,
-              pcs.regional_parameter_ids
+              pcs.regional_parameter_ids, pcs.parameter_provenance
          FROM assessments a
          JOIN policy_rule_versions prv ON prv.id = a.rule_version_id
          JOIN policy_calculation_snapshots pcs ON pcs.assessment_id = a.id
         WHERE a.id = $1`,
-      [firstAssessmentId]
+      [assessmentId]
     );
     expect(stored.rows).toHaveLength(1);
     expect(stored.rows[0]).toMatchObject({
-      assessment_id: firstAssessmentId,
+      assessment_id: assessmentId,
       product_channel: "main",
       status: "completed",
       accuracy_level: "estimated",
@@ -261,6 +278,9 @@ describe("versioned policy public API", () => {
         response.body.parameters.minimumMonthlyWage.parameterId,
         response.body.parameters.employeeAverageMonthlyWage.parameterId
       ].sort()
+    );
+    expect(stored.rows[0].parameter_provenance).toEqual(
+      response.body.parameters
     );
 
     const repeated = await request(createApp())
@@ -357,8 +377,12 @@ describe("versioned policy public API", () => {
       fallback: true,
       amountFen: 238000
     });
-    expect(response.body.parameters.employeeAverageMonthlyWage).toEqual({
+    expect(response.body.parameters.employeeAverageMonthlyWage).toMatchObject({
       source: "manual",
+      parameterType: "employee_average_monthly_wage",
+      regionCode: "130100",
+      regionName: "石家庄市",
+      fallback: false,
       amountFen: 800000
     });
   });
@@ -372,12 +396,12 @@ describe("versioned policy public API", () => {
        VALUES
          (
            '420100', '武汉市', 2026, 'minimum_monthly_wage', 250000,
-           '过期测试来源', 'https://example.test/stale',
+           '过期测试来源', 'https://www.mohrss.gov.cn/test/stale',
            DATE '2026-01-01', 'stale'
          ),
          (
            '130100', '石家庄市', 2026, 'minimum_monthly_wage', 230000,
-           '过期测试来源', 'https://example.test/stale-manual',
+           '过期测试来源', 'https://www.mohrss.gov.cn/test/stale-manual',
            DATE '2026-01-01', 'stale'
          )
        RETURNING id, region_code`
@@ -450,7 +474,7 @@ describe("versioned policy public API", () => {
        )
        VALUES
          ('420100', '武汉市', 2026, 'employee_average_monthly_wage', 999999,
-          '未来平均工资', 'https://example.test/future-average',
+          '未来平均工资', 'https://tjj.wuhan.gov.cn/test/future-average',
           DATE '2026-06-01', 'verified')`
     );
     try {
@@ -702,7 +726,38 @@ describe("versioned policy public API", () => {
     expect(after.rows[0].count).toBe(before.rows[0].count);
   });
 
-  it("paginates owner-only history and hides foreign details behind 404", async () => {
+  it("keeps full parameter provenance immutable in owner-only history", async () => {
+    const first = await request(createApp())
+      .post("/api/policy/calculate")
+      .set(authHeader(userToken))
+      .send(calculationBody())
+      .expect(201);
+    const firstAssessmentId = first.body.assessmentId as string;
+    const firstOutput = first.body.result;
+    const frozenParameters = first.body.parameters;
+
+    await query(
+      `UPDATE regional_parameters
+          SET amount_fen = 999999,
+              source_name = '后续更新的参数来源',
+              source_url = 'https://tjj.wuhan.gov.cn/changed-after-calculation',
+              source_published_at = DATE '2026-07-01',
+              reviewed_at = now()
+        WHERE id = $1`,
+      [frozenParameters.employeeAverageMonthlyWage.parameterId]
+    );
+    await query(
+      `UPDATE assessments
+          SET answers = '{"parameterProvenance":{"tampered":true}}'::jsonb
+        WHERE id = $1`,
+      [firstAssessmentId]
+    );
+    await request(createApp())
+      .post("/api/policy/calculate")
+      .set(authHeader(userToken))
+      .send(calculationBody({ alreadyPaidFen: 200_000 }))
+      .expect(201);
+
     const pageOne = await request(createApp())
       .get("/api/policy/history?page=1&pageSize=1")
       .set(authHeader(userToken))
@@ -724,7 +779,15 @@ describe("versioned policy public API", () => {
       id: firstAssessmentId,
       ruleVersion: 1,
       accuracy: "estimated",
+      parameters: frozenParameters,
       output: firstOutput
+    });
+    expect(detail.body.parameters.employeeAverageMonthlyWage).toMatchObject({
+      amountFen: 940975,
+      sourceName: "武汉市统计局：关于2024年劳动工资统计数据的公告",
+      sourceUrl:
+        "https://tjj.wuhan.gov.cn/xwzx/tzgg/202506/t20250620_2598379.shtml",
+      sourcePublishedAt: "2025-06-20"
     });
     expect(detail.body.input).not.toHaveProperty("clientResult");
 
@@ -871,11 +934,22 @@ describe("policy capability administration", () => {
       .get(path)
       .set(authHeader(adminToken))
       .expect(200);
-    const futureDraft = listed.body.items.find(
-      (item: { effectiveFrom: string; status: string }) =>
-        item.effectiveFrom === "2030-01-01" && item.status === "draft"
-    );
-    expect(futureDraft).toBeTruthy();
+    const historical = await request(createApp())
+      .post("/api/policy/calculate")
+      .set(authHeader(userToken))
+      .send(calculationBody())
+      .expect(201);
+    const futureDraft = (
+      await request(createApp())
+        .post(path)
+        .set(authHeader(adminToken))
+        .send({
+          definition: listed.body.items[0].definition,
+          sourceSnapshot: [{ source: "future publication test" }],
+          effectiveFrom: "2030-01-01"
+        })
+        .expect(201)
+    ).body;
 
     await request(createApp())
       .post(`${path}/${futureDraft.id}/publish`)
@@ -967,12 +1041,12 @@ describe("policy capability administration", () => {
     expect(future.body.ruleVersion).toBe(futureDraft.version);
 
     const oldDetail = await request(createApp())
-      .get(`/api/policy/history/${firstAssessmentId}`)
+      .get(`/api/policy/history/${historical.body.assessmentId}`)
       .set(authHeader(userToken))
       .expect(200);
     expect(oldDetail.body).toMatchObject({
       ruleVersion: 1,
-      output: firstOutput
+      output: historical.body.result
     });
   });
 
@@ -1096,7 +1170,7 @@ describe("policy capability administration", () => {
     });
   });
 
-  it("strictly validates drafts and transactionally upserts reviewed parameters", async () => {
+  it("strictly validates policy rule drafts", async () => {
     const path = "/api/admin/policy/rule-sets/cn-severance/versions";
     const listed = await request(createApp())
       .get(path)
@@ -1115,18 +1189,79 @@ describe("policy capability administration", () => {
         effectiveFrom: "2090-01-01"
       })
       .expect(400);
+  });
+
+  it("requires publish review and trustworthy official evidence for verified parameters", async () => {
+    await query(
+      `INSERT INTO role_capabilities(role, capability)
+       VALUES ('analyst', 'policy.write')
+       ON CONFLICT DO NOTHING`
+    );
+    const base = {
+      regionCode: "420100",
+      year: 2026,
+      parameterType: "minimum_monthly_wage",
+      amountFen: 260000,
+      sourceName: "武汉最低工资官方公告",
+      sourceUrl:
+        "https://rsj.wuhan.gov.cn/zwgk_17/zc/qtzdgkwj/202602/t20260201_000001.shtml",
+      sourcePublishedAt: "2026-02-01"
+    };
+
+    await request(createApp())
+      .put("/api/admin/policy/regional-parameters")
+      .set(authHeader(analystToken))
+      .send({ ...base, status: "draft" })
+      .expect(200);
+    const forbiddenVerification = await request(createApp())
+      .put("/api/admin/policy/regional-parameters")
+      .set(authHeader(analystToken))
+      .send({ ...base, status: "verified" })
+      .expect(403);
+    expect(forbiddenVerification.body.error).toBe("CAPABILITY_REQUIRED");
+
+    for (const invalid of [
+      {
+        ...base,
+        sourceUrl: "https://gov.cn.attacker.example/source",
+        status: "verified"
+      },
+      {
+        ...base,
+        sourceUrl: "http://www.gov.cn/source",
+        status: "verified"
+      },
+      {
+        ...base,
+        sourcePublishedAt: "2099-01-01",
+        status: "verified"
+      },
+      {
+        ...base,
+        year: 2100,
+        sourcePublishedAt: "2026-02-01",
+        status: "verified"
+      },
+      {
+        ...base,
+        year: 2026,
+        sourcePublishedAt: "2025-12-31",
+        status: "verified"
+      }
+    ]) {
+      const rejected = await request(createApp())
+        .put("/api/admin/policy/regional-parameters")
+        .set(authHeader(adminToken))
+        .send(invalid)
+        .expect(400);
+      expect(rejected.body.error).toBe("VALIDATION_ERROR");
+    }
 
     const response = await request(createApp())
       .put("/api/admin/policy/regional-parameters")
       .set(authHeader(adminToken))
       .send({
-        regionCode: "420100",
-        year: 2026,
-        parameterType: "minimum_monthly_wage",
-        amountFen: 260000,
-        sourceName: "武汉最低工资官方公告",
-        sourceUrl: "https://example.test/wuhan-minimum",
-        sourcePublishedAt: "2026-02-01",
+        ...base,
         status: "verified",
         reviewerId: "00000000-0000-0000-0000-000000000000"
       })
@@ -1167,11 +1302,27 @@ describe("policy capability administration", () => {
     expect(exactCalculation.body.parameters.minimumMonthlyWage).toMatchObject({
       source: "database",
       fallback: false,
-      status: "verified"
+      status: "verified",
+      sourceUrl: base.sourceUrl
     });
   });
 
   it("reports active-region coverage with exact, fallback, and manual-needed status", async () => {
+    await request(createApp())
+      .put("/api/admin/policy/regional-parameters")
+      .set(authHeader(adminToken))
+      .send({
+        regionCode: "420100",
+        year: 2026,
+        parameterType: "minimum_monthly_wage",
+        amountFen: 260000,
+        sourceName: "武汉最低工资官方公告",
+        sourceUrl:
+          "https://rsj.wuhan.gov.cn/zwgk_17/zc/qtzdgkwj/202602/t20260201_000001.shtml",
+        sourcePublishedAt: "2026-02-01",
+        status: "verified"
+      })
+      .expect(200);
     const response = await request(createApp())
       .get("/api/admin/policy/coverage?year=2026")
       .set(authHeader(analystToken))
@@ -1199,22 +1350,14 @@ describe("policy capability administration", () => {
     });
   });
 
-  it("recomputes the seed active pointer from the current effective interval", async () => {
-    const promoted = await query<{
+  it("keeps a retired baseline retired when repeated seed recomputes the active pointer", async () => {
+    const baseline = await query<{
       id: string;
+      rule_set_id: string;
+      definition: unknown;
       source_snapshot: unknown;
     }>(
-      `SELECT prv.id, prv.source_snapshot
-         FROM policy_rule_versions prv
-         JOIN policy_rule_sets prs ON prs.id = prv.rule_set_id
-        WHERE prs.code = 'cn-severance'
-          AND prv.status = 'published'
-          AND prv.version > 1
-        ORDER BY prv.effective_from, prv.version
-        LIMIT 1`
-    );
-    const baseline = await query<{ id: string }>(
-      `SELECT prv.id
+      `SELECT prv.id, prv.rule_set_id, prv.definition, prv.source_snapshot
          FROM policy_rule_versions prv
          JOIN policy_rule_sets prs ON prs.id = prv.rule_set_id
         WHERE prs.code = 'cn-severance'
@@ -1222,15 +1365,26 @@ describe("policy capability administration", () => {
     );
     await query(
       `UPDATE policy_rule_versions
-          SET effective_to = current_date - 1
+          SET status = 'retired',
+              effective_to = current_date - 1
         WHERE id = $1`,
       [baseline.rows[0].id]
     );
-    await query(
-      `UPDATE policy_rule_versions
-          SET effective_from = current_date
-        WHERE id = $1`,
-      [promoted.rows[0].id]
+    const promoted = await query<{ id: string }>(
+      `INSERT INTO policy_rule_versions(
+         rule_set_id, version, status, definition, source_snapshot,
+         effective_from, effective_to, published_at
+       )
+       VALUES (
+         $1, 2, 'published', $2::jsonb, $3::jsonb,
+         current_date, NULL, now()
+       )
+       RETURNING id`,
+      [
+        baseline.rows[0].rule_set_id,
+        JSON.stringify(baseline.rows[0].definition),
+        JSON.stringify([{ source: "admin-managed-v2" }])
+      ]
     );
     await query(
       `UPDATE policy_rule_sets
@@ -1243,17 +1397,43 @@ describe("policy capability administration", () => {
     await seedPolicyFoundation();
     const active = await query<{
       active_version_id: string | null;
-      source_snapshot: unknown;
+      baseline_status: string;
+      baseline_effective_to: string | null;
+      promoted_source_snapshot: unknown;
+      overlap_count: string;
     }>(
-      `SELECT prs.active_version_id, prv.source_snapshot
+      `SELECT prs.active_version_id,
+              baseline.status AS baseline_status,
+              baseline.effective_to::text AS baseline_effective_to,
+              promoted.source_snapshot AS promoted_source_snapshot,
+              (
+                SELECT count(*)::text
+                  FROM policy_rule_versions left_version
+                  JOIN policy_rule_versions right_version
+                    ON right_version.rule_set_id = left_version.rule_set_id
+                   AND right_version.id > left_version.id
+                   AND right_version.status = 'published'
+                   AND left_version.status = 'published'
+                   AND right_version.effective_from <=
+                       coalesce(left_version.effective_to, DATE '9999-12-31')
+                   AND left_version.effective_from <=
+                       coalesce(right_version.effective_to, DATE '9999-12-31')
+                 WHERE left_version.rule_set_id = prs.id
+              ) AS overlap_count
          FROM policy_rule_sets prs
-         JOIN policy_rule_versions prv ON prv.id = $1
+         JOIN policy_rule_versions baseline
+           ON baseline.rule_set_id = prs.id
+          AND baseline.version = 1
+         JOIN policy_rule_versions promoted ON promoted.id = $1
         WHERE prs.code = 'cn-severance'`,
       [promoted.rows[0].id]
     );
     expect(active.rows[0]).toEqual({
       active_version_id: promoted.rows[0].id,
-      source_snapshot: promoted.rows[0].source_snapshot
+      baseline_status: "retired",
+      baseline_effective_to: expect.any(String),
+      promoted_source_snapshot: [{ source: "admin-managed-v2" }],
+      overlap_count: "0"
     });
   });
 });

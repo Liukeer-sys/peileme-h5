@@ -190,8 +190,7 @@ export const seedPolicyFoundation = async () => {
         "2013-07-01"
       ]
     );
-    let versionId = insertedVersion.rows[0]?.id;
-    if (!versionId) {
+    if (!insertedVersion.rows[0]) {
       const existingVersion = await client.query<{
         id: string;
         status: string;
@@ -202,62 +201,25 @@ export const seedPolicyFoundation = async () => {
          FOR UPDATE`,
         [ruleSetId]
       );
-      versionId = existingVersion.rows[0]?.id;
-      if (!versionId) {
+      const existing = existingVersion.rows[0];
+      if (!existing) {
         throw new Error("Policy rule version disappeared during seed");
       }
-      const nextPublished = await client.query<{
-        effective_from: string;
-      }>(
-        `SELECT effective_from::text
-           FROM policy_rule_versions
-          WHERE rule_set_id = $1
-            AND status = 'published'
-            AND version <> 1
-            AND effective_from > DATE '2013-07-01'
-          ORDER BY effective_from, version
-          LIMIT 1
-          FOR UPDATE`,
-        [ruleSetId]
-      );
-      if (
-        existingVersion.rows[0].status === "published" &&
-        nextPublished.rows[0]
-      ) {
+      if (existing.status === "published") {
         await client.query(
           `UPDATE policy_rule_versions
-              SET effective_to = $2::date - 1,
-                  updated_at = now()
-            WHERE id = $1
-              AND effective_to IS DISTINCT FROM $2::date - 1`,
-          [versionId, nextPublished.rows[0].effective_from]
-        );
-      } else {
-        await client.query(
-          `UPDATE policy_rule_versions
-           SET status = 'published',
-               definition = $2::jsonb,
+           SET definition = $2::jsonb,
                source_snapshot = $3::jsonb,
-               effective_from = $4::date,
-               effective_to = NULL,
-               published_at = CASE
-                 WHEN status <> 'published' THEN now()
-                 ELSE published_at
-               END,
                updated_at = now()
            WHERE id = $1
              AND (
-               status IS DISTINCT FROM 'published' OR
                definition IS DISTINCT FROM $2::jsonb OR
-               source_snapshot IS DISTINCT FROM $3::jsonb OR
-               effective_from IS DISTINCT FROM $4::date OR
-               effective_to IS NOT NULL
+               source_snapshot IS DISTINCT FROM $3::jsonb
              )`,
           [
-            versionId,
+            existing.id,
             definitionJson,
-            sourceSnapshotJson,
-            "2013-07-01"
+            sourceSnapshotJson
           ]
         );
       }

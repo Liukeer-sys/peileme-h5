@@ -1709,7 +1709,8 @@ describe("policy persistence foundation", () => {
     );
     expect(migrations.rows).toEqual([
       { version: "001_initial.sql" },
-      { version: "002_policy_foundation.sql" }
+      { version: "002_policy_foundation.sql" },
+      { version: "003_policy_parameter_provenance.sql" }
     ]);
 
     const preserved = await query<{

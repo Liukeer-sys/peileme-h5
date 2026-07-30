@@ -1,6 +1,12 @@
-import { Router } from "express";
+import {
+  Router,
+  type NextFunction,
+  type Request,
+  type Response
+} from "express";
 import { z } from "zod";
 import { ApiError } from "../../errors.js";
+import { isGovernmentHttpsUrl } from "../../lib/official-source.js";
 import {
   getRequestIdentity,
   requireAuth,
@@ -160,6 +166,66 @@ const sourceSnapshotSchema = z
   .array(z.record(z.string(), z.unknown()))
   .max(100);
 
+const regionalParameterSchema = z
+  .object({
+    regionCode: z.string().regex(/^\d{6}$/),
+    year: z.number().int().min(2000).max(2100),
+    parameterType: z.enum([
+      "minimum_monthly_wage",
+      "employee_average_monthly_wage"
+    ]),
+    amountFen: positiveMoneySchema,
+    sourceName: z.string().trim().min(1).max(500),
+    sourceUrl: z
+      .string()
+      .url()
+      .refine((url) => new URL(url).protocol === "https:", {
+        message: "来源地址必须使用 HTTPS"
+      }),
+    sourcePublishedAt: isoDateSchema,
+    status: z.enum(["draft", "verified", "stale"])
+  })
+  .superRefine((value, context) => {
+    if (value.status === "draft") return;
+    const currentDate = new Date().toISOString().slice(0, 10);
+    const currentYear = Number(currentDate.slice(0, 4));
+    if (!isGovernmentHttpsUrl(value.sourceUrl)) {
+      context.addIssue({
+        code: "custom",
+        path: ["sourceUrl"],
+        message: "已审核参数必须使用政府官方 HTTPS 来源"
+      });
+    }
+    if (value.sourcePublishedAt > currentDate) {
+      context.addIssue({
+        code: "custom",
+        path: ["sourcePublishedAt"],
+        message: "来源发布日期不得晚于当前日期"
+      });
+    }
+    if (
+      value.year > currentYear ||
+      Number(value.sourcePublishedAt.slice(0, 4)) < value.year
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["year"],
+        message: "参数年份必须已由该来源发布且不得晚于当前年份"
+      });
+    }
+  });
+
+const requireRegionalParameterCapability = (
+  request: Request,
+  response: Response,
+  next: NextFunction
+) =>
+  requireCapability(
+    request.body?.status === "verified"
+      ? "policy.publish"
+      : "policy.write"
+  )(request, response, next);
+
 export const createAdminPolicyRouter = (
   repository = new PolicyRepository()
 ) => {
@@ -242,25 +308,9 @@ export const createAdminPolicyRouter = (
 
   router.put(
     "/regional-parameters",
-    write,
+    requireRegionalParameterCapability,
     async (request, response) => {
-      const input = z
-        .object({
-          regionCode: z.string().regex(/^\d{6}$/),
-          year: z.number().int().min(2000).max(2100),
-          parameterType: z.enum([
-            "minimum_monthly_wage",
-            "employee_average_monthly_wage"
-          ]),
-          amountFen: positiveMoneySchema,
-          sourceName: z.string().trim().min(1).max(500),
-          sourceUrl: z.string().url().refine((url) => url.startsWith("https://"), {
-            message: "来源地址必须使用 HTTPS"
-          }),
-          sourcePublishedAt: isoDateSchema,
-          status: z.enum(["draft", "verified", "stale"])
-        })
-        .parse(request.body);
+      const input = regionalParameterSchema.parse(request.body);
       response.json(
         await repository.upsertRegionalParameter({ input, request })
       );

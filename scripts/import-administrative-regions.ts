@@ -2,7 +2,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { closePool, withTransaction } from "../server/db.js";
 import { readCsvRecords } from "./lib/csv.js";
-import { assertGovernmentHttpsUrl } from "./lib/official-source.js";
+import { assertGovernmentHttpsUrl } from "../server/lib/official-source.js";
 
 const header = [
   "code",

@@ -118,6 +118,11 @@ type ParameterRow = {
   parameter_type: ParameterType;
   amount_fen: string;
   status: "verified" | "stale";
+  source_name: string;
+  source_url: string;
+  source_published_at: string;
+  reviewed_by: string | null;
+  reviewed_at: string | null;
 };
 
 export type ParameterProvenance =
@@ -130,10 +135,28 @@ export type ParameterProvenance =
       regionName: string;
       fallback: boolean;
       amountFen: number;
+      parameterType: ParameterType;
+      sourceName: string;
+      sourceUrl: string;
+      sourcePublishedAt: string;
+      reviewedBy: string | null;
+      reviewedAt: string | null;
     }
   | {
       source: "manual";
+      parameterId: null;
+      status: "manual";
+      year: null;
+      regionCode: string;
+      regionName: string;
+      fallback: false;
       amountFen: number;
+      parameterType: ParameterType;
+      sourceName: null;
+      sourceUrl: null;
+      sourcePublishedAt: null;
+      reviewedBy: null;
+      reviewedAt: null;
     };
 
 export type CalculationResult = {
@@ -356,7 +379,10 @@ export class PolicyRepository {
       ) => {
         const result = await client.query<ParameterRow>(
           `SELECT rp.id, rp.region_code, rp.region_name, rp.year,
-                  rp.parameter_type, rp.amount_fen::text, rp.status
+                  rp.parameter_type, rp.amount_fen::text, rp.status,
+                  rp.source_name, rp.source_url,
+                  rp.source_published_at::text,
+                  rp.reviewed_by, rp.reviewed_at::text
              FROM regional_parameters rp
             WHERE rp.region_code = $1
               AND rp.parameter_type = $2
@@ -423,20 +449,43 @@ export class PolicyRepository {
         regionCode: row.region_code,
         regionName: row.region_name,
         fallback,
-        amountFen: Number(row.amount_fen)
+        amountFen: Number(row.amount_fen),
+        parameterType: row.parameter_type,
+        sourceName: row.source_name,
+        sourceUrl: row.source_url,
+        sourcePublishedAt: row.source_published_at,
+        reviewedBy: row.reviewed_by,
+        reviewedAt: row.reviewed_at
       });
-      const manualProvenance = (amountFen: number): ParameterProvenance => ({
+      const manualProvenance = (
+        parameterType: ParameterType,
+        amountFen: number
+      ): ParameterProvenance => ({
         source: "manual",
-        amountFen
+        parameterId: null,
+        status: "manual",
+        year: null,
+        regionCode: region.code,
+        regionName: region.name,
+        fallback: false,
+        amountFen,
+        parameterType,
+        sourceName: null,
+        sourceUrl: null,
+        sourcePublishedAt: null,
+        reviewedBy: null,
+        reviewedAt: null
       });
       const minimumProvenance = minimum
         ? databaseProvenance(minimum, minimumFallback)
         : manualProvenance(
+            "minimum_monthly_wage",
             facts.manualParameters!.minimumMonthlyWageFen!
           );
       const averageProvenance = average
         ? databaseProvenance(average, false)
         : manualProvenance(
+            "employee_average_monthly_wage",
             facts.manualParameters!.employeeAverageMonthlyWageFen!
           );
       const parameters = {
@@ -502,16 +551,19 @@ export class PolicyRepository {
       await client.query(
         `INSERT INTO policy_calculation_snapshots(
            assessment_id, rule_version_id, regional_parameter_ids,
-           input, output, input_hash
+           input, output, input_hash, parameter_provenance
          )
-         VALUES ($1, $2, $3::uuid[], $4::jsonb, $5::jsonb, $6)`,
+         VALUES (
+           $1, $2, $3::uuid[], $4::jsonb, $5::jsonb, $6, $7::jsonb
+         )`,
         [
           assessmentId,
           version.id,
           parameterIds,
           JSON.stringify(canonicalInput),
           JSON.stringify(output),
-          inputHash
+          inputHash,
+          JSON.stringify(parameters)
         ]
       );
       return {
@@ -589,13 +641,12 @@ export class PolicyRepository {
       version: number;
       input: PolicyInput;
       output: PolicyOutput;
-      answers: {
-        parameterProvenance?: CalculationResult["parameters"];
-      };
+      parameter_provenance: CalculationResult["parameters"];
       created_at: string;
     }>(
       `SELECT a.id, a.accuracy_level, prv.version,
-              pcs.input, pcs.output, a.answers, a.created_at
+              pcs.input, pcs.output, pcs.parameter_provenance,
+              a.created_at
          FROM assessments a
          JOIN policy_calculation_snapshots pcs
            ON pcs.assessment_id = a.id
@@ -617,7 +668,7 @@ export class PolicyRepository {
       id: row.id,
       ruleVersion: row.version,
       accuracy: row.accuracy_level,
-      parameters: row.answers.parameterProvenance,
+      parameters: row.parameter_provenance,
       input: row.input,
       output: row.output,
       createdAt: row.created_at
