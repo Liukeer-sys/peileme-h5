@@ -652,12 +652,37 @@ git commit -m "fix: harden policy persistence invariants"
 below is the engine input contract; callers preserve the legally relevant facts
 instead of pre-collapsing them into a payout multiplier.
 
+**Final Task 3 contract clarifications:**
+
+- Employment service uses the half-open interval `[startDate, endDate)`.
+  Dates are strict `YYYY-MM-DD` calendar dates and `endDate` must follow
+  `startDate`. Complete months use the start-day anniversary, clamped to the
+  destination month's final day. Any positive service time after complete
+  years counts as the less-than-six-month `0.5` band.
+- `monthlyEarnedWagesFen` contains 1-12 complete months ordered earliest to
+  latest. Decimal accumulation and half-up rounding produce the average; the
+  last entry is the complete wage month immediately before termination and is
+  the Article 40 payment-in-lieu basis.
+- Payment in lieu does not use the compensation average, minimum-wage
+  adjustment, or three-times cap. `UNCLEAR` uses a high bound of
+  `max(2N, N + prior-month wage)`. Employee-proposed mutual agreement returns a
+  conservative `0..N` review range.
+- Every input and computed fen amount is a non-negative safe integer; regional
+  wage parameters are positive safe integers. Overflow is rejected.
+- Output also includes `serviceRemainderDays` and `noticePayBasisFen`.
+  `formulaSteps` explains service, average wage, minimum adjustment,
+  three-times cap, legal scenario, notice pay, paid amount, and difference in
+  Chinese.
+- The engine is pure and deterministic: it reads no database, clock, or
+  environment state and does not mutate input.
+
 **Files:**
 - Create: `server/modules/policy/types.ts`
 - Create: `server/modules/policy/engine.ts`
 - Create: `server/tests/policy.engine.test.ts`
 - Modify: `package.json`
 - Modify: `package-lock.json`
+- Modify: `docs/superpowers/plans/2026-07-30-dual-web-policy-foundation.md`
 
 - [ ] **Step 1: Install Decimal.js**
 
@@ -802,6 +827,7 @@ export type PolicyInput = {
   startDate: string;
   endDate: string;
   terminationScenario: TerminationScenario;
+  /** Earliest to latest; final item is the prior complete wage month. */
   monthlyEarnedWagesFen: number[];
   minimumMonthlyWageFen: number;
   employeeAverageMonthlyWageFen: number;
@@ -810,11 +836,13 @@ export type PolicyInput = {
 
 export type PolicyOutput = {
   serviceMonths: number;
+  serviceRemainderDays: number;
   compensationMonths: number;
   rawAverageWageFen: number;
   salaryBasisFen: number;
   salaryCapped: boolean;
   baseCompensationFen: number;
+  noticePayBasisFen: number;
   noticePayFen: number;
   payableFen: number;
   alreadyPaidFen: number;
@@ -830,8 +858,13 @@ export type PolicyOutput = {
 
 Create `server/modules/policy/engine.ts`:
 
+The following block is an abbreviated control-flow sketch. The final Task 3
+contract clarifications above and the executable implementation/tests are
+authoritative for strict date handling, safe-integer validation, overflow
+guards, output additions, and Chinese explanations.
+
 ```ts
-import Decimal from "decimal.js";
+import { Decimal } from "decimal.js";
 import type { PolicyInput, PolicyOutput } from "./types.js";
 
 const monthsBetween = (start: string, end: string) => {
@@ -851,10 +884,10 @@ const monthsBetween = (start: string, end: string) => {
 
 const averageFen = (values: number[]) => {
   if (values.length < 1 || values.length > 12) throw new Error("WAGE_MONTHS_OUT_OF_RANGE");
-  if (values.some((value) => !Number.isInteger(value) || value < 0)) {
+  if (values.some((value) => !Number.isSafeInteger(value) || value < 0)) {
     throw new Error("INVALID_WAGE_VALUE");
   }
-  return new Decimal(values.reduce((sum, value) => sum + value, 0))
+  return values.reduce((sum, value) => sum.plus(value), new Decimal(0))
     .div(values.length)
     .toDecimalPlaces(0, Decimal.ROUND_HALF_UP)
     .toNumber();
@@ -893,7 +926,9 @@ export const calculatePolicy = (input: PolicyInput): PolicyOutput => {
     payableFen = nFen;
   } else if (scenario.kind === "ARTICLE_40") {
     noticePayFen =
-      scenario.noticeMethod === "payment_in_lieu" ? salaryBasisFen : 0;
+      scenario.noticeMethod === "payment_in_lieu"
+        ? input.monthlyEarnedWagesFen[input.monthlyEarnedWagesFen.length - 1]
+        : 0;
     payableFen = nFen + noticePayFen;
   } else if (
     scenario.kind === "MUTUAL_AGREEMENT" &&
@@ -909,9 +944,18 @@ export const calculatePolicy = (input: PolicyInput): PolicyOutput => {
     reviewRequired = true;
   }
   const rangeFen = scenario.kind === "UNCLEAR"
-    ? { low: 0, high: twoNFen }
+    ? {
+        low: 0,
+        high: Math.max(
+          twoNFen,
+          nFen + input.monthlyEarnedWagesFen[input.monthlyEarnedWagesFen.length - 1]
+        )
+      }
+    : scenario.kind === "MUTUAL_AGREEMENT" &&
+        scenario.proposedBy === "employee"
+      ? { low: 0, high: nFen }
     : { low: payableFen, high: payableFen };
-  const alreadyPaidFen = input.alreadyPaidFen || 0;
+  const alreadyPaidFen = input.alreadyPaidFen ?? 0;
   return {
     serviceMonths,
     compensationMonths,
@@ -944,12 +988,14 @@ Run:
 npm test -- --run server/tests/policy.engine.test.ts
 ```
 
-Expected: 7 tests pass.
+Expected: all 52 Task 3 engine tests pass.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add package.json package-lock.json server/modules/policy server/tests/policy.engine.test.ts
+git add package.json package-lock.json server/modules/policy \
+  server/tests/policy.engine.test.ts \
+  docs/superpowers/plans/2026-07-30-dual-web-policy-foundation.md
 git commit -m "feat: calculate severance with deterministic rules"
 ```
 
