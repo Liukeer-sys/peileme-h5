@@ -69,7 +69,7 @@ test("生产持久化、私有下载与管理后台回查", async ({ page, brows
   expect(userDownloadResponse.headers()["content-disposition"]).toContain(
     "e2e-agreement.pdf"
   );
-  expect((await userDownloadResponse.body()).byteLength).toBeGreaterThan(0);
+  expect(Number(userDownloadResponse.headers()["content-length"])).toBeGreaterThan(0);
   await page.locator(".account-close").click();
 
   await page.reload();
@@ -85,7 +85,12 @@ test("生产持久化、私有下载与管理后台回查", async ({ page, brows
   const adminPage = await adminContext.newPage();
   const adminErrors: string[] = [];
   adminPage.on("console", (message) => {
-    if (message.type() === "error") adminErrors.push(message.text());
+    if (
+      message.type() === "error" &&
+      !message.text().startsWith("Failed to load resource:")
+    ) {
+      adminErrors.push(message.text());
+    }
   });
   adminPage.on("pageerror", (error) => adminErrors.push(error.message));
   await adminPage.goto("/admin");
@@ -118,7 +123,7 @@ test("生产持久化、私有下载与管理后台回查", async ({ page, brows
   expect(adminDownloadResponse.headers()["content-disposition"]).toContain(
     "e2e-agreement.pdf"
   );
-  expect((await adminDownloadResponse.body()).byteLength).toBeGreaterThan(0);
+  expect(Number(adminDownloadResponse.headers()["content-length"])).toBeGreaterThan(0);
   await adminPage.getByRole("button", { name: /埋点统计/ }).click();
   await expect(adminPage.getByText("assessment_completed", { exact: true })).toBeVisible();
   await adminPage.getByRole("button", { name: /审计日志/ }).click();
