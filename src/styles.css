@@ -2386,6 +2386,338 @@ button {
   }
 }
 
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.account-button {
+  max-width: 118px;
+  padding: 8px 12px;
+  border: 1px solid rgba(108, 82, 121, 0.13);
+  border-radius: 999px;
+  color: #51485b;
+  background: linear-gradient(135deg, #f4eefc, #edf8ee);
+  font-size: 13px;
+  font-weight: 750;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-overlay {
+  z-index: 30;
+  padding: 18px;
+}
+
+.account-modal {
+  position: relative;
+  width: min(100%, 390px);
+  max-height: min(760px, calc(100dvh - 36px));
+  padding: 26px 24px 22px;
+  border: 1px solid rgba(83, 67, 91, 0.12);
+  border-radius: 24px 24px 24px 8px;
+  background:
+    radial-gradient(circle at 100% 0, rgba(191, 171, 238, 0.22), transparent 30%),
+    #fffdf8;
+  box-shadow: 0 24px 70px rgba(47, 37, 54, 0.24);
+  overflow-y: auto;
+  animation: account-modal-in 180ms ease-out both;
+}
+
+.account-close {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  color: #655b6b;
+  background: rgba(85, 70, 94, 0.08);
+  font-size: 23px;
+  line-height: 1;
+}
+
+.account-mark {
+  display: grid;
+  width: 48px;
+  height: 48px;
+  place-items: center;
+  border: 1px solid rgba(74, 65, 84, 0.09);
+  border-radius: 16px 16px 16px 5px;
+  color: #2f2936;
+  background: linear-gradient(135deg, #dfd3fb, #d9f0dd);
+  font-family: "Songti SC", "STSong", serif;
+  font-size: 23px;
+  font-weight: 900;
+  box-shadow: 0 9px 24px rgba(73, 57, 83, 0.13);
+}
+
+.account-modal > h2 {
+  margin: 17px 0 5px;
+  color: #2d2732;
+  font-family: "Songti SC", "STSong", serif;
+  font-size: 25px;
+}
+
+.account-modal > p,
+.profile-head p,
+.account-panel-section p {
+  margin: 0;
+  color: #7b7180;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.account-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  margin: 18px 0 13px;
+  padding: 4px;
+  border-radius: 12px;
+  background: #f1ede8;
+}
+
+.account-tabs button {
+  padding: 8px 6px;
+  border: 0;
+  border-radius: 9px;
+  color: #796f7d;
+  background: transparent;
+  font-size: 13px;
+}
+
+.account-tabs button.active {
+  color: #342d3a;
+  background: #fff;
+  font-weight: 800;
+  box-shadow: 0 3px 12px rgba(59, 47, 65, 0.08);
+}
+
+.account-field {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.account-field > span,
+.account-panel-section > strong {
+  color: #514857;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.account-field input,
+.account-panel-section input {
+  width: 100%;
+  min-width: 0;
+  padding: 11px 12px;
+  border: 1px solid #ddd3dc;
+  border-radius: 11px;
+  outline: 0;
+  color: #312b35;
+  background: rgba(255, 255, 255, 0.9);
+  font-size: 14px;
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+
+.account-field input:focus,
+.account-panel-section input:focus {
+  border-color: #a992bf;
+  box-shadow: 0 0 0 3px rgba(169, 146, 191, 0.14);
+}
+
+.account-code-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.account-code-row button {
+  min-width: 96px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 11px;
+  color: #fff;
+  background: #514759;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.account-code-row button:disabled {
+  opacity: 0.48;
+}
+
+.account-message {
+  margin-top: 12px;
+  padding: 9px 11px;
+  border-radius: 10px;
+  color: #5b4b5f;
+  background: #f1ebf6;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.account-submit {
+  width: 100%;
+  margin-top: 16px;
+}
+
+.account-switch {
+  display: block;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: #6d5875;
+  background: none;
+  font-size: 13px;
+}
+
+.account-switch-row {
+  display: flex;
+  justify-content: center;
+  gap: 18px;
+  margin-top: 13px;
+}
+
+.upload-history-item {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.upload-history-item > div {
+  min-width: 0;
+}
+
+.upload-history-item b {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upload-history-item button {
+  border: 1px solid rgba(82, 70, 94, 0.18);
+  border-radius: 999px;
+  background: #fff9df;
+  color: #51485a;
+  padding: 7px 12px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.account-modal > small {
+  display: block;
+  margin-top: 15px;
+  color: #9a909e;
+  font-size: 10px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.account-panel {
+  width: min(100%, 410px);
+}
+
+.profile-head {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  padding-right: 32px;
+}
+
+.profile-head h2 {
+  margin: 0 0 3px;
+  font-family: "Songti SC", "STSong", serif;
+}
+
+.account-panel-section {
+  display: grid;
+  gap: 9px;
+  margin-top: 17px;
+  padding-top: 16px;
+  border-top: 1px solid #e9e1e7;
+}
+
+.grant-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.grant-list span {
+  padding: 7px 9px;
+  border-radius: 9px;
+  color: #386047;
+  background: #e8f5ea;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.history-list {
+  display: grid;
+  gap: 7px;
+}
+
+.history-list article {
+  display: grid;
+  gap: 3px;
+  padding: 10px 11px;
+  border-radius: 11px;
+  background: #f7f3ee;
+}
+
+.history-list b {
+  color: #4b424f;
+  font-size: 12px;
+}
+
+.history-list span {
+  color: #948a95;
+  font-size: 10px;
+}
+
+.admin-entry-link {
+  display: block;
+  margin-top: 17px;
+  padding: 11px 13px;
+  border-radius: 11px;
+  color: #fff;
+  background: #514759;
+  font-size: 13px;
+  font-weight: 800;
+  text-align: center;
+  text-decoration: none;
+}
+
+.account-logout {
+  width: 100%;
+  margin-top: 10px;
+}
+
+@keyframes account-modal-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@media (max-width: 520px) {
+  .account-modal {
+    padding: 23px 18px 19px;
+  }
+}
 .legal-article-list,
 .case-law-detail-list {
   display: grid;
@@ -3020,9 +3352,6 @@ button {
     will-change: auto;
   }
 }
-
-
-
 
 
 

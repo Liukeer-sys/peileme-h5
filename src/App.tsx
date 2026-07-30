@@ -4,6 +4,10 @@ import OptionButtons from "./components/OptionButtons";
 import PaidUpsellCard, { PaidNextStepCard, SelectedReasonCard } from "./components/PaidUpsellCard";
 import ResultCard from "./components/ResultCard";
 import StickerCard from "./components/StickerCard";
+import AccountPanel from "./components/AccountPanel";
+import AuthModal from "./components/AuthModal";
+import { useAuth } from "./auth/AuthContext";
+import { api, ApiError, track } from "./lib/api";
 import { baseQuestions, loadingMessages } from "./data/questions";
 import { forcedOtherReasonLeaf, getTerminationReasonNode, rootTerminationReasonNode, type TerminationLeaf } from "./data/terminationReasonFlow";
 import type { XiaoPeiAvatarState } from "./constants/xiaopeiAvatarStates";
@@ -54,6 +58,7 @@ const mergeBooleanInference = (current: boolean | undefined, next: boolean | und
   next === undefined ? current : next;
 
 export default function App() {
+  const { user } = useAuth();
   const restored = useMemo(() => loadAnswers(), []);
   const [answers, setAnswers] = useState<Answers>(restored || initialAnswers);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -69,8 +74,15 @@ export default function App() {
   const [loadingIndex, setLoadingIndex] = useState(0);
   const [showSticker, setShowSticker] = useState(false);
   const [selectedEquivalentId, setSelectedEquivalentId] = useState<string | null>(null);
+  const [authOpen, setAuthOpen] = useState(false);
+  const [accountOpen, setAccountOpen] = useState(false);
+  const [assessmentId, setAssessmentId] = useState(
+    () => window.sessionStorage.getItem("peileme-active-assessment") || ""
+  );
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const messageTimersRef = useRef<number[]>([]);
+  const assessmentRequestRef = useRef<Promise<string> | null>(null);
+  const completedAssessmentRef = useRef("");
 
   const currentQuestion = baseQuestions[stepIndex];
   const result = useMemo(() => calculateCompensation(answers), [answers]);
@@ -136,6 +148,14 @@ export default function App() {
   useEffect(() => clearMessageTimers, []);
 
   useEffect(() => {
+    const pageKey = `peileme-page-view:${window.location.pathname}`;
+    if (!window.sessionStorage.getItem(pageKey)) {
+      window.sessionStorage.setItem(pageKey, "1");
+      track("page_view", { title: document.title });
+    }
+  }, []);
+
+  useEffect(() => {
     if (mode === "result") return;
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, mode, loadingIndex, optionsPaused, stepIndex, terminationNodeId]);
@@ -162,6 +182,71 @@ export default function App() {
       window.clearTimeout(doneTimer);
     };
   }, [answers, mode]);
+
+  useEffect(() => {
+    if (
+      mode === "result" &&
+      assessmentId &&
+      completedAssessmentRef.current === assessmentId
+    ) {
+      return;
+    }
+    const syncTimer = window.setTimeout(() => {
+      const payload = {
+        status: mode === "result" ? "completed" : "in_progress",
+        currentStep: mode === "result" ? "result" : currentQuestion?.id || mode,
+        answers,
+        result: mode === "result" ? result : null
+      };
+      const sync = async () => {
+        let id = assessmentId || window.sessionStorage.getItem("peileme-active-assessment") || "";
+        if (!id) {
+          if (!assessmentRequestRef.current) {
+            assessmentRequestRef.current = api<{ id: string }>("/api/assessments", {
+              method: "POST",
+              auth: Boolean(user),
+              body: payload
+            })
+              .then((saved) => {
+                window.sessionStorage.setItem("peileme-active-assessment", saved.id);
+                setAssessmentId(saved.id);
+                track("assessment_started", {
+                  assessmentId: saved.id,
+                  restored: Boolean(restored)
+                });
+                return saved.id;
+              })
+              .finally(() => {
+                assessmentRequestRef.current = null;
+              });
+          }
+          id = await assessmentRequestRef.current;
+        } else {
+          await api(`/api/assessments/${id}`, {
+            method: "PATCH",
+            auth: Boolean(user),
+            body: payload
+          });
+        }
+        if (mode === "result" && completedAssessmentRef.current !== id) {
+          completedAssessmentRef.current = id;
+          track("assessment_completed", {
+            assessmentId: id,
+            city: answers.city || answers.customCity,
+            terminationReasonId: result.terminationReasonId
+          });
+        }
+      };
+      void sync().catch((error) => {
+        if (error instanceof ApiError && error.status === 404) {
+          window.sessionStorage.removeItem("peileme-active-assessment");
+          assessmentRequestRef.current = null;
+          setAssessmentId("");
+        }
+      });
+    }, mode === "result" ? 0 : 700);
+    return () => window.clearTimeout(syncTimer);
+  }, [answers, assessmentId, currentQuestion?.id, mode, result, user]);
 
   const buildAnswersForQuestion = (questionId: string, value: string): Answers => {
     const next: Answers = { ...answers };
@@ -329,6 +414,7 @@ export default function App() {
     );
   };
   const submitTerminationDetail = (value: string) => {
+    track("answer_submitted", { questionId: "terminationDetail", inputKind: "text" });
     const combinedText = [answers.terminationReasonText, value].filter(Boolean).join("\n");
     const nextAnswers: Answers = {
       ...answers,
@@ -372,6 +458,7 @@ export default function App() {
   };
 
   const submitCustomCity = (value: string) => {
+    track("answer_submitted", { questionId: "customCity", inputKind: "text" });
     const nextAnswers: Answers = {
       ...answers,
       city: value,
@@ -387,6 +474,10 @@ export default function App() {
     if (!currentQuestion) return;
     const value = String(rawValue).trim();
     if (!value) return;
+    track("answer_submitted", {
+      questionId: currentQuestion.id,
+      inputKind: currentQuestion.kind
+    });
 
     if (currentQuestion.id === "terminationReason") {
       handleTerminationAnswer(value);
@@ -471,12 +562,18 @@ export default function App() {
     setMode("chat");
     setShowSticker(false);
     setSelectedEquivalentId(null);
+    window.sessionStorage.removeItem("peileme-active-assessment");
+    setAssessmentId("");
+    assessmentRequestRef.current = null;
+    completedAssessmentRef.current = "";
+    track("assessment_restarted");
     trackTimer(() => setOptionsPaused(false), MESSAGE_STAGGER_MS * 4);
   };
 
   const openSticker = (equivalentId: string) => {
     setSelectedEquivalentId(equivalentId);
     setShowSticker(true);
+    track("sticker_opened", { equivalentId });
   };
 
   const reselectPostExitWish = () => {
@@ -492,7 +589,9 @@ export default function App() {
     setAwaitingCustomCity(false);
     setTextValue("");
     setShowSticker(false);
+    completedAssessmentRef.current = "";
     setSelectedEquivalentId(null);
+    track("post_exit_wish_reselected");
     appendMessages({
       id: `q-postExitWish-reselect-${Date.now()}`,
       from: "system",
@@ -523,9 +622,18 @@ export default function App() {
             <span className="brand-dot" />
             <strong>赔了么</strong>
           </div>
-          <button className="mini-button" type="button" onClick={restart}>
-            重算
-          </button>
+          <div className="topbar-actions">
+            <button
+              className="account-button"
+              type="button"
+              onClick={() => user ? setAccountOpen(true) : setAuthOpen(true)}
+            >
+              {user ? (user.displayName || user.email || user.phone || "我的").slice(0, 4) : "登录"}
+            </button>
+            <button className="mini-button" type="button" onClick={restart}>
+              重算
+            </button>
+          </div>
         </header>
 
         {mode !== "result" && (
@@ -575,7 +683,14 @@ export default function App() {
             )}
 
             {terminationConclusionReady && (
-              <button className="primary-button" type="button" onClick={() => setMode("loading")}>
+              <button
+                className="primary-button"
+                type="button"
+                onClick={() => {
+                  track("calculation_requested");
+                  setMode("loading");
+                }}
+              >
                 计算你的牛马身价
               </button>
             )}
@@ -619,7 +734,14 @@ export default function App() {
             >
               <PaidNextStepCard />
             </ResultCard>
-            <PaidUpsellCard result={result} answers={answers} showIntro={false} />
+            <PaidUpsellCard
+              result={result}
+              answers={answers}
+              assessmentId={assessmentId || undefined}
+              onRequireAuth={() => setAuthOpen(true)}
+              onOpenAccount={() => setAccountOpen(true)}
+              showIntro={false}
+            />
             <button className="secondary-button" type="button" onClick={restart}>
               重新评估一次
             </button>
@@ -630,14 +752,11 @@ export default function App() {
       {showSticker && (
         <StickerCard result={result} equivalentId={selectedEquivalentId} onClose={() => setShowSticker(false)} />
       )}
+      <AuthModal open={authOpen} onClose={() => setAuthOpen(false)} />
+      <AccountPanel open={accountOpen} onClose={() => setAccountOpen(false)} />
     </main>
   );
 }
-
-
-
-
-
 
 
 

@@ -1,9 +1,11 @@
-﻿import { useMemo, useState } from "react";
+﻿import { useEffect, useMemo, useState } from "react";
 import { buildEvidenceChecklist, getEvidenceCompleteness, priorityLabels } from "../data/evidenceChecklist";
 import { getLaborLawArticle, getLaborLawPack, type LaborLawArticle, type LaborLawCitation } from "../data/laborLawReferences";
 import type { Answers } from "../types";
 import type { CalculationResult } from "../utils/calculate";
 import { formatMoney } from "../utils/calculate";
+import { useAuth } from "../auth/AuthContext";
+import { api, ApiError, track } from "../lib/api";
 
 type PaidModuleKey = "caseLawPack" | "evidencePack" | "documentReview";
 type CaseLawSectionKey = "laws";
@@ -30,10 +32,16 @@ type ExpandedLinkedArticle = {
   sourceArticleTitle: string;
 };
 
-type PaidUpsellCardProps = {
+type PaidCoreProps = {
   result: CalculationResult;
   answers: Answers;
+};
+
+type PaidUpsellCardProps = PaidCoreProps & {
   showIntro?: boolean;
+  assessmentId?: string;
+  onRequireAuth?: () => void;
+  onOpenAccount?: () => void;
 };
 
 const hrOfferTypes = ["给 N", "给 N+1", "给 2N", "只给工资不赔偿", "要求当天签字", "其他条件"];
@@ -353,7 +361,7 @@ const getSelectedReasonPath = (answers: Answers, result: CalculationResult) => {
     });
 };
 
-export function SelectedReasonCard({ result, answers }: Omit<PaidUpsellCardProps, "showIntro">) {
+export function SelectedReasonCard({ result, answers }: PaidCoreProps) {
   const selectedReasonPath = useMemo(() => getSelectedReasonPath(answers, result), [answers, result]);
   return (
     <div className="selected-reason-card">
@@ -381,7 +389,7 @@ export function PaidNextStepCard() {
   );
 }
 
-export function PaidIntroCard(props: Omit<PaidUpsellCardProps, "showIntro">) {
+export function PaidIntroCard(props: PaidCoreProps) {
   return (
     <>
       <SelectedReasonCard {...props} />
@@ -389,7 +397,15 @@ export function PaidIntroCard(props: Omit<PaidUpsellCardProps, "showIntro">) {
     </>
   );
 }
-export default function PaidUpsellCard({ result, answers, showIntro = true }: PaidUpsellCardProps) {
+export default function PaidUpsellCard({
+  result,
+  answers,
+  showIntro = true,
+  assessmentId,
+  onRequireAuth,
+  onOpenAccount
+}: PaidUpsellCardProps) {
+  const { user, grants } = useAuth();
   const [hrOfferType, setHrOfferType] = useState(hrOfferTypes[1]);
   const [hrOfferAmount, setHrOfferAmount] = useState("");
   const [uploadedFiles, setUploadedFiles] = useState<string[]>([]);
@@ -404,6 +420,14 @@ export default function PaidUpsellCard({ result, answers, showIntro = true }: Pa
   const [expandedLinkedArticles, setExpandedLinkedArticles] = useState<ExpandedLinkedArticle[]>([]);
   const [activeLinkedArticle, setActiveLinkedArticle] = useState<LaborLawArticle | null>(null);
   const [toast, setToast] = useState("");
+
+  useEffect(() => {
+    setPaidModules({
+      caseLawPack: grants.some((grant) => grant.module === "caseLawPack"),
+      evidencePack: grants.some((grant) => grant.module === "evidencePack"),
+      documentReview: grants.some((grant) => grant.module === "documentReview")
+    });
+  }, [grants]);
 
   const expectedAmount = Math.round((result.lowAmount + result.highAmount) / 2);
   const numericOffer = Number(hrOfferAmount || 0);
@@ -421,7 +445,7 @@ export default function PaidUpsellCard({ result, answers, showIntro = true }: Pa
     hrScore >= 80
       ? "方案力度还行，但签字前要看有没有放弃追责、保密、竞业和付款时间的坑。"
       : hrScore >= 50
-        ? "不是完全没给，但离你理论上应得的金额或安全签署条件还有距离。"
+        ? "方案有一定力度，但离你理论上应得的金额或安全签署条件还有距离。"
         : "警报偏高。别被“今天签就打款”带节奏，先看条款，再谈金额。";
 
   const evidenceChecklist = useMemo(() => buildEvidenceChecklist(result, answers), [answers, result]);
@@ -508,15 +532,45 @@ export default function PaidUpsellCard({ result, answers, showIntro = true }: Pa
       ));
 
   const unlockModule = (module: PaidModuleKey) => {
-    setPaidModules((current) => ({ ...current, [module]: true }));
     setPaywallModule(null);
-    showToast("已 mock 解锁，完整内容先给你演示出来。");
+    track("paid_module_unlock_clicked", { module, loggedIn: Boolean(user) });
+    if (!user) {
+      onRequireAuth?.();
+      return;
+    }
+    onOpenAccount?.();
   };
 
-  const handleFileChange = (files: FileList | null) => {
+  const handleFileChange = async (files: FileList | null) => {
     if (!files?.length) return;
-    setUploadedFiles((current) => [...current, ...Array.from(files).map((file) => file.name)]);
-    showToast("文件已放进待审清单，后续这里接 OCR / 大模型。");
+    if (!user) {
+      onRequireAuth?.();
+      return;
+    }
+    const selected = Array.from(files);
+    const formData = new FormData();
+    selected.forEach((file) => formData.append("files", file));
+    if (assessmentId) formData.append("assessmentId", assessmentId);
+    showToast("正在安全上传…");
+    try {
+      const response = await api<{ files: Array<{ original_name: string }> }>("/api/uploads", {
+        method: "POST",
+        auth: true,
+        body: formData
+      });
+      setUploadedFiles((current) => [
+        ...current,
+        ...response.files.map((file) => file.original_name)
+      ]);
+      showToast("材料已加密通道上传，并保存到你的账号。");
+      track("document_uploaded", {
+        assessmentId,
+        count: response.files.length,
+        types: selected.map((file) => file.type)
+      });
+    } catch (error) {
+      showToast(error instanceof ApiError ? error.message : "上传失败，请稍后重试");
+    }
   };
 
   const toggleEvidence = (item: string) => {
@@ -662,7 +716,7 @@ export default function PaidUpsellCard({ result, answers, showIntro = true }: Pa
           <b>{hrVerdict}</b>
         </div>
         <label className="upload-box compact-upload">
-          <input type="file" multiple accept="image/*,.pdf" onChange={(event) => handleFileChange(event.target.files)} />
+          <input type="file" multiple accept="image/*,.pdf" onChange={(event) => void handleFileChange(event.target.files)} />
           <span>{uploadedFiles.length ? `已选择 ${uploadedFiles.length} 个文件` : "上传 HR 文件 / 截图 / PDF"}</span>
         </label>
         {uploadedFiles.length > 0 && (
@@ -690,10 +744,12 @@ export default function PaidUpsellCard({ result, answers, showIntro = true }: Pa
       {paywallModule && (
         <div className="paywall-overlay" role="dialog" aria-modal="true">
           <div className="paywall-modal paid-card">
-            <div className="card-label">付费内容预览</div>
-            <h2>解锁后查看完整分析</h2>
-            <p>当前先用 mock 解锁演示完整内容，后续这里可以接入微信支付 / 支付宝支付。</p>
-            <button className="primary-button" type="button" onClick={() => unlockModule(paywallModule)}>mock 解锁</button>
+            <div className="card-label">完整内容权限</div>
+            <h2>{user ? "兑换邀请码解锁" : "登录后解锁完整分析"}</h2>
+            <p>{user ? "在个人中心输入有效邀请码，即可开通案例法条包、证据包和文件签署分析。" : "登录后可保存测算、上传私有材料，并使用邀请码解锁完整内容。"}</p>
+            <button className="primary-button" type="button" onClick={() => unlockModule(paywallModule)}>
+              {user ? "前往个人中心兑换" : "登录 / 注册"}
+            </button>
             <button className="ghost-button" type="button" onClick={() => setPaywallModule(null)}>先不解锁</button>
           </div>
         </div>
@@ -740,8 +796,6 @@ export default function PaidUpsellCard({ result, answers, showIntro = true }: Pa
     </section>
   );
 }
-
-
 
 
 

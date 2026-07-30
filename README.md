@@ -1,50 +1,76 @@
-# 赔了么 H5 Demo
+# 赔了么
 
-一个移动端优先的「牛马身价 / 离职赔偿预评估」对话式产品 demo。
+移动端优先的离职赔偿预评估产品。原有 H5 视觉和对话式测算保持不变，现已接入生产可用的账号、数据、邀请码、材料与管理能力。
 
-## 本地启动
+## 已实现能力
+
+- H5 对话测算、结果页、法条案例包、证据包和材料签署提示
+- 邮箱/手机号验证码、密码注册登录、会话刷新、退出与找回密码
+- 游客测算自动保存，登录后认领历史记录
+- 邀请码多权益授权、次数与有效期控制
+- PDF/JPG/PNG/WebP 私有上传、文件签名校验、本人下载
+- 全链路埋点、访客会话、转化统计
+- 管理后台：经营概览、用户、测算、材料、邀请码、埋点、审计、系统状态
+- `admin` / `analyst` 分级权限，关键操作审计
+- PostgreSQL 迁移、初始化管理员、容器健康检查与持久化卷
+- SMTP、阿里云邮件推送、阿里云短信适配器
+
+## 本地开发
 
 ```bash
-npm install
+npm ci
+cp .env.example .env
+npm run db:migrate
+npm run dev:api
 npm run dev
 ```
 
-默认访问：
+默认地址为 `http://localhost:5173`。也可直接使用 Docker Compose 启动完整栈：
 
 ```bash
-http://localhost:5173
+cp .env.example .env
+docker compose up -d --build
 ```
 
-## 构建检查
+Compose 仅把 Web 绑定到 `127.0.0.1:${WEB_PORT}`；数据库和 API 保持在内部网络。
+
+## 质量检查
 
 ```bash
 npm run build
+npm test
+npm audit --omit=dev
+docker compose config
 ```
 
-## 目录结构
+集成测试使用独立 PostgreSQL，默认连接：
 
 ```text
-src/
-  App.tsx
-  components/
-    ChatBubble.tsx
-    OptionButtons.tsx
-    PaidUpsellCard.tsx
-    ResultCard.tsx
-    StickerCard.tsx
-  data/
-    questions.ts
-    terminationTypes.ts
-  utils/
-    calculate.ts
-    storage.ts
-  styles.css
+postgresql://peileme_test:peileme_test@127.0.0.1:55432/peileme_test
 ```
 
-## Demo 边界
+## 生产部署
 
-页面内已明确展示：
+生产编排文件为 `docker-compose.yml`：
 
-> 本结果仅为离职赔偿预评估，不构成正式法律意见。具体金额和风险需结合材料进一步判断。
+1. 从 `.env.example` 创建 `.env`，生成独立的数据库、JWT、OTP、管理员和邀请码密钥。
+2. 配置 `APP_ORIGIN`、邮件或短信渠道，保持 `OTP_DEBUG=false`。
+3. 运行 `docker compose up -d --build`。
+4. 由 1Panel OpenResty 将域名反代到 `127.0.0.1:${WEB_PORT}`。
+5. 配置 HTTPS 后，从公网检查 `/api/health`，并验证容器重启恢复。
 
-当前版本只做前端 state 和 localStorage 保存，不包含后端、支付和真实材料识别。
+部署时禁止提交 `.env`、上传材料和数据库卷。验证码、Cookie 与鉴权头会从日志中脱敏。
+
+## 主要目录
+
+```text
+database/migrations/   PostgreSQL 迁移
+deploy/                Nginx / OpenResty 模板
+server/                Express API、认证、通知与测试
+src/admin/             管理后台
+src/auth/              前端会话与账号状态
+src/components/        H5 与账号组件
+src/lib/api.ts         API、下载和埋点客户端
+```
+
+页面测算结果属于预评估信息，不构成正式法律意见；最终金额和风险需结合劳动合同、工资流水及沟通记录判断。

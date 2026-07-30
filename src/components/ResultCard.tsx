@@ -235,8 +235,9 @@ export const getGeneratedIconSrc = (id: string) => {
 
 export function EquivalentIcon({ id, category, name }: { id: string; category: string; name: string }) {
   const generatedIconSrc = getGeneratedIconSrc(id);
-  if (generatedIconSrc) {
-    return <img src={generatedIconSrc} alt={name} />;
+  const [generatedIconFailed, setGeneratedIconFailed] = useState(false);
+  if (generatedIconSrc && !generatedIconFailed) {
+    return <img src={generatedIconSrc} alt={name} onError={() => setGeneratedIconFailed(true)} />;
   }
 
   const group = getIconGroup(category);
@@ -499,7 +500,6 @@ export default function ResultCard({ result, onSticker, postExitWish, onReselect
     </section>
   );
 }
-
 
 
 
