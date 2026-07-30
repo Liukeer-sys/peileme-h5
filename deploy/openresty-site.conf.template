@@ -3,8 +3,37 @@ server {
     listen [::]:80;
     server_name peileme.art www.peileme.art;
 
-    location /.well-known/acme-challenge/ {
-        root /opt/1panel/www/sites/peileme.art/index;
+    access_log /www/sites/peileme.art/log/access.log main;
+    error_log /www/sites/peileme.art/log/error.log;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /www/sites/peileme.art/index;
+        allow all;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name peileme.art www.peileme.art;
+
+    access_log /www/sites/peileme.art/log/access.log main;
+    error_log /www/sites/peileme.art/log/error.log;
+    client_max_body_size 12m;
+
+    ssl_certificate /www/sites/peileme.art/ssl/fullchain.pem;
+    ssl_certificate_key /www/sites/peileme.art/ssl/privkey.pem;
+    ssl_protocols TLSv1.3 TLSv1.2;
+    ssl_session_cache shared:PEILEME_SSL:10m;
+    ssl_session_timeout 10m;
+
+    location ~ ^/(\.user.ini|\.htaccess|\.git|\.env|\.svn|\.project) {
+        return 404;
     }
 
     location / {
@@ -13,10 +42,11 @@ server {
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Forwarded-Host $host;
         proxy_connect_timeout 10s;
         proxy_read_timeout 90s;
-        client_max_body_size 64m;
     }
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
 }
