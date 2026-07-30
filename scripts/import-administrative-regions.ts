@@ -103,6 +103,10 @@ const loadAdministrativeRegions = async (csvPath: string) => {
 export const importAdministrativeRegions = async (csvPath: string) => {
   const rows = await loadAdministrativeRegions(csvPath);
   await withTransaction(async (client) => {
+    // Every administrative importer takes this table lock before discovery.
+    // It serializes administrative writers, so the child-code snapshot cannot
+    // be changed by another importer while preserving compatibility with the
+    // parameter importer's read-side table lock.
     await client.query(
       "LOCK TABLE administrative_regions IN SHARE ROW EXCLUSIVE MODE"
     );
@@ -118,8 +122,7 @@ export const importAdministrativeRegions = async (csvPath: string) => {
            FROM administrative_regions
            WHERE parent_code = ANY($1::text[])
              AND status = 'active'
-           ORDER BY code
-           FOR UPDATE`,
+           ORDER BY code`,
           [retiringProvinceCodes]
         )
       : { rows: [] };
@@ -130,6 +133,8 @@ export const importAdministrativeRegions = async (csvPath: string) => {
           .map((row) => row.parentCode as string)
       )
     ];
+    // This is the sole existing-row lock acquisition: both administrative and
+    // parameter importers lock administrative_regions in global code order.
     const lockCodes = [
       ...new Set([
         ...rows.map((row) => row.code),

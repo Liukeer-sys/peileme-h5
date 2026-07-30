@@ -492,10 +492,16 @@ an HTTPS government source and upserts in one transaction. Existing
 lock matching rows in code order, preflight the whole batch, and keep the
 `ON CONFLICT ... WHERE` identity predicate plus affected-row check as the
 concurrency-safe database boundary. Status and source metadata remain mutable.
-Take a `SHARE ROW EXCLUSIVE` table lock before child discovery. When a province
-is retired, lock all of its active children in code order and require every one
-to appear as retired in the same batch. All administrative row locks use the
-same sorted-code order.
+Take a `SHARE ROW EXCLUSIVE` table lock before child discovery. This serializes
+administrative importers and excludes their writes throughout discovery, while
+remaining compatible with the parameter importer's read-side table lock. When
+a province is retired, use an ordinary `SELECT` without a row-lock clause to
+collect every active child code. Merge those codes with all input and parent
+codes, deduplicate and sort globally, then acquire every existing
+administrative-region row through one `ORDER BY code FOR UPDATE` query. All
+later validation and upserts operate on those already-locked existing rows;
+they do not acquire administrative-region row locks in another order. Every
+active child must appear as retired in the same batch.
 Build `database/seeds/administrative-regions.csv` from the latest available
 Ministry of Civil Affairs administrative-division snapshot and include 31
 mainland province-level and 333 prefecture-level entries.
@@ -508,9 +514,10 @@ region_code,region_name,year,parameter_type,amount_fen,source_name,source_url,so
 
 It rejects unknown regions, duplicate region/year/type rows, non-positive
 amounts and non-government source hosts. It sorts and deduplicates region codes,
-then takes `FOR SHARE` row locks before validation and retains them through all
-parameter writes. This serializes validation with administrative retirement
-and follows the administrative importer's code-order convention.
+then takes every administrative-region lock through one
+`ORDER BY code FOR SHARE` query before validation and retains those locks
+through all parameter writes. This serializes validation with administrative
+retirement and follows the same global code-order convention.
 `scripts/lib/csv.ts` reads a bounded Buffer, decodes it through
 `TextDecoder("utf-8", { fatal: true })`, accepts BOM/CRLF/multiline quoted
 fields/escaped quotes, and rejects isolated CR or any character after a closing
@@ -575,6 +582,12 @@ Also assert:
   the retired parent;
 - a deterministic concurrent parameter import observes an active locked region
   and a concurrent retirement waits until commit;
+- a deterministic Hubei retirement/parameter cross-import test forces both
+  transactions to contend on province and prefecture rows, then proves they
+  serialize without `40P01` and without partial writes. In the forced order,
+  the parameter transaction commits while the region is active, then the
+  retirement commits; retaining that versioned historical parameter row for
+  the subsequently retired region is an accepted serial result;
 - invalid UTF-8, trailing quoted-field characters, isolated CR and oversize
   input fail with bounded path/line/column diagnostics;
 - two migration processes against one clean database both exit zero and leave

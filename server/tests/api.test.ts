@@ -970,6 +970,11 @@ describe("policy persistence foundation", () => {
       const canonicalPath = path.resolve(
         "database/seeds/administrative-regions.csv"
       );
+      const initialImport = runImport(
+        "scripts/import-administrative-regions.ts",
+        canonicalPath
+      );
+      expect(initialImport.status, initialImport.stderr).toBe(0);
       const tempDir = await mkdtemp(
         path.join(tmpdir(), "peileme-region-retire-race-")
       );
@@ -1490,6 +1495,209 @@ describe("policy persistence foundation", () => {
       expect(importResult?.status, importResult?.stderr).toBe(0);
     },
     12_000
+  );
+
+  it(
+    "uses one global code order for a province retirement and parameter import",
+    async () => {
+      const canonicalPath = path.resolve(
+        "database/seeds/administrative-regions.csv"
+      );
+      const initialImport = runImport(
+        "scripts/import-administrative-regions.ts",
+        canonicalPath
+      );
+      expect(initialImport.status, initialImport.stderr).toBe(0);
+      const tempDir = await mkdtemp(
+        path.join(tmpdir(), "peileme-region-parameter-order-")
+      );
+      const retirementPath = path.join(tempDir, "hubei-retirement.csv");
+      const parameterPath = path.join(tempDir, "hubei-parameters.csv");
+      const retirementApplication = `hubei-retirement-${process.pid}`;
+      const parameterApplication = `hubei-parameters-${process.pid}`;
+      const regionHeader =
+        "code,name,level,parent_code,status,source_name,source_url,source_snapshot_date\n";
+      const regionSource =
+        "中华人民共和国民政部," +
+        "https://www.mca.gov.cn/mzsj/xzqh/2025/202401xzqh.html,2024-12-31";
+      const hubeiRows = await query<{
+        code: string;
+        name: string;
+        level: string;
+        parent_code: string | null;
+      }>(
+        `SELECT code, name, level, parent_code
+         FROM administrative_regions
+         WHERE code = '420000' OR parent_code = '420000'
+         ORDER BY code`
+      );
+      await writeFile(
+        retirementPath,
+        regionHeader +
+          hubeiRows.rows
+            .map(
+              (row) =>
+                [
+                  row.code,
+                  row.name,
+                  row.level,
+                  row.parent_code ?? "",
+                  "retired",
+                  regionSource
+                ].join(",")
+            )
+            .join("\n") +
+          "\n",
+        "utf8"
+      );
+      await writeFile(
+        parameterPath,
+        "region_code,region_name,year,parameter_type,amount_fen,source_name," +
+          "source_url,source_published_at,status\n" +
+          "420000,湖北省,2098,minimum_monthly_wage,300000,人社部," +
+          "https://www.mohrss.gov.cn/official,2026-01-15,verified\n" +
+          "420100,武汉市,2098,minimum_monthly_wage,310000,人社部," +
+          "https://www.mohrss.gov.cn/official,2026-01-15,verified\n",
+        "utf8"
+      );
+      const retirementUrl = new URL(process.env.DATABASE_URL!);
+      retirementUrl.searchParams.set(
+        "application_name",
+        retirementApplication
+      );
+      const parameterUrl = new URL(process.env.DATABASE_URL!);
+      parameterUrl.searchParams.set(
+        "application_name",
+        parameterApplication
+      );
+
+      const blocker = await getPool().connect();
+      let blockerInTransaction = false;
+      let retirementPromise:
+        | ReturnType<typeof runImportAsync>
+        | undefined;
+      let parameterPromise:
+        | ReturnType<typeof runImportAsync>
+        | undefined;
+      let retirementResult:
+        | Awaited<ReturnType<typeof runImportAsync>>
+        | undefined;
+      let parameterResult:
+        | Awaited<ReturnType<typeof runImportAsync>>
+        | undefined;
+      let finalState:
+        | {
+            parent_status: string;
+            active_children: string;
+            imported_parameters: string;
+          }
+        | undefined;
+      try {
+        await blocker.query("BEGIN");
+        blockerInTransaction = true;
+        await blocker.query(
+          `SELECT code
+           FROM administrative_regions
+           WHERE code = '420000'
+           FOR UPDATE`
+        );
+
+        parameterPromise = runImportAsync(
+          "scripts/import-regional-parameters.ts",
+          parameterPath,
+          { ...process.env, DATABASE_URL: parameterUrl.toString() }
+        );
+        await waitUntil(async () => {
+          const waiting = await query<{ waiting: boolean }>(
+            `SELECT EXISTS (
+               SELECT 1 FROM pg_stat_activity
+               WHERE application_name = $1
+                 AND wait_event_type = 'Lock'
+             ) AS waiting`,
+            [parameterApplication]
+          );
+          return waiting.rows[0].waiting;
+        });
+
+        retirementPromise = runImportAsync(
+          "scripts/import-administrative-regions.ts",
+          retirementPath,
+          { ...process.env, DATABASE_URL: retirementUrl.toString() }
+        );
+        await waitUntil(async () => {
+          const waiting = await query<{ waiting: boolean }>(
+            `SELECT EXISTS (
+               SELECT 1 FROM pg_stat_activity
+               WHERE application_name = $1
+                 AND wait_event_type = 'Lock'
+             ) AS waiting`,
+            [retirementApplication]
+          );
+          return waiting.rows[0].waiting;
+        });
+
+        await blocker.query("COMMIT");
+        blockerInTransaction = false;
+        [retirementResult, parameterResult] = await Promise.all([
+          retirementPromise,
+          parameterPromise
+        ]);
+        finalState = (
+          await query<{
+            parent_status: string;
+            active_children: string;
+            imported_parameters: string;
+          }>(
+            `SELECT
+               max(status) FILTER (WHERE code = '420000') AS parent_status,
+               count(*) FILTER (
+                 WHERE parent_code = '420000' AND status = 'active'
+               )::text AS active_children,
+               (
+                 SELECT count(*)::text
+                 FROM regional_parameters
+                 WHERE year = 2098
+                   AND region_code = ANY(ARRAY['420000', '420100'])
+               ) AS imported_parameters
+             FROM administrative_regions
+             WHERE code = '420000' OR parent_code = '420000'`
+          )
+        ).rows[0];
+      } finally {
+        if (blockerInTransaction) await blocker.query("ROLLBACK");
+        blocker.release();
+        await Promise.allSettled([
+          retirementPromise,
+          parameterPromise
+        ].filter((item): item is Promise<unknown> => Boolean(item)));
+        await query(
+          `DELETE FROM regional_parameters
+           WHERE year = 2098
+             AND region_code = ANY(ARRAY['420000', '420100'])`
+        );
+        const restored = runImport(
+          "scripts/import-administrative-regions.ts",
+          canonicalPath
+        );
+        expect(restored.status, restored.stderr).toBe(0);
+        await rm(tempDir, { recursive: true, force: true });
+      }
+
+      expect(
+        retirementResult?.status,
+        `${retirementResult?.stdout}\n${retirementResult?.stderr}`
+      ).toBe(0);
+      expect(
+        parameterResult?.status,
+        `${parameterResult?.stdout}\n${parameterResult?.stderr}`
+      ).toBe(0);
+      expect(finalState).toEqual({
+        parent_status: "retired",
+        active_children: "0",
+        imported_parameters: "2"
+      });
+    },
+    15_000
   );
 
   it("re-runs migrations without changing imported policy data", async () => {
