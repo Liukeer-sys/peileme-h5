@@ -32,6 +32,23 @@ describe("test upload environment", () => {
     }
   });
 
+  it("refuses to claim an unknown prefixed directory without wrapper ownership proof", () => {
+    expect(testSetup.claimWrapperUploadDir).toBeTypeOf("function");
+    const unknown = mkdtempSync(path.join(tmpdir(), "peileme-test-uploads-"));
+    const sentinel = path.join(unknown, "sentinel.txt");
+    writeFileSync(sentinel, "keep", "utf8");
+
+    try {
+      expect(() =>
+        testSetup.claimWrapperUploadDir(unknown, "untrusted-token")
+      ).toThrow("Invalid wrapper-owned test upload directory");
+      expect(testSetup.cleanupTestUploadDir(unknown)).toBe(false);
+      expect(existsSync(sentinel)).toBe(true);
+    } finally {
+      rmSync(unknown, { recursive: true, force: true });
+    }
+  });
+
   it("retains ownership when removing an owned directory fails", () => {
     const owned = testSetup.createTestUploadDir();
 

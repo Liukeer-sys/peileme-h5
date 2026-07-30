@@ -108,13 +108,14 @@ Add focused tests to `server/tests/run-api-tests.test.ts` for:
 - SIGTERM cleanup and exit `143`, including a child that ignores the first signal until the grace timer sends `SIGKILL`;
 - a second SIGINT/SIGTERM immediately escalating the active child to `SIGKILL` while preserving the first signal's exit `130`/`143`;
 - real detached process trees where the leader exits on the first signal while an in-group descendant ignores it, covering both grace-timer and second-signal escalation before down/release;
+- a real detached process tree whose leader receives SIGTERM directly, requiring the wrapper to record the child-originated signal, terminate the remaining group, and wait before down/release;
 - a dead owner sidecar replaced by a new owner;
 - an idle mutex replacing a stale sidecar whose PID has been reused by a live, unrelated process;
 - mutex release completing promptly when a client attempts to keep its connection open;
 - two contenders released from the same barrier against one stale sidecar, with exactly one winner and one fast active-lock failure;
 - active ownership returning nonzero without issuing any Compose command, with separate diagnostics for a known sidecar owner and an occupied mutex with no sidecar;
 - cleanup and lock-release failures preserving an earlier up/test failure, while a release failure after success returns `1`;
-- explicit `--lifecycle-test-exit-code`, `--lifecycle-test-hold-ms`, and `--lifecycle-test-stubborn-ms` acceptance controls.
+- explicit `--lifecycle-test-exit-code`, `--lifecycle-test-hold-ms`, and `--lifecycle-test-stubborn-ms` acceptance controls; the stubborn control is signal-acceptance-only and exits `97` when its timeout is reached without the expected signal.
 
 Run:
 
@@ -134,7 +135,7 @@ After ownership, execute Compose up and Vitest. A `finally` block must run:
 docker compose -f docker-compose.test.yml down --volumes --remove-orphans
 ```
 
-Preserve the up or test exit code through cleanup and lock-release failures. On the first SIGINT/SIGTERM, forward that signal to the active child process group where supported, save the detached process-group ID independently from the direct child, start a two-second grace timer, and escalate the saved group to `SIGKILL` when any member remains alive. A second signal escalates immediately, including after the group leader has exited. Confirm the saved group no longer exists before entering down; clear its timer and ID only after that check. Platforms or permissions without process-group control fall back to signalling the direct child. Then run cleanup, release ownership, and terminate with the original signal status `130`/`143`.
+Preserve the up or test exit code through cleanup and lock-release failures. On the first SIGINT/SIGTERM, forward that signal to the active child process group where supported, save the detached process-group ID independently from the direct child, start a two-second grace timer, and escalate the saved group to `SIGKILL` when any member remains alive. A second signal escalates immediately, including after the group leader has exited. When the direct child exits from a signal before the wrapper receives one, record that signal before updating process-group state, terminate the remaining group through the same escalation path, and use the signal's `128 + signal number` exit status. Confirm the saved group no longer exists before entering down; clear its timer and ID only after that check. Platforms or permissions without process-group control fall back to signalling the direct child. Then run cleanup, release ownership, and terminate with the original signal status.
 
 Merge these scripts into `package.json`:
 
@@ -160,7 +161,7 @@ process.env.COOKIE_DOMAIN = "";
 process.env.CSRF_SECRET = "test-csrf-secret-that-is-longer-than-thirty-two-characters";
 ```
 
-Create each run's upload directory with `mkdtempSync(path.join(tmpdir(), "peileme-test-uploads-"))`. Register only directories created by the current setup module and recursively remove those registered paths in `afterAll`. `server/tests/test-setup.test.ts` must prove that cleanup removes its owned directory and preserves an unknown historical directory and sentinel.
+For direct `npm test`, create each run's upload directory with `mkdtempSync(path.join(tmpdir(), "peileme-test-uploads-"))`, register it in the setup module, and remove it in `afterAll`. For `test:api`, the wrapper creates one lifecycle directory while holding the database mutex, writes a random-token ownership marker, and passes the directory and token explicitly to Vitest. Every worker validates that marker and uses the shared directory without taking deletion ownership; the wrapper performs the single idempotent removal in its outer `finally`, including child-SIGKILL and down/release failure paths. `server/tests/test-setup.test.ts` must prove that cleanup removes its owned directory and preserves an unknown directory and sentinel, including an unknown directory with the expected filename prefix.
 
 Add behavior-level assertions to `server/tests/api.test.ts`:
 
@@ -177,7 +178,7 @@ npx vitest run server/tests/run-api-tests.test.ts
 npm run test:api
 ```
 
-Expected: 19 wrapper/lock tests pass; the complete server suite reports 34/34; the lock sidecar, mutex listener, Compose container/network, and port `55432` are removed.
+Expected: 22 wrapper/lock tests pass; the complete server suite reports 38/38; the wrapper-owned upload directory, lock sidecar, mutex listener, Compose container/network, and port `55432` are removed.
 
 Exercise a real nonzero child:
 

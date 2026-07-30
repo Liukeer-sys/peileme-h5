@@ -1,14 +1,54 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll } from "vitest";
 
 const ownedUploadDirs = new Set<string>();
+const testUploadDirPattern = /^peileme-test-uploads-[A-Za-z0-9_-]+$/;
+const wrapperOwnerFilename = ".peileme-wrapper-owner.json";
+
+const isSafeTestUploadDir = (uploadDir: string) => {
+  const resolvedUploadDir = path.resolve(uploadDir);
+  return (
+    path.dirname(resolvedUploadDir) === path.resolve(tmpdir()) &&
+    testUploadDirPattern.test(path.basename(resolvedUploadDir))
+  );
+};
 
 export const createTestUploadDir = () => {
   const uploadDir = mkdtempSync(path.join(tmpdir(), "peileme-test-uploads-"));
   ownedUploadDirs.add(path.resolve(uploadDir));
   return uploadDir;
+};
+
+export const claimWrapperUploadDir = (uploadDir: string, token: string) => {
+  const resolvedUploadDir = path.resolve(uploadDir);
+  let persistedToken = "";
+  try {
+    persistedToken = JSON.parse(
+      readFileSync(path.join(resolvedUploadDir, wrapperOwnerFilename), "utf8")
+    ).token;
+  } catch {
+    persistedToken = "";
+  }
+  if (
+    !isSafeTestUploadDir(resolvedUploadDir) ||
+    !existsSync(resolvedUploadDir) ||
+    !statSync(resolvedUploadDir).isDirectory() ||
+    !token ||
+    persistedToken !== token
+  ) {
+    throw new Error(
+      `Invalid wrapper-owned test upload directory: ${resolvedUploadDir}`
+    );
+  }
+  return resolvedUploadDir;
 };
 
 export const cleanupTestUploadDir = (
@@ -33,9 +73,15 @@ process.env.JWT_SECRET = "test-jwt-secret-that-is-longer-than-thirty-two-charact
 process.env.OTP_SECRET = "test-otp-secret-that-is-longer-than-thirty-two-characters";
 process.env.OTP_DEBUG = "true";
 process.env.REGISTRATION_REQUIRE_INVITE = "false";
-const testUploadDir = createTestUploadDir();
+const wrapperUploadDir = process.env.TEST_WRAPPER_UPLOAD_DIR;
+const testUploadDir = wrapperUploadDir
+  ? claimWrapperUploadDir(
+      wrapperUploadDir,
+      process.env.TEST_WRAPPER_UPLOAD_TOKEN ?? ""
+    )
+  : createTestUploadDir();
 process.env.UPLOAD_DIR = testUploadDir;
 
 afterAll(() => {
-  cleanupTestUploadDir(testUploadDir);
+  if (!wrapperUploadDir) cleanupTestUploadDir(testUploadDir);
 });

@@ -66,7 +66,43 @@ const isProcessGroupAlive = (pgid: number) => {
   }
 };
 
-const spawnLeaderWithStubbornDescendant = (readyPath: string) => {
+const runSpawnedCommand = ({
+  command,
+  args,
+  cwd,
+  env,
+  onSpawn
+}: {
+  command: string;
+  args: string[];
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+  onSpawn: (
+    child: ChildProcess,
+    metadata?: { processGroupId: number | null }
+  ) => void;
+}) =>
+  new Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>(
+    (resolve, reject) => {
+      const child = spawn(command, args, {
+        cwd,
+        env,
+        detached: process.platform !== "win32",
+        stdio: "ignore"
+      });
+      onSpawn(child, {
+        processGroupId:
+          process.platform !== "win32" && child.pid ? child.pid : null
+      });
+      child.once("error", reject);
+      child.once("exit", (exitCode, signal) => resolve({ exitCode, signal }));
+    }
+  );
+
+const spawnLeaderWithStubbornDescendant = (
+  readyPath: string,
+  leaderHandlesSignals = true
+) => {
   const descendantSource = [
     "const fs = require('node:fs');",
     "process.on('SIGINT', () => {});",
@@ -77,8 +113,12 @@ const spawnLeaderWithStubbornDescendant = (readyPath: string) => {
   const leaderSource = [
     "const { spawn } = require('node:child_process');",
     `spawn(process.execPath, ['-e', ${JSON.stringify(descendantSource)}], { stdio: 'ignore' });`,
-    "process.on('SIGINT', () => process.exit(0));",
-    "process.on('SIGTERM', () => process.exit(0));",
+    leaderHandlesSignals
+      ? "process.on('SIGINT', () => process.exit(0));"
+      : "",
+    leaderHandlesSignals
+      ? "process.on('SIGTERM', () => process.exit(0));"
+      : "",
     "setInterval(() => {}, 1000);"
   ].join("");
 
@@ -123,10 +163,12 @@ afterEach(async () => {
 describe("API test lifecycle wrapper", () => {
   const exerciseLeaderExitWithStubbornDescendant = async ({
     signal,
-    secondSignal
+    secondSignal,
+    signalOrigin = "wrapper"
   }: {
     signal: "SIGINT" | "SIGTERM";
     secondSignal: boolean;
+    signalOrigin?: "wrapper" | "child";
   }) => {
     const { releaseTestDbLock, runApiTestLifecycle } = await loadWrapper();
     const signalSource = new EventEmitter();
@@ -179,7 +221,10 @@ describe("API test lifecycle wrapper", () => {
             return { exitCode: 0, signal: null };
           }
 
-          const leader = spawnLeaderWithStubbornDescendant(readyPath);
+          const leader = spawnLeaderWithStubbornDescendant(
+            readyPath,
+            signalOrigin === "wrapper"
+          );
           if (!leader.pid || leader.pid === process.pid) {
             throw new Error("Expected a distinct detached process-group leader");
           }
@@ -209,7 +254,11 @@ describe("API test lifecycle wrapper", () => {
         "stubborn descendant readiness"
       );
 
-      signalSource.emit(signal);
+      if (signalOrigin === "wrapper") {
+        signalSource.emit(signal);
+      } else {
+        process.kill(processGroupId, signal);
+      }
       if (secondSignal) {
         await withWatchdog(leaderExit, 500, "leader exit");
         await new Promise((resolve) => setImmediate(resolve));
@@ -753,6 +802,140 @@ describe("API test lifecycle wrapper", () => {
       await expect(access(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
     }
   );
+
+  it.runIf(process.platform !== "win32")(
+    "kills a stubborn descendant when the leader receives a signal directly",
+    async () => {
+      const observation = await exerciseLeaderExitWithStubbornDescendant({
+        signal: "SIGTERM",
+        secondSignal: false,
+        signalOrigin: "child"
+      });
+
+      expect(observation.result).toEqual({
+        exitCode: 143,
+        signal: "SIGTERM"
+      });
+      expect(observation.phases).toEqual(["up", "test", "down"]);
+      expect(observation.groupAliveAtDown).toBe(false);
+      expect(observation.groupAliveAtRelease).toBe(false);
+      expect(observation.groupAliveAfterLifecycle).toBe(false);
+      expect(observation.descendantAliveAfterLifecycle).toBe(false);
+      await expect(access(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  );
+
+  it("returns 97 when the stubborn acceptance child reaches its timeout", async () => {
+    const { runApiTestLifecycle } = await loadWrapper();
+
+    const result = await withWatchdog(
+      runApiTestLifecycle({
+        lockPath,
+        lockPort,
+        lifecycleArgs: ["--lifecycle-test-stubborn-ms=10"],
+        runCommand: async ({
+          phase,
+          ...command
+        }: {
+          phase: string;
+          command: string;
+          args: string[];
+          cwd: string;
+          env?: NodeJS.ProcessEnv;
+          onSpawn: (
+            child: ChildProcess,
+            metadata?: { processGroupId: number | null }
+          ) => void;
+        }) =>
+          phase === "test"
+            ? runSpawnedCommand(command)
+            : { exitCode: 0, signal: null }
+      }),
+      1_000,
+      "stubborn acceptance timeout"
+    );
+
+    expect(result).toEqual({ exitCode: 97, signal: null });
+    await expect(access(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("removes its upload directory after SIGKILL and preserves an unknown directory", async () => {
+    const { releaseTestDbLock, runApiTestLifecycle } = await loadWrapper();
+    const unknownUploadDir = await mkdtemp(
+      path.join(tmpdir(), "peileme-unknown-upload-")
+    );
+    const unknownSentinel = path.join(unknownUploadDir, "sentinel.txt");
+    await writeFile(unknownSentinel, "keep", "utf8");
+    const previousWrapperUploadDir = process.env.TEST_WRAPPER_UPLOAD_DIR;
+    process.env.TEST_WRAPPER_UPLOAD_DIR = unknownUploadDir;
+    let wrapperUploadDir = "";
+    const errors: string[] = [];
+
+    try {
+      const result = await withWatchdog(
+        runApiTestLifecycle({
+          lockPath,
+          lockPort,
+          logError: (message: string) => errors.push(message),
+          releaseLock: async (lock: unknown) => {
+            await releaseTestDbLock(lock);
+            throw new Error("release failed");
+          },
+          runCommand: async ({
+            phase,
+            cwd,
+            env,
+            onSpawn
+          }: {
+            phase: string;
+            cwd: string;
+            env?: NodeJS.ProcessEnv;
+            onSpawn: (
+              child: ChildProcess,
+              metadata?: { processGroupId: number | null }
+            ) => void;
+          }) => {
+            if (phase === "up") return { exitCode: 0, signal: null };
+            if (phase === "down") return { exitCode: 29, signal: null };
+            wrapperUploadDir = env?.TEST_WRAPPER_UPLOAD_DIR ?? "";
+            if (!wrapperUploadDir) return { exitCode: 91, signal: null };
+            return runSpawnedCommand({
+              command: process.execPath,
+              args: [
+                "-e",
+                "const fs = require('node:fs');" +
+                  "const path = require('node:path');" +
+                  "fs.writeFileSync(path.join(process.env.TEST_WRAPPER_UPLOAD_DIR, 'marker.txt'), 'started');" +
+                  "process.kill(process.pid, 'SIGKILL');"
+              ],
+              cwd,
+              env,
+              onSpawn
+            });
+          }
+        }),
+        1_000,
+        "SIGKILL upload cleanup lifecycle"
+      );
+
+      expect(result).toEqual({ exitCode: 137, signal: "SIGKILL" });
+      expect(wrapperUploadDir).not.toBe("");
+      expect(wrapperUploadDir).not.toBe(unknownUploadDir);
+      await expect(access(wrapperUploadDir)).rejects.toMatchObject({
+        code: "ENOENT"
+      });
+      await expect(access(unknownSentinel)).resolves.toBeUndefined();
+      expect(errors.join("\n")).toContain("cleanup failed with exit code 29");
+      expect(errors.join("\n")).toContain("release failed");
+    } finally {
+      if (previousWrapperUploadDir === undefined) {
+        delete process.env.TEST_WRAPPER_UPLOAD_DIR;
+      } else {
+        process.env.TEST_WRAPPER_UPLOAD_DIR = previousWrapperUploadDir;
+      }
+      await rm(unknownUploadDir, { recursive: true, force: true });
+    }
+  });
 
   it("parses explicit lifecycle-only failure, hold, and stubborn controls", async () => {
     const { parseLifecycleArgs } = await loadWrapper();

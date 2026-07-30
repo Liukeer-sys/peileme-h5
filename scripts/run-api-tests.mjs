@@ -1,17 +1,20 @@
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
-import { readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
+import { constants as osConstants, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const COMPOSE_FILE = "docker-compose.test.yml";
 const ACTIVE_LOCK_EXIT_CODE = 73;
-const SIGNAL_EXIT_CODES = {
-  SIGINT: 130,
-  SIGTERM: 143
-};
+const STUBBORN_ACCEPTANCE_MISSED_SIGNAL_EXIT_CODE = 97;
+const TEST_UPLOAD_BASENAME_PREFIX = "peileme-test-uploads-";
+const TEST_UPLOAD_PATH_PREFIX = path.join(
+  tmpdir(),
+  TEST_UPLOAD_BASENAME_PREFIX
+);
+const TEST_UPLOAD_OWNER_FILENAME = ".peileme-wrapper-owner.json";
 
 export const TEST_DB_LOCK_PATH = path.join(
   tmpdir(),
@@ -138,6 +141,38 @@ export const releaseTestDbLock = async (lock) => {
   }
 };
 
+const createLifecycleUploadOwnership = async () => {
+  const directory = await mkdtemp(TEST_UPLOAD_PATH_PREFIX);
+  const ownership = {
+    directory: path.resolve(directory),
+    token: crypto.randomUUID()
+  };
+  try {
+    await writeFile(
+      path.join(ownership.directory, TEST_UPLOAD_OWNER_FILENAME),
+      `${JSON.stringify({ token: ownership.token })}\n`,
+      { encoding: "utf8", flag: "wx" }
+    );
+    return ownership;
+  } catch (error) {
+    await rm(ownership.directory, { recursive: true, force: true });
+    throw error;
+  }
+};
+
+const cleanupLifecycleUploadOwnership = async (ownership) => {
+  if (!ownership) return false;
+  const directory = path.resolve(ownership.directory);
+  if (
+    path.dirname(directory) !== path.resolve(tmpdir()) ||
+    !path.basename(directory).startsWith(TEST_UPLOAD_BASENAME_PREFIX)
+  ) {
+    throw new Error(`Refusing to remove unowned upload directory: ${directory}`);
+  }
+  await rm(directory, { recursive: true, force: true });
+  return true;
+};
+
 export const parseLifecycleArgs = (args = []) => {
   let forcedTestExitCode = null;
   let holdMs = 0;
@@ -177,10 +212,11 @@ export const parseLifecycleArgs = (args = []) => {
   return { forcedTestExitCode, holdMs, stubbornMs, vitestArgs };
 };
 
-const spawnCommand = ({ command, args, cwd, onSpawn, logError }) =>
+const spawnCommand = ({ command, args, cwd, env, onSpawn, logError }) =>
   new Promise((resolve) => {
     const child = spawn(command, args, {
       cwd,
+      env,
       stdio: "inherit",
       shell: false,
       detached: process.platform !== "win32"
@@ -258,10 +294,13 @@ const waitForHold = (holdMs, wasSignalled) =>
     }, Math.min(50, holdMs));
   });
 
+const signalExitCode = (signal) => {
+  const signalNumber = osConstants.signals[signal];
+  return Number.isInteger(signalNumber) ? 128 + signalNumber : null;
+};
+
 const resultExitCode = (result) => {
-  if (result.signal && result.signal in SIGNAL_EXIT_CODES) {
-    return SIGNAL_EXIT_CODES[result.signal];
-  }
+  if (result.signal) return signalExitCode(result.signal) ?? 1;
   return result.exitCode ?? 1;
 };
 
@@ -295,6 +334,35 @@ export const runApiTestLifecycle = async ({
     };
   }
 
+  let uploadOwnership;
+  try {
+    uploadOwnership = await createLifecycleUploadOwnership();
+  } catch (error) {
+    logError(
+      `Failed to create lifecycle upload directory: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    try {
+      await releaseLock(lock);
+    } catch (releaseError) {
+      logError(
+        `Test database lock release failed: ${
+          releaseError instanceof Error
+            ? releaseError.message
+            : String(releaseError)
+        }`
+      );
+    }
+    return { exitCode: 1, signal: null };
+  }
+
+  const testEnvironment = {
+    ...process.env,
+    UPLOAD_DIR: uploadOwnership.directory,
+    TEST_WRAPPER_UPLOAD_DIR: uploadOwnership.directory,
+    TEST_WRAPPER_UPLOAD_TOKEN: uploadOwnership.token
+  };
   const { forcedTestExitCode, holdMs, stubbornMs, vitestArgs } = parsedArgs;
   let activeChild = null;
   let activeProcessGroupId = null;
@@ -401,13 +469,14 @@ export const runApiTestLifecycle = async ({
   signalSource.on("SIGINT", onSigint);
   signalSource.on("SIGTERM", onSigterm);
 
-  const runPhase = async (nextPhase, command, args) => {
+  const runPhase = async (nextPhase, command, args, env = process.env) => {
     phase = nextPhase;
     const result = await runCommand({
       phase: nextPhase,
       command,
       args,
       cwd,
+      env,
       logError,
       onSpawn: (child, metadata = {}) => {
         activeChild = child;
@@ -424,13 +493,17 @@ export const runApiTestLifecycle = async ({
         if (requestedSignal) forwardFirstSignal();
       }
     });
+    const childOriginatedSignal = Boolean(result.signal && !requestedSignal);
+    if (childOriginatedSignal) requestedSignal = result.signal;
     activeChild = null;
+    if (childOriginatedSignal && activeProcessGroupId !== null) {
+      forwardFirstSignal();
+    }
     if (requestedSignal && nextPhase !== "down") {
       await waitForTrackedTreeExit();
     } else {
       clearTrackedProcessGroup();
     }
-    if (result.signal && !requestedSignal) requestedSignal = result.signal;
     return result;
   };
 
@@ -457,10 +530,14 @@ export const runApiTestLifecycle = async ({
       } else if (stubbornMs !== null) {
         testArgs = [
           "-e",
-          "const peilemeLifecycleStubborn = true;" +
+          "const fs = require('node:fs');" +
+            "const path = require('node:path');" +
+            "const peilemeLifecycleStubborn = true;" +
+            "const uploadDir = process.env.TEST_WRAPPER_UPLOAD_DIR;" +
+            "if (uploadDir) fs.writeFileSync(path.join(uploadDir, 'stubborn-child-started'), 'started');" +
             "process.on('SIGINT', () => {});" +
             "process.on('SIGTERM', () => {});" +
-            `setTimeout(() => process.exit(peilemeLifecycleStubborn ? 0 : 1), ${stubbornMs});`
+            `setTimeout(() => process.exit(peilemeLifecycleStubborn ? ${STUBBORN_ACCEPTANCE_MISSED_SIGNAL_EXIT_CODE} : 1), ${stubbornMs});`
         ];
       } else {
         testArgs = [
@@ -470,51 +547,69 @@ export const runApiTestLifecycle = async ({
           ...vitestArgs
         ];
       }
-      const test = await runPhase("test", testCommand, testArgs);
+      const test = await runPhase(
+        "test",
+        testCommand,
+        testArgs,
+        testEnvironment
+      );
       primaryExitCode = resultExitCode(test);
     }
 
     if (requestedSignal) {
       primaryExitCode =
-        SIGNAL_EXIT_CODES[requestedSignal] ?? (primaryExitCode || 1);
+        signalExitCode(requestedSignal) ?? (primaryExitCode || 1);
     }
   } finally {
-    await waitForTrackedTreeExit();
     try {
-      const down = await runPhase("down", "docker", [
-        "compose",
-        "-f",
-        COMPOSE_FILE,
-        "down",
-        "--volumes",
-        "--remove-orphans"
-      ]);
-      const downExitCode = resultExitCode(down);
-      if (primaryExitCode === 0 && downExitCode !== 0) {
-        primaryExitCode = downExitCode;
-      } else if (downExitCode !== 0) {
-        logError(`Test database cleanup failed with exit code ${downExitCode}`);
-      }
-    } catch (error) {
-      logError(
-        `Test database cleanup failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`
-      );
-      if (primaryExitCode === 0) primaryExitCode = 1;
-    } finally {
+      await waitForTrackedTreeExit();
       try {
-        await releaseLock(lock);
+        const down = await runPhase("down", "docker", [
+          "compose",
+          "-f",
+          COMPOSE_FILE,
+          "down",
+          "--volumes",
+          "--remove-orphans"
+        ]);
+        const downExitCode = resultExitCode(down);
+        if (primaryExitCode === 0 && downExitCode !== 0) {
+          primaryExitCode = downExitCode;
+        } else if (downExitCode !== 0) {
+          logError(`Test database cleanup failed with exit code ${downExitCode}`);
+        }
       } catch (error) {
         logError(
-          `Test database lock release failed: ${
+          `Test database cleanup failed: ${
             error instanceof Error ? error.message : String(error)
           }`
         );
         if (primaryExitCode === 0) primaryExitCode = 1;
       } finally {
-        signalSource.off("SIGINT", onSigint);
-        signalSource.off("SIGTERM", onSigterm);
+        try {
+          await releaseLock(lock);
+        } catch (error) {
+          logError(
+            `Test database lock release failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          );
+          if (primaryExitCode === 0) primaryExitCode = 1;
+        } finally {
+          signalSource.off("SIGINT", onSigint);
+          signalSource.off("SIGTERM", onSigterm);
+        }
+      }
+    } finally {
+      try {
+        await cleanupLifecycleUploadOwnership(uploadOwnership);
+      } catch (error) {
+        logError(
+          `Test upload cleanup failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+        if (primaryExitCode === 0) primaryExitCode = 1;
       }
     }
   }
