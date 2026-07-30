@@ -46,6 +46,31 @@ afterAll(async () => {
   await closePool();
 });
 
+describe("CORS policy", () => {
+  it("authorizes configured main and AI origins", async () => {
+    for (const origin of [
+      "http://localhost:5173",
+      "http://ai.localhost:5174"
+    ]) {
+      const response = await request(createApp())
+        .get("/api/public/config")
+        .set("origin", origin)
+        .expect(200);
+      expect(response.headers["access-control-allow-origin"]).toBe(origin);
+      expect(response.headers["access-control-allow-credentials"]).toBe("true");
+    }
+  });
+
+  it("does not authorize an unknown origin", async () => {
+    const response = await request(createApp())
+      .get("/api/public/config")
+      .set("origin", "https://unknown.example")
+      .expect(200);
+
+    expect(response.headers["access-control-allow-origin"]).toBeUndefined();
+  });
+});
+
 describe("health and authentication", () => {
   it("reports database and OTP channel status", async () => {
     const response = await request(createApp()).get("/api/health").expect(200);
