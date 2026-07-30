@@ -119,7 +119,7 @@ const loadRegionalParameters = async (csvPath: string) => {
 export const importRegionalParameters = async (csvPath: string) => {
   const rows = await loadRegionalParameters(csvPath);
   await withTransaction(async (client) => {
-    const regionCodes = [...new Set(rows.map((row) => row.regionCode))];
+    const regionCodes = [...new Set(rows.map((row) => row.regionCode))].sort();
     const regions = await client.query<{
       code: string;
       name: string;
@@ -127,7 +127,9 @@ export const importRegionalParameters = async (csvPath: string) => {
     }>(
       `SELECT code, name, status
        FROM administrative_regions
-       WHERE code = ANY($1::text[])`,
+       WHERE code = ANY($1::text[])
+       ORDER BY code
+       FOR SHARE`,
       [regionCodes]
     );
     const regionState = new Map(

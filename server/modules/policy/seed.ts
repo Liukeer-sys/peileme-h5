@@ -1,30 +1,115 @@
 import { withTransaction } from "../../db.js";
 
 const severanceDefinition = {
-  schemaVersion: 1,
-  terminationModes: {
-    mutual_agreement: "N",
-    employer_notice: "N_PLUS_ONE",
-    unlawful_termination: "TWO_N",
-    employee_resignation: "ZERO",
-    unclear: "REVIEW"
+  schemaVersion: 2,
+  decisionModel: {
+    mutualAgreement: {
+      employerProposed: {
+        compensation: "N"
+      },
+      employeeProposed: {
+        compensation: "ZERO",
+        agreementReviewRequired: true
+      }
+    },
+    article40EmployerTermination: {
+      notice30Days: {
+        compensation: "N",
+        noticePayMonths: 0
+      },
+      paymentInLieu: {
+        compensation: "N",
+        noticePayMonths: 1
+      }
+    },
+    employeeTermination: {
+      article38: {
+        compensation: "N"
+      },
+      voluntaryResignation: {
+        compensation: "ZERO"
+      }
+    },
+    unlawfulTermination: {
+      primaryRemedy: "CONTINUE_PERFORMANCE",
+      fallbackCompensation: "TWO_N",
+      fallbackWhen: [
+        "EMPLOYEE_DOES_NOT_REQUEST_CONTINUATION",
+        "CONTINUED_PERFORMANCE_IMPOSSIBLE"
+      ]
+    },
+    unclear: {
+      result: "REVIEW"
+    }
   },
-  serviceFraction: {
+  serviceYearFraction: {
     lessThanSixMonths: 0.5,
     atLeastSixMonths: 1
   },
-  highSalaryCapMultiplier: 3,
-  highSalaryServiceYearCap: 12
+  highSalaryCap: {
+    localAverageMultiplier: 3,
+    serviceYearCap: 12
+  }
 };
+
+const laborContractLawUrl =
+  "https://www.mohrss.gov.cn/xxgk2020/fdzdgknr/zcfg/fl/202011/t20201102_394622_wap.html";
 
 const severanceSourceSnapshot = [
   {
-    name: "中华人民共和国劳动合同法",
+    instrument: "中华人民共和国劳动合同法",
+    article: "第三十六条",
+    canonicalUrl: laborContractLawUrl,
+    appliesTo: "mutual_agreement"
+  },
+  {
+    instrument: "中华人民共和国劳动合同法",
+    article: "第三十七条",
+    canonicalUrl: laborContractLawUrl,
+    appliesTo: "voluntary_resignation"
+  },
+  {
+    instrument: "中华人民共和国劳动合同法",
+    article: "第三十八条",
+    canonicalUrl: laborContractLawUrl,
+    appliesTo: "employee_statutory_termination"
+  },
+  {
+    instrument: "中华人民共和国劳动合同法",
+    article: "第四十条",
+    canonicalUrl: laborContractLawUrl,
+    appliesTo: "employer_notice_or_payment_in_lieu"
+  },
+  {
+    instrument: "中华人民共和国劳动合同法",
+    article: "第四十六条",
+    canonicalUrl: laborContractLawUrl,
+    appliesTo: "statutory_compensation_eligibility"
+  },
+  {
+    instrument: "中华人民共和国劳动合同法",
     article: "第四十七条",
-    authority: "中华人民共和国人力资源和社会保障部",
-    url: "https://www.mohrss.gov.cn/xxgk2020/fdzdgknr/zcfg/fl/202011/t20201102_394622_wap.html",
-    publishedDate: "2012-12-28",
-    effectiveDate: "2013-07-01"
+    canonicalUrl: laborContractLawUrl,
+    appliesTo: "compensation_years_and_salary_cap"
+  },
+  {
+    instrument: "中华人民共和国劳动合同法",
+    article: "第四十八条",
+    canonicalUrl: laborContractLawUrl,
+    appliesTo: "unlawful_termination_remedy_priority"
+  },
+  {
+    instrument: "中华人民共和国劳动合同法",
+    article: "第八十七条",
+    canonicalUrl: laborContractLawUrl,
+    appliesTo: "unlawful_termination_two_n"
+  },
+  {
+    instrument: "中华人民共和国劳动合同法实施条例",
+    article: "第二十七条",
+    canonicalUrl:
+      "https://www.mohrss.gov.cn/xxgk2020/fdzdgknr/zcfg/fg/202011/t20201103_394939_wap.html",
+    appliesTo: "average_monthly_wage_definition"
   }
 ];
 

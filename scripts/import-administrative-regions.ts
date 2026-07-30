@@ -103,6 +103,26 @@ const loadAdministrativeRegions = async (csvPath: string) => {
 export const importAdministrativeRegions = async (csvPath: string) => {
   const rows = await loadAdministrativeRegions(csvPath);
   await withTransaction(async (client) => {
+    await client.query(
+      "LOCK TABLE administrative_regions IN SHARE ROW EXCLUSIVE MODE"
+    );
+    const retiringProvinceCodes = rows
+      .filter(
+        (row) => row.level === "province" && row.status === "retired"
+      )
+      .map((row) => row.code)
+      .sort();
+    const activeChildren = retiringProvinceCodes.length
+      ? await client.query<{ code: string; parent_code: string }>(
+          `SELECT code, parent_code
+           FROM administrative_regions
+           WHERE parent_code = ANY($1::text[])
+             AND status = 'active'
+           ORDER BY code
+           FOR UPDATE`,
+          [retiringProvinceCodes]
+        )
+      : { rows: [] };
     const parentCodes = [
       ...new Set(
         rows
@@ -111,7 +131,11 @@ export const importAdministrativeRegions = async (csvPath: string) => {
       )
     ];
     const lockCodes = [
-      ...new Set([...rows.map((row) => row.code), ...parentCodes])
+      ...new Set([
+        ...rows.map((row) => row.code),
+        ...parentCodes,
+        ...activeChildren.rows.map((row) => row.code)
+      ])
     ].sort();
     const lockedRegions = lockCodes.length
       ? await client.query<{
@@ -145,6 +169,17 @@ export const importAdministrativeRegions = async (csvPath: string) => {
         throw new Error(
           `Administrative identity mismatch for ${row.code}; ` +
             "name, level and parent_code are immutable"
+        );
+      }
+    }
+
+    const incomingRegions = new Map(rows.map((row) => [row.code, row]));
+    for (const child of activeChildren.rows) {
+      const incomingChild = incomingRegions.get(child.code);
+      if (!incomingChild || incomingChild.status !== "retired") {
+        throw new Error(
+          `Province ${child.parent_code} cannot retire while child ` +
+            `${child.code} remains active; retire every active child in the same batch`
         );
       }
     }

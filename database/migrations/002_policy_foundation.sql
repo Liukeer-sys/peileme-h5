@@ -123,7 +123,8 @@ CREATE TABLE announcements (
   ends_at TIMESTAMPTZ,
   created_by UUID REFERENCES users(id) ON DELETE SET NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (ends_at IS NULL OR starts_at IS NULL OR ends_at >= starts_at)
 );
 
 CREATE INDEX policy_rule_versions_status_idx

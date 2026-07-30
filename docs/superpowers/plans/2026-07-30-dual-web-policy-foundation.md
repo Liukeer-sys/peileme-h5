@@ -232,8 +232,11 @@ git commit -m "test: supervise PostgreSQL integration database"
 - Create: `scripts/lib/csv.ts`
 - Create: `scripts/lib/official-source.ts`
 - Create: `server/modules/policy/seed.ts`
+- Create: `server/tests/csv.test.ts`
+- Create: `server/tests/migration-concurrency.test.ts`
 - Create: `tsconfig.scripts.json`
 - Modify: `package.json`
+- Modify: `server/migrate.ts`
 - Modify: `server/seed.ts`
 - Modify: `server/tests/api.test.ts`
 - Modify: `docs/superpowers/plans/2026-07-30-dual-web-policy-foundation.md`
@@ -276,6 +279,12 @@ Also reproduce and lock these failures before implementation:
 - an ordinary region upsert can change an existing code's name or parent;
 - the wage fixture uses a repost instead of the Ministry primary URL and
   includes an unsupported Q&A-derived prefecture value.
+- a province can be retired while active prefecture children remain;
+- parameter validation can race a concurrent region retirement;
+- concurrent migration processes can both enter DDL on a clean database;
+- malformed UTF-8, isolated CR, and trailing bytes after a quoted CSV field
+  are accepted;
+- an announcement can end before it starts.
 
 - [ ] **Step 2: Run the assertion and verify failure**
 
@@ -406,7 +415,8 @@ CREATE TABLE announcements (
   ends_at TIMESTAMPTZ,
   created_by UUID REFERENCES users(id) ON DELETE SET NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (ends_at IS NULL OR starts_at IS NULL OR ends_at >= starts_at)
 );
 
 CREATE INDEX assessments_channel_time_idx
@@ -434,9 +444,31 @@ Implement one database transaction with this sequence:
    differs;
 6. insert the four role capabilities using `ON CONFLICT DO NOTHING`.
 
-The baseline definition uses `schemaVersion: 1`, the five termination modes,
-the two service fractions, multiplier 3 and service cap 12. The source snapshot
-is an array containing Labor Contract Law article 47 and its Ministry URL.
+The baseline definition uses `schemaVersion: 2` and a conditional decision
+model:
+
+- mutual agreement proposed by the employer yields `N`; employee-proposed
+  agreement yields statutory `ZERO` and requires agreement review;
+- Labor Contract Law article 40 with 30 days' notice yields `N` and zero notice
+  pay; payment in lieu yields `N` plus exactly one monthly salary;
+- employee termination under article 38 yields `N`; ordinary voluntary
+  resignation yields `ZERO`;
+- unlawful termination prioritizes continued performance. When the employee
+  does not request continuation or continued performance is impossible, the
+  fallback is `TWO_N`;
+- unclear facts yield `REVIEW`;
+- a service-year remainder under six months contributes `0.5`, while a
+  remainder of at least six months contributes `1`; the high-salary threshold
+  is three times the local average and the capped service period is 12 years.
+
+The source snapshot records the Ministry canonical Labor Contract Law page for
+articles 36, 37, 38, 40, 46, 47, 48 and 87:
+
+`https://www.mohrss.gov.cn/xxgk2020/fdzdgknr/zcfg/fl/202011/t20201102_394622_wap.html`
+
+It also records Implementing Regulation article 27 from:
+
+`https://www.mohrss.gov.cn/xxgk2020/fdzdgknr/zcfg/fg/202011/t20201103_394939_wap.html`
 
 Call `seedPolicyFoundation()` from `server/seed.ts` after the existing admin and invite seed logic.
 
@@ -460,6 +492,10 @@ an HTTPS government source and upserts in one transaction. Existing
 lock matching rows in code order, preflight the whole batch, and keep the
 `ON CONFLICT ... WHERE` identity predicate plus affected-row check as the
 concurrency-safe database boundary. Status and source metadata remain mutable.
+Take a `SHARE ROW EXCLUSIVE` table lock before child discovery. When a province
+is retired, lock all of its active children in code order and require every one
+to appear as retired in the same batch. All administrative row locks use the
+same sorted-code order.
 Build `database/seeds/administrative-regions.csv` from the latest available
 Ministry of Civil Affairs administrative-division snapshot and include 31
 mainland province-level and 333 prefecture-level entries.
@@ -471,9 +507,16 @@ region_code,region_name,year,parameter_type,amount_fen,source_name,source_url,so
 ```
 
 It rejects unknown regions, duplicate region/year/type rows, non-positive
-amounts and non-government source hosts. `scripts/lib/csv.ts` supplies bounded,
-strict CSV parsing; `scripts/lib/official-source.ts` enforces HTTPS and a
-label-bound `gov.cn` host suffix.
+amounts and non-government source hosts. It sorts and deduplicates region codes,
+then takes `FOR SHARE` row locks before validation and retains them through all
+parameter writes. This serializes validation with administrative retirement
+and follows the administrative importer's code-order convention.
+`scripts/lib/csv.ts` reads a bounded Buffer, decodes it through
+`TextDecoder("utf-8", { fatal: true })`, accepts BOM/CRLF/multiline quoted
+fields/escaped quotes, and rejects isolated CR or any character after a closing
+quote before comma, CRLF, LF or EOF. Diagnostics contain path, line and column
+without copying row contents. `scripts/lib/official-source.ts` enforces HTTPS
+and a label-bound `gov.cn` host suffix.
 
 Populate exactly 31 province-level first-tier monthly minimum wages from the
 Ministry of Human Resources and Social Security primary release:
@@ -525,6 +568,18 @@ Also assert:
   retains the rule set and nulls only `active_version_id`;
 - unchanged repeated seed timestamps are byte-for-byte stable;
 - same-code rename/reparent batches fail atomically and retain original values.
+- province-only retirement fails, while province plus all active children in
+  one batch succeeds;
+- a concurrent active-child import waits behind a province-retirement batch
+  and is rejected after the retirement commits, leaving no active child under
+  the retired parent;
+- a deterministic concurrent parameter import observes an active locked region
+  and a concurrent retirement waits until commit;
+- invalid UTF-8, trailing quoted-field characters, isolated CR and oversize
+  input fail with bounded path/line/column diagnostics;
+- two migration processes against one clean database both exit zero and leave
+  exactly two applied migrations;
+- announcements reject `ends_at < starts_at`.
 
 - [ ] **Step 7: Run migrations and tests**
 
@@ -549,19 +604,40 @@ sequence, then migrate once more. Expected persisted facts are 2 migrations,
 one published baseline version and a valid active pointer. All tests/builds
 pass and Compose, ports, lock files and temporary uploads are removed.
 
+`runMigrations()` uses the stable session advisory-lock key
+`732202607300002` on the same client before creating or checking
+`schema_migrations`. The key is separate from the test wrapper's TCP mutex.
+Migration sessions use a 30-second lock timeout and a 120-second statement
+timeout, unlock in `finally`, and preserve both primary and cleanup errors.
+
+Unresolved follow-up technical debt:
+
+- both importers execute row-by-row upserts, which is acceptable for the
+  current 364-region/32-parameter bootstrap and needs batching or staging-table
+  work before materially larger datasets;
+- `policy_calculation_snapshots.regional_parameter_ids` is a `UUID[]`; PostgreSQL
+  does not enforce a foreign key on individual array elements. A normalized
+  snapshot-to-parameter join table is deferred to the later persistence task.
+
 - [ ] **Step 8: Commit**
 
 ```bash
 git add database/migrations/002_policy_foundation.sql database/seeds \
   scripts/import-administrative-regions.ts scripts/import-regional-parameters.ts \
   scripts/lib/csv.ts scripts/lib/official-source.ts \
-  server/modules/policy/seed.ts server/seed.ts server/tests/api.test.ts \
+  server/migrate.ts server/modules/policy/seed.ts server/seed.ts \
+  server/tests/api.test.ts server/tests/csv.test.ts \
+  server/tests/migration-concurrency.test.ts \
   tsconfig.scripts.json package.json \
   docs/superpowers/plans/2026-07-30-dual-web-policy-foundation.md
 git commit -m "fix: harden policy persistence invariants"
 ```
 
 ## Task 3: Implement the deterministic compensation engine
+
+**Dependency:** implement against Task 2 `schemaVersion: 2`. The scenario union
+below is the engine input contract; callers preserve the legally relevant facts
+instead of pre-collapsing them into a payout multiplier.
 
 **Files:**
 - Create: `server/modules/policy/types.ts`
@@ -593,7 +669,10 @@ const base = {
   regionName: "上海市",
   startDate: "2020-01-01",
   endDate: "2026-07-01",
-  terminationMode: "N" as const,
+  terminationScenario: {
+    kind: "ARTICLE_40",
+    noticeMethod: "notice_30_days"
+  } as const,
   monthlyEarnedWagesFen: Array(12).fill(1_500_000),
   minimumMonthlyWageFen: 269_000,
   employeeAverageMonthlyWageFen: 1_250_000
@@ -629,16 +708,44 @@ describe("calculatePolicy", () => {
     expect(result.payableFen).toBe(45_000_000);
   });
 
-  it("adds one salary month for N plus one", () => {
-    const result = calculatePolicy({ ...base, terminationMode: "N_PLUS_ONE" });
+  it("does not add notice pay after 30 days' notice", () => {
+    const result = calculatePolicy(base);
+    expect(result.noticePayFen).toBe(0);
+    expect(result.payableFen).toBe(10_500_000);
+  });
+
+  it("adds one salary month only for article 40 payment in lieu", () => {
+    const result = calculatePolicy({
+      ...base,
+      terminationScenario: {
+        kind: "ARTICLE_40",
+        noticeMethod: "payment_in_lieu"
+      }
+    });
     expect(result.noticePayFen).toBe(1_500_000);
     expect(result.payableFen).toBe(12_000_000);
   });
 
   it("returns a review range for unclear termination", () => {
-    const result = calculatePolicy({ ...base, terminationMode: "REVIEW" });
+    const result = calculatePolicy({
+      ...base,
+      terminationScenario: { kind: "UNCLEAR" }
+    });
     expect(result.rangeFen).toEqual({ low: 0, high: 21_000_000 });
     expect(result.reviewRequired).toBe(true);
+  });
+
+  it("prioritizes continued performance for unlawful termination", () => {
+    const result = calculatePolicy({
+      ...base,
+      terminationScenario: {
+        kind: "UNLAWFUL_TERMINATION",
+        continuedPerformanceRequested: true,
+        continuedPerformancePossible: true
+      }
+    });
+    expect(result.continuedPerformanceRequired).toBe(true);
+    expect(result.payableFen).toBe(0);
   });
 });
 ```
@@ -658,20 +765,30 @@ Expected: FAIL because the policy module does not exist.
 Create `server/modules/policy/types.ts`:
 
 ```ts
-export type TerminationMode =
-  | "ZERO"
-  | "N"
-  | "N_PLUS_ONE"
-  | "TWO_N"
-  | "ZERO_OR_TWO_N"
-  | "REVIEW";
+export type TerminationScenario =
+  | {
+      kind: "MUTUAL_AGREEMENT";
+      proposedBy: "employer" | "employee";
+    }
+  | {
+      kind: "ARTICLE_40";
+      noticeMethod: "notice_30_days" | "payment_in_lieu";
+    }
+  | { kind: "ARTICLE_38_EMPLOYEE_TERMINATION" }
+  | { kind: "VOLUNTARY_RESIGNATION" }
+  | {
+      kind: "UNLAWFUL_TERMINATION";
+      continuedPerformanceRequested: boolean;
+      continuedPerformancePossible: boolean;
+    }
+  | { kind: "UNCLEAR" };
 
 export type PolicyInput = {
   regionCode: string;
   regionName: string;
   startDate: string;
   endDate: string;
-  terminationMode: TerminationMode;
+  terminationScenario: TerminationScenario;
   monthlyEarnedWagesFen: number[];
   minimumMonthlyWageFen: number;
   employeeAverageMonthlyWageFen: number;
@@ -691,6 +808,7 @@ export type PolicyOutput = {
   differenceFen: number;
   rangeFen: { low: number; high: number };
   reviewRequired: boolean;
+  continuedPerformanceRequired: boolean;
   formulaSteps: Array<{ key: string; label: string; value: string }>;
 };
 ```
@@ -748,17 +866,38 @@ export const calculatePolicy = (input: PolicyInput): PolicyOutput => {
     .mul(compensationMonths)
     .toDecimalPlaces(0, Decimal.ROUND_HALF_UP)
     .toNumber();
-  const noticePayFen = input.terminationMode === "N_PLUS_ONE" ? salaryBasisFen : 0;
   const twoNFen = nFen * 2;
-  const payableFen =
-    input.terminationMode === "N" ? nFen :
-    input.terminationMode === "N_PLUS_ONE" ? nFen + noticePayFen :
-    input.terminationMode === "TWO_N" ? twoNFen :
-    0;
-  const rangeFen =
-    input.terminationMode === "ZERO_OR_TWO_N" || input.terminationMode === "REVIEW"
-      ? { low: 0, high: twoNFen }
-      : { low: payableFen, high: payableFen };
+  const scenario = input.terminationScenario;
+  let noticePayFen = 0;
+  let payableFen = 0;
+  let reviewRequired = false;
+  let continuedPerformanceRequired = false;
+  if (
+    scenario.kind === "ARTICLE_38_EMPLOYEE_TERMINATION" ||
+    (scenario.kind === "MUTUAL_AGREEMENT" &&
+      scenario.proposedBy === "employer")
+  ) {
+    payableFen = nFen;
+  } else if (scenario.kind === "ARTICLE_40") {
+    noticePayFen =
+      scenario.noticeMethod === "payment_in_lieu" ? salaryBasisFen : 0;
+    payableFen = nFen + noticePayFen;
+  } else if (
+    scenario.kind === "MUTUAL_AGREEMENT" &&
+    scenario.proposedBy === "employee"
+  ) {
+    reviewRequired = true;
+  } else if (scenario.kind === "UNLAWFUL_TERMINATION") {
+    continuedPerformanceRequired =
+      scenario.continuedPerformanceRequested &&
+      scenario.continuedPerformancePossible;
+    payableFen = continuedPerformanceRequired ? 0 : twoNFen;
+  } else if (scenario.kind === "UNCLEAR") {
+    reviewRequired = true;
+  }
+  const rangeFen = scenario.kind === "UNCLEAR"
+    ? { low: 0, high: twoNFen }
+    : { low: payableFen, high: payableFen };
   const alreadyPaidFen = input.alreadyPaidFen || 0;
   return {
     serviceMonths,
@@ -772,11 +911,12 @@ export const calculatePolicy = (input: PolicyInput): PolicyOutput => {
     alreadyPaidFen,
     differenceFen: Math.max(0, payableFen - alreadyPaidFen),
     rangeFen,
-    reviewRequired: ["ZERO_OR_TWO_N", "REVIEW"].includes(input.terminationMode),
+    reviewRequired,
+    continuedPerformanceRequired,
     formulaSteps: [
       { key: "service", label: "补偿工龄", value: `${compensationMonths} 个月工资` },
       { key: "salary", label: "月工资基数", value: `${salaryBasisFen} 分` },
-      { key: "mode", label: "适用模式", value: input.terminationMode },
+      { key: "scenario", label: "适用情形", value: scenario.kind },
       { key: "result", label: "测算金额", value: `${payableFen} 分` }
     ]
   };
@@ -791,7 +931,7 @@ Run:
 npm test -- --run server/tests/policy.engine.test.ts
 ```
 
-Expected: 5 tests pass.
+Expected: 7 tests pass.
 
 - [ ] **Step 7: Commit**
 
@@ -824,7 +964,10 @@ it("rejects a client-supplied result and saves the server snapshot", async () =>
       regionName: "上海市",
       startDate: "2020-01-01",
       endDate: "2026-07-01",
-      terminationMode: "N",
+      terminationScenario: {
+        kind: "ARTICLE_40",
+        noticeMethod: "notice_30_days"
+      },
       monthlyEarnedWagesFen: Array(12).fill(1_500_000),
       alreadyPaidFen: 0,
       clientResult: { payableFen: 1 }

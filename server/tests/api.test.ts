@@ -1,12 +1,12 @@
 import bcrypt from "bcryptjs";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createApp } from "../app.js";
-import { closePool, query } from "../db.js";
+import { closePool, getPool, query } from "../db.js";
 import { runMigrations } from "../migrate.js";
 import { seed } from "../seed.js";
 
@@ -94,6 +94,60 @@ describe("policy persistence foundation", () => {
         env: process.env
       }
     );
+
+  const runImportAsync = (
+    script: string,
+    csvPath: string,
+    env: NodeJS.ProcessEnv = process.env,
+    timeoutMs = 8_000
+  ) =>
+    new Promise<{ status: number | null; stdout: string; stderr: string }>(
+      (resolve, reject) => {
+        const child = spawn(
+          path.resolve("node_modules/.bin/tsx"),
+          [path.resolve(script), csvPath],
+          {
+            cwd: path.resolve("."),
+            env,
+            stdio: ["ignore", "pipe", "pipe"]
+          }
+        );
+        let stdout = "";
+        let stderr = "";
+        child.stdout.setEncoding("utf8");
+        child.stderr.setEncoding("utf8");
+        child.stdout.on("data", (chunk) => {
+          stdout += chunk;
+        });
+        child.stderr.on("data", (chunk) => {
+          stderr += chunk;
+        });
+        const timeout = setTimeout(() => {
+          child.kill("SIGKILL");
+          reject(new Error(`Import timed out after ${timeoutMs}ms: ${script}`));
+        }, timeoutMs);
+        child.once("error", (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        });
+        child.once("close", (status) => {
+          clearTimeout(timeout);
+          resolve({ status, stdout, stderr });
+        });
+      }
+    );
+
+  const waitUntil = async (
+    predicate: () => Promise<boolean>,
+    timeoutMs = 3_000
+  ) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (await predicate()) return;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error(`Condition was not met within ${timeoutMs}ms`);
+  };
 
   it("installs the versioned policy schema", async () => {
     const tables = await query<{ table_name: string }>(
@@ -231,6 +285,7 @@ describe("policy persistence foundation", () => {
          AND c.relname = ANY($1::text[])`,
       [[
         "administrative_regions",
+        "announcements",
         "assessments",
         "policy_calculation_snapshots",
         "policy_rule_sets",
@@ -264,6 +319,33 @@ describe("policy persistence foundation", () => {
     expect(definitions.some((value) =>
       value.includes("policy_rule_versions:CHECK:CHECK ((version > 0))")
     )).toBe(true);
+    expect(definitions.some((value) =>
+      value.includes(
+        "announcements:CHECK:CHECK (((ends_at IS NULL) OR " +
+          "(starts_at IS NULL) OR (ends_at >= starts_at)))"
+      )
+    )).toBe(true);
+  });
+
+  it("rejects an announcement whose end precedes its start", async () => {
+    let invalidRejected = false;
+    try {
+      await query(
+        `INSERT INTO announcements(
+           title, body, placement, status, starts_at, ends_at
+         )
+         VALUES (
+           '时间约束测试', '结束时间不得早于开始时间', 'all', 'draft',
+           TIMESTAMPTZ '2026-08-02 00:00:00+08',
+           TIMESTAMPTZ '2026-08-01 00:00:00+08'
+         )`
+      );
+    } catch {
+      invalidRejected = true;
+    } finally {
+      await query("DELETE FROM announcements WHERE title = '时间约束测试'");
+    }
+    expect(invalidRejected).toBe(true);
   });
 
   it("keeps an active version inside its owning rule set", async () => {
@@ -372,27 +454,123 @@ describe("policy persistence foundation", () => {
       effective_from: "2013-07-01",
       published_after_effective: true,
       definition: {
-        schemaVersion: 1,
-        terminationModes: {
-          mutual_agreement: "N",
-          employer_notice: "N_PLUS_ONE",
-          unlawful_termination: "TWO_N",
-          employee_resignation: "ZERO",
-          unclear: "REVIEW"
+        schemaVersion: 2,
+        decisionModel: {
+          mutualAgreement: {
+            employerProposed: {
+              compensation: "N"
+            },
+            employeeProposed: {
+              compensation: "ZERO",
+              agreementReviewRequired: true
+            }
+          },
+          article40EmployerTermination: {
+            notice30Days: {
+              compensation: "N",
+              noticePayMonths: 0
+            },
+            paymentInLieu: {
+              compensation: "N",
+              noticePayMonths: 1
+            }
+          },
+          employeeTermination: {
+            article38: {
+              compensation: "N"
+            },
+            voluntaryResignation: {
+              compensation: "ZERO"
+            }
+          },
+          unlawfulTermination: {
+            primaryRemedy: "CONTINUE_PERFORMANCE",
+            fallbackCompensation: "TWO_N",
+            fallbackWhen: [
+              "EMPLOYEE_DOES_NOT_REQUEST_CONTINUATION",
+              "CONTINUED_PERFORMANCE_IMPOSSIBLE"
+            ]
+          },
+          unclear: {
+            result: "REVIEW"
+          }
         },
-        serviceFraction: {
+        serviceYearFraction: {
           lessThanSixMonths: 0.5,
           atLeastSixMonths: 1
         },
-        highSalaryCapMultiplier: 3,
-        highSalaryServiceYearCap: 12
+        highSalaryCap: {
+          localAverageMultiplier: 3,
+          serviceYearCap: 12
+        }
       }
     });
+    expect(versions.rows[0].definition).not.toHaveProperty("terminationModes");
+    expect(versions.rows[0].definition).not.toHaveProperty("serviceFraction");
     expect(versions.rows[0].source_snapshot).toEqual([
-      expect.objectContaining({
-        name: "中华人民共和国劳动合同法",
-        article: "第四十七条"
-      })
+      {
+        instrument: "中华人民共和国劳动合同法",
+        article: "第三十六条",
+        canonicalUrl:
+          "https://www.mohrss.gov.cn/xxgk2020/fdzdgknr/zcfg/fl/202011/t20201102_394622_wap.html",
+        appliesTo: "mutual_agreement"
+      },
+      {
+        instrument: "中华人民共和国劳动合同法",
+        article: "第三十七条",
+        canonicalUrl:
+          "https://www.mohrss.gov.cn/xxgk2020/fdzdgknr/zcfg/fl/202011/t20201102_394622_wap.html",
+        appliesTo: "voluntary_resignation"
+      },
+      {
+        instrument: "中华人民共和国劳动合同法",
+        article: "第三十八条",
+        canonicalUrl:
+          "https://www.mohrss.gov.cn/xxgk2020/fdzdgknr/zcfg/fl/202011/t20201102_394622_wap.html",
+        appliesTo: "employee_statutory_termination"
+      },
+      {
+        instrument: "中华人民共和国劳动合同法",
+        article: "第四十条",
+        canonicalUrl:
+          "https://www.mohrss.gov.cn/xxgk2020/fdzdgknr/zcfg/fl/202011/t20201102_394622_wap.html",
+        appliesTo: "employer_notice_or_payment_in_lieu"
+      },
+      {
+        instrument: "中华人民共和国劳动合同法",
+        article: "第四十六条",
+        canonicalUrl:
+          "https://www.mohrss.gov.cn/xxgk2020/fdzdgknr/zcfg/fl/202011/t20201102_394622_wap.html",
+        appliesTo: "statutory_compensation_eligibility"
+      },
+      {
+        instrument: "中华人民共和国劳动合同法",
+        article: "第四十七条",
+        canonicalUrl:
+          "https://www.mohrss.gov.cn/xxgk2020/fdzdgknr/zcfg/fl/202011/t20201102_394622_wap.html",
+        appliesTo: "compensation_years_and_salary_cap"
+      },
+      {
+        instrument: "中华人民共和国劳动合同法",
+        article: "第四十八条",
+        canonicalUrl:
+          "https://www.mohrss.gov.cn/xxgk2020/fdzdgknr/zcfg/fl/202011/t20201102_394622_wap.html",
+        appliesTo: "unlawful_termination_remedy_priority"
+      },
+      {
+        instrument: "中华人民共和国劳动合同法",
+        article: "第八十七条",
+        canonicalUrl:
+          "https://www.mohrss.gov.cn/xxgk2020/fdzdgknr/zcfg/fl/202011/t20201102_394622_wap.html",
+        appliesTo: "unlawful_termination_two_n"
+      },
+      {
+        instrument: "中华人民共和国劳动合同法实施条例",
+        article: "第二十七条",
+        canonicalUrl:
+          "https://www.mohrss.gov.cn/xxgk2020/fdzdgknr/zcfg/fg/202011/t20201103_394939_wap.html",
+        appliesTo: "average_monthly_wage_definition"
+      }
     ]);
     expect(ruleSet.rows[0].active_version_id).toBe(versions.rows[0].id);
 
@@ -466,7 +644,7 @@ describe("policy persistence foundation", () => {
        )
          AND version = 1`
     );
-    expect(restored.rows[0].definition).toMatchObject({ schemaVersion: 1 });
+    expect(restored.rows[0].definition).toMatchObject({ schemaVersion: 2 });
     expect(
       Date.parse(restored.rows[0].updated_at)
     ).toBeGreaterThan(Date.parse(changed.rows[0].updated_at));
@@ -669,6 +847,307 @@ describe("policy persistence foundation", () => {
       }
     ]);
   });
+
+  it(
+    "retires a province only when every active child is retired in the same batch",
+    async () => {
+      const canonicalPath = path.resolve(
+        "database/seeds/administrative-regions.csv"
+      );
+      const tempDir = await mkdtemp(path.join(tmpdir(), "peileme-region-retire-"));
+      const partialPath = path.join(tempDir, "partial.csv");
+      const completePath = path.join(tempDir, "complete.csv");
+      const header =
+        "code,name,level,parent_code,status,source_name,source_url,source_snapshot_date\n";
+      const source =
+        "中华人民共和国民政部," +
+        "https://www.mca.gov.cn/mzsj/xzqh/2025/202401xzqh.html,2024-12-31";
+      await writeFile(
+        partialPath,
+        header + `130000,河北省,province,,retired,${source}\n`,
+        "utf8"
+      );
+
+      let partialResult: ReturnType<typeof runImport>;
+      let stateAfterPartial: { parent_status: string; active_children: string };
+      let completeResult: ReturnType<typeof runImport>;
+      let stateAfterComplete: typeof stateAfterPartial;
+      try {
+        partialResult = runImport(
+          "scripts/import-administrative-regions.ts",
+          partialPath
+        );
+        stateAfterPartial = (
+          await query<{
+            parent_status: string;
+            active_children: string;
+          }>(
+            `SELECT
+               max(status) FILTER (WHERE code = '130000') AS parent_status,
+               count(*) FILTER (
+                 WHERE parent_code = '130000' AND status = 'active'
+               )::text AS active_children
+             FROM administrative_regions
+             WHERE code = '130000' OR parent_code = '130000'`
+          )
+        ).rows[0];
+
+        const restored = runImport(
+          "scripts/import-administrative-regions.ts",
+          canonicalPath
+        );
+        expect(restored.status, restored.stderr).toBe(0);
+        const hebeiRows = await query<{
+          code: string;
+          name: string;
+          level: string;
+          parent_code: string | null;
+        }>(
+          `SELECT code, name, level, parent_code
+           FROM administrative_regions
+           WHERE code = '130000' OR parent_code = '130000'
+           ORDER BY code`
+        );
+        await writeFile(
+          completePath,
+          header +
+            hebeiRows.rows
+              .map(
+                (row) =>
+                  [
+                    row.code,
+                    row.name,
+                    row.level,
+                    row.parent_code ?? "",
+                    "retired",
+                    source
+                  ].join(",")
+              )
+              .join("\n") +
+            "\n",
+          "utf8"
+        );
+        completeResult = runImport(
+          "scripts/import-administrative-regions.ts",
+          completePath
+        );
+        stateAfterComplete = (
+          await query<{
+            parent_status: string;
+            active_children: string;
+          }>(
+            `SELECT
+               max(status) FILTER (WHERE code = '130000') AS parent_status,
+               count(*) FILTER (
+                 WHERE parent_code = '130000' AND status = 'active'
+               )::text AS active_children
+             FROM administrative_regions
+             WHERE code = '130000' OR parent_code = '130000'`
+          )
+        ).rows[0];
+      } finally {
+        runImport("scripts/import-administrative-regions.ts", canonicalPath);
+        await rm(tempDir, { recursive: true, force: true });
+      }
+
+      expect(partialResult!.status, partialResult!.stderr).not.toBe(0);
+      expect(stateAfterPartial!).toEqual({
+        parent_status: "active",
+        active_children: expect.not.stringMatching(/^0$/)
+      });
+      expect(completeResult!.status, completeResult!.stderr).toBe(0);
+      expect(stateAfterComplete!).toEqual({
+        parent_status: "retired",
+        active_children: "0"
+      });
+    },
+    15_000
+  );
+
+  it(
+    "serializes province retirement with a concurrent active-child import",
+    async () => {
+      const canonicalPath = path.resolve(
+        "database/seeds/administrative-regions.csv"
+      );
+      const tempDir = await mkdtemp(
+        path.join(tmpdir(), "peileme-region-retire-race-")
+      );
+      const retirementPath = path.join(tempDir, "retirement.csv");
+      const childPath = path.join(tempDir, "child.csv");
+      const retirementApplication = `region-retirement-${process.pid}`;
+      const childApplication = `region-child-${process.pid}`;
+      const advisoryKey = 7_302_027;
+      const source =
+        "中华人民共和国民政部," +
+        "https://www.mca.gov.cn/mzsj/xzqh/2025/202401xzqh.html,2024-12-31";
+      const header =
+        "code,name,level,parent_code,status,source_name,source_url,source_snapshot_date\n";
+      const hebeiRows = await query<{
+        code: string;
+        name: string;
+        level: string;
+        parent_code: string | null;
+      }>(
+        `SELECT code, name, level, parent_code
+         FROM administrative_regions
+         WHERE code = '130000' OR parent_code = '130000'
+         ORDER BY code`
+      );
+      await writeFile(
+        retirementPath,
+        header +
+          hebeiRows.rows
+            .map(
+              (row) =>
+                [
+                  row.code,
+                  row.name,
+                  row.level,
+                  row.parent_code ?? "",
+                  "retired",
+                  source
+                ].join(",")
+            )
+            .join("\n") +
+          "\n",
+        "utf8"
+      );
+      await writeFile(
+        childPath,
+        header + `139999,并发新增市,prefecture,130000,active,${source}\n`,
+        "utf8"
+      );
+      const retirementUrl = new URL(process.env.DATABASE_URL!);
+      retirementUrl.searchParams.set(
+        "application_name",
+        retirementApplication
+      );
+      const childUrl = new URL(process.env.DATABASE_URL!);
+      childUrl.searchParams.set("application_name", childApplication);
+
+      const gateClient = await getPool().connect();
+      let gateHeld = false;
+      let retirementPromise:
+        | ReturnType<typeof runImportAsync>
+        | undefined;
+      let childPromise:
+        | ReturnType<typeof runImportAsync>
+        | undefined;
+      let retirementResult:
+        | Awaited<ReturnType<typeof runImportAsync>>
+        | undefined;
+      let childResult:
+        | Awaited<ReturnType<typeof runImportAsync>>
+        | undefined;
+      try {
+        await query(
+          `CREATE OR REPLACE FUNCTION region_retirement_gate()
+           RETURNS trigger
+           LANGUAGE plpgsql
+           AS $$
+           BEGIN
+             IF NEW.code = '130000' AND NEW.status = 'retired' THEN
+               PERFORM pg_advisory_xact_lock(${advisoryKey});
+             END IF;
+             RETURN NEW;
+           END
+           $$`
+        );
+        await query(
+          `CREATE TRIGGER region_retirement_gate_trigger
+           BEFORE UPDATE ON administrative_regions
+           FOR EACH ROW EXECUTE FUNCTION region_retirement_gate()`
+        );
+        await gateClient.query("SELECT pg_advisory_lock($1)", [advisoryKey]);
+        gateHeld = true;
+
+        retirementPromise = runImportAsync(
+          "scripts/import-administrative-regions.ts",
+          retirementPath,
+          { ...process.env, DATABASE_URL: retirementUrl.toString() }
+        );
+        await waitUntil(async () => {
+          const waiting = await query<{ waiting: boolean }>(
+            `SELECT EXISTS (
+               SELECT 1 FROM pg_stat_activity
+               WHERE application_name = $1 AND wait_event = 'advisory'
+             ) AS waiting`,
+            [retirementApplication]
+          );
+          return waiting.rows[0].waiting;
+        });
+
+        childPromise = runImportAsync(
+          "scripts/import-administrative-regions.ts",
+          childPath,
+          { ...process.env, DATABASE_URL: childUrl.toString() }
+        );
+        await waitUntil(async () => {
+          const waiting = await query<{ waiting: boolean }>(
+            `SELECT EXISTS (
+               SELECT 1 FROM pg_stat_activity
+               WHERE application_name = $1
+                 AND wait_event_type = 'Lock'
+             ) AS waiting`,
+            [childApplication]
+          );
+          return waiting.rows[0].waiting;
+        });
+
+        await gateClient.query("SELECT pg_advisory_unlock($1)", [advisoryKey]);
+        gateHeld = false;
+        [retirementResult, childResult] = await Promise.all([
+          retirementPromise,
+          childPromise
+        ]);
+        const finalState = await query<{
+          parent_status: string;
+          active_children: string;
+          concurrent_child_count: string;
+        }>(
+          `SELECT
+             max(status) FILTER (WHERE code = '130000') AS parent_status,
+             count(*) FILTER (
+               WHERE parent_code = '130000' AND status = 'active'
+             )::text AS active_children,
+             count(*) FILTER (WHERE code = '139999')::text
+               AS concurrent_child_count
+           FROM administrative_regions
+           WHERE code = '130000' OR parent_code = '130000'`
+        );
+        expect(finalState.rows[0]).toEqual({
+          parent_status: "retired",
+          active_children: "0",
+          concurrent_child_count: "0"
+        });
+      } finally {
+        if (gateHeld) {
+          await gateClient.query("SELECT pg_advisory_unlock($1)", [advisoryKey]);
+        }
+        gateClient.release();
+        await Promise.allSettled([
+          retirementPromise,
+          childPromise
+        ].filter((item): item is Promise<unknown> => Boolean(item)));
+        await query(
+          "DROP TRIGGER IF EXISTS region_retirement_gate_trigger ON administrative_regions"
+        );
+        await query("DROP FUNCTION IF EXISTS region_retirement_gate()");
+        await query("DELETE FROM administrative_regions WHERE code = '139999'");
+        const restored = runImport(
+          "scripts/import-administrative-regions.ts",
+          canonicalPath
+        );
+        expect(restored.status, restored.stderr).toBe(0);
+        await rm(tempDir, { recursive: true, force: true });
+      }
+
+      expect(retirementResult?.status, retirementResult?.stderr).toBe(0);
+      expect(childResult?.status, childResult?.stderr).not.toBe(0);
+    },
+    15_000
+  );
 
   it("rejects invalid administrative-region batches without partial writes", async () => {
     const tempDir = await mkdtemp(path.join(tmpdir(), "peileme-region-import-"));
@@ -887,6 +1366,131 @@ describe("policy persistence foundation", () => {
     );
     expect(count.rows[0].count).toBe("32");
   });
+
+  it(
+    "serializes parameter validation with concurrent region retirement",
+    async () => {
+      const tempDir = await mkdtemp(path.join(tmpdir(), "peileme-parameter-race-"));
+      const csvPath = path.join(tempDir, "race.csv");
+      const applicationName = `parameter-race-${process.pid}`;
+      const advisoryKey = 7_302_026;
+      const databaseUrl = new URL(process.env.DATABASE_URL!);
+      databaseUrl.searchParams.set("application_name", applicationName);
+      await writeFile(
+        csvPath,
+        "region_code,region_name,year,parameter_type,amount_fen,source_name," +
+          "source_url,source_published_at,status\n" +
+          "110000,北京市,2099,minimum_monthly_wage,300000,人社部," +
+          "https://www.mohrss.gov.cn/official,2026-01-15,verified\n",
+        "utf8"
+      );
+
+      const gateClient = await getPool().connect();
+      let gateHeld = false;
+      let importPromise:
+        | ReturnType<typeof runImportAsync>
+        | undefined;
+      let updatePromise: Promise<unknown> | undefined;
+      let updateSettledBeforeRelease = false;
+      let importResult:
+        | Awaited<ReturnType<typeof runImportAsync>>
+        | undefined;
+      try {
+        await query("DROP TABLE IF EXISTS parameter_race_audit");
+        await query(
+          "CREATE TABLE parameter_race_audit(observed_status TEXT NOT NULL)"
+        );
+        await query(
+          `CREATE OR REPLACE FUNCTION parameter_race_gate()
+           RETURNS trigger
+           LANGUAGE plpgsql
+           AS $$
+           DECLARE observed TEXT;
+           BEGIN
+             IF NEW.region_code = '110000' AND NEW.year = 2099 THEN
+               PERFORM pg_advisory_xact_lock(${advisoryKey});
+               SELECT status INTO observed
+               FROM administrative_regions
+               WHERE code = NEW.region_code;
+               INSERT INTO parameter_race_audit(observed_status)
+               VALUES (observed);
+             END IF;
+             RETURN NEW;
+           END
+           $$`
+        );
+        await query(
+          `CREATE TRIGGER parameter_race_gate_trigger
+           BEFORE INSERT OR UPDATE ON regional_parameters
+           FOR EACH ROW EXECUTE FUNCTION parameter_race_gate()`
+        );
+        await gateClient.query("SELECT pg_advisory_lock($1)", [advisoryKey]);
+        gateHeld = true;
+
+        importPromise = runImportAsync(
+          "scripts/import-regional-parameters.ts",
+          csvPath,
+          { ...process.env, DATABASE_URL: databaseUrl.toString() }
+        );
+        await waitUntil(async () => {
+          const waiting = await query<{ waiting: boolean }>(
+            `SELECT EXISTS (
+               SELECT 1
+               FROM pg_stat_activity
+               WHERE application_name = $1
+                 AND wait_event = 'advisory'
+             ) AS waiting`,
+            [applicationName]
+          );
+          return waiting.rows[0].waiting;
+        });
+
+        let updateSettled = false;
+        updatePromise = query(
+          `UPDATE administrative_regions
+           SET status = 'retired', updated_at = now()
+           WHERE code = '110000'`
+        ).finally(() => {
+          updateSettled = true;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        updateSettledBeforeRelease = updateSettled;
+
+        await gateClient.query("SELECT pg_advisory_unlock($1)", [advisoryKey]);
+        gateHeld = false;
+        [importResult] = await Promise.all([importPromise, updatePromise]);
+        const audit = await query<{ observed_status: string }>(
+          "SELECT observed_status FROM parameter_race_audit"
+        );
+        expect(audit.rows).toEqual([{ observed_status: "active" }]);
+      } finally {
+        if (gateHeld) {
+          await gateClient.query("SELECT pg_advisory_unlock($1)", [advisoryKey]);
+        }
+        gateClient.release();
+        await Promise.allSettled([
+          importPromise,
+          updatePromise
+        ].filter((item): item is Promise<unknown> => Boolean(item)));
+        await query(
+          "DELETE FROM regional_parameters WHERE region_code = '110000' AND year = 2099"
+        );
+        await query(
+          "UPDATE administrative_regions SET status = 'active' WHERE code = '110000'"
+        );
+        await query(
+          "DROP TRIGGER IF EXISTS parameter_race_gate_trigger ON regional_parameters"
+        );
+        await query("DROP FUNCTION IF EXISTS parameter_race_gate()");
+        await query("DROP TABLE IF EXISTS parameter_race_audit");
+        await rm(tempDir, { recursive: true, force: true });
+      }
+
+      expect(updateSettledBeforeRelease).toBe(false);
+      expect(importResult?.status, importResult?.stderr).toBe(0);
+    },
+    12_000
+  );
 
   it("re-runs migrations without changing imported policy data", async () => {
     await runMigrations();
