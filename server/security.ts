@@ -103,6 +103,36 @@ export const requireAuth = (request: Request, response: Response, next: NextFunc
   next();
 };
 
+export const requireCapability = (capability: string) => async (
+  request: Request,
+  response: Response,
+  next: NextFunction
+) => {
+  if (!request.authUser) {
+    response.status(401).json({ error: "AUTH_REQUIRED", message: "请先登录" });
+    return;
+  }
+  try {
+    const result = await query(
+      `SELECT 1
+         FROM role_capabilities
+        WHERE role = $1
+          AND capability = $2`,
+      [request.authUser.role, capability]
+    );
+    if (!result.rowCount) {
+      response.status(403).json({
+        error: "CAPABILITY_REQUIRED",
+        message: "当前账号没有此操作权限"
+      });
+      return;
+    }
+    next();
+  } catch (error) {
+    next(error);
+  }
+};
+
 export const requireAdmin = (request: Request, response: Response, next: NextFunction) => {
   if (!request.authUser || !["admin", "analyst"].includes(request.authUser.role)) {
     response.status(403).json({ error: "ADMIN_REQUIRED", message: "需要管理权限" });

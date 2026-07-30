@@ -12,10 +12,16 @@ import multer from "multer";
 import { nanoid } from "nanoid";
 import { pinoHttp } from "pino-http";
 import { z } from "zod";
+import { writeAdminAudit as audit } from "./audit.js";
 import { getConfig } from "./config.js";
 import { query, withTransaction } from "./db.js";
 import { ApiError } from "./errors.js";
 import { getChannelStatus } from "./notifier.js";
+import {
+  createAdminPolicyRouter,
+  createPolicyRouter
+} from "./modules/policy/routes.js";
+import { type PolicyOutput } from "./modules/policy/types.js";
 import {
   clearRefreshCookie,
   consumeOtp,
@@ -73,28 +79,6 @@ const parsePagination = (request: Request) => {
   const page = Math.max(1, Number(request.query.page) || 1);
   const pageSize = Math.min(100, Math.max(1, Number(request.query.pageSize) || 20));
   return { page, pageSize, offset: (page - 1) * pageSize };
-};
-
-const audit = async (
-  request: Request,
-  action: string,
-  targetType?: string,
-  targetId?: string,
-  detail: Record<string, unknown> = {}
-) => {
-  await query(
-    `INSERT INTO admin_audit_logs
-       (admin_user_id, action, target_type, target_id, detail, ip)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [
-      request.authUser?.id || null,
-      action,
-      targetType || null,
-      targetId || null,
-      detail,
-      request.ip || null
-    ]
-  );
 };
 
 const uploadConfig = () => {
@@ -175,7 +159,11 @@ const removeUploadedFiles = (files: Express.Multer.File[]) => {
   });
 };
 
-export const createApp = () => {
+export const createApp = (
+  options: {
+    policyCalculate?: (input: unknown) => PolicyOutput;
+  } = {}
+) => {
   const config = getConfig();
   const { uploadDir, middleware: upload } = uploadConfig();
   const app = express();
@@ -201,6 +189,11 @@ export const createApp = () => {
   app.use(express.urlencoded({ extended: false, limit: "128kb" }));
   app.use(cookieParser());
   app.use(optionalAuth);
+  app.use(
+    "/api/policy",
+    createPolicyRouter({ calculate: options.policyCalculate })
+  );
+  app.use("/api/admin/policy", createAdminPolicyRouter());
 
   app.get("/api/health", async (_request, response) => {
     const started = Date.now();
@@ -1021,7 +1014,7 @@ export const createApp = () => {
       request.log?.error(error);
       response.status(500).json({
         error: "INTERNAL_ERROR",
-        message: config.NODE_ENV === "production" ? "服务暂时开小差了" : pgError.message || "服务异常"
+        message: "服务暂时开小差了"
       });
     }
   );
