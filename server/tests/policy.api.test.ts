@@ -1654,6 +1654,39 @@ describe("versioned policy public API", () => {
       .expect(404);
   });
 
+  it.each([
+    ["missing", "input - 'wageDataConfirmation'"],
+    [
+      "malformed",
+      "jsonb_set(input - 'wageDataConfirmation', '{wageDataConfirmation}', '\"legacy-garbage\"'::jsonb)"
+    ]
+  ])(
+    "normalizes %s legacy wage confirmation without silently confirming it",
+    async (_legacyShape, legacyExpression) => {
+      const calculation = await request(createApp())
+        .post("/api/policy/calculate")
+        .set(authHeader(userToken))
+        .send(calculationBody())
+        .expect(201);
+      await query(
+        `UPDATE policy_calculation_snapshots
+            SET input = ${legacyExpression}
+          WHERE assessment_id = $1`,
+        [calculation.body.assessmentId]
+      );
+
+      const detail = await request(createApp())
+        .get(`/api/policy/history/${calculation.body.assessmentId}`)
+        .set(authHeader(userToken))
+        .expect(200);
+      expect(detail.body.input.wageDataConfirmation).toEqual({
+        confirmed: false,
+        basis: "legacy_unverified"
+      });
+      expect(detail.body.output).toEqual(calculation.body.result);
+    }
+  );
+
   it("creates hashed expiring share tokens that owners can revoke", async () => {
     const calculation = await request(createApp())
       .post("/api/policy/calculate")
@@ -1689,6 +1722,23 @@ describe("versioned policy public API", () => {
     expect(stored.rows[0].token_hash).not.toContain(created.body.token);
     expect(stored.rows[0].revoked_at).toBeNull();
 
+    await request(createApp())
+      .get(`/api/policy/history/${calculation.body.assessmentId}/shares`)
+      .set(authHeader(otherUserToken))
+      .expect(404);
+    const ownerShares = await request(createApp())
+      .get(`/api/policy/history/${calculation.body.assessmentId}/shares`)
+      .set(authHeader(userToken))
+      .expect(200);
+    expect(ownerShares.body.items).toContainEqual({
+      shareId: created.body.shareId,
+      createdAt: expect.any(String),
+      expiresAt: created.body.expiresAt,
+      status: "active"
+    });
+    expect(JSON.stringify(ownerShares.body)).not.toContain(created.body.token);
+    expect(JSON.stringify(ownerShares.body)).not.toContain("tokenHash");
+
     const shared = await request(createApp())
       .get(`/api/policy/share/${created.body.token}`)
       .expect(200);
@@ -1716,6 +1766,14 @@ describe("versioned policy public API", () => {
     await request(createApp())
       .get(`/api/policy/share/${created.body.token}`)
       .expect(404);
+    const revokedShares = await request(createApp())
+      .get(`/api/policy/history/${calculation.body.assessmentId}/shares`)
+      .set(authHeader(userToken))
+      .expect(200);
+    expect(revokedShares.body.items[0]).toMatchObject({
+      shareId: created.body.shareId,
+      status: "revoked"
+    });
 
     const expiring = await request(createApp())
       .post(`/api/policy/history/${calculation.body.assessmentId}/share`)

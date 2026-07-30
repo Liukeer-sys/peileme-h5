@@ -189,6 +189,33 @@ const stableJson = (value: unknown): string => {
   return JSON.stringify(value);
 };
 
+const normalizeHistoryInput = (input: unknown) => {
+  const record =
+    input && typeof input === "object" && !Array.isArray(input)
+      ? (input as Record<string, unknown>)
+      : {};
+  const confirmation = record.wageDataConfirmation;
+  const confirmed =
+    confirmation &&
+    typeof confirmation === "object" &&
+    !Array.isArray(confirmation) &&
+    (confirmation as Record<string, unknown>).confirmed === true &&
+    (confirmation as Record<string, unknown>).basis ===
+      "pretax_earned_including_bonus_allowance";
+  return {
+    ...record,
+    wageDataConfirmation: confirmed
+      ? {
+          confirmed: true as const,
+          basis: "pretax_earned_including_bonus_allowance" as const
+        }
+      : {
+          confirmed: false as const,
+          basis: "legacy_unverified" as const
+        }
+  };
+};
+
 const formatVersion = (row: {
   id: string;
   version: number;
@@ -662,7 +689,7 @@ export class PolicyRepository {
       id: string;
       accuracy_level: string;
       version: number;
-      input: PolicyInput;
+      input: unknown;
       output: PolicyOutput;
       parameter_provenance: CalculationResult["parameters"];
       created_at: string;
@@ -692,7 +719,7 @@ export class PolicyRepository {
       ruleVersion: row.version,
       accuracy: row.accuracy_level,
       parameters: row.parameter_provenance,
-      input: row.input,
+      input: normalizeHistoryInput(row.input),
       output: row.output,
       createdAt: row.created_at
     };
@@ -736,6 +763,50 @@ export class PolicyRepository {
       token,
       expiresAt: row.expires_at
     };
+  }
+
+  async listShares(userId: string, assessmentId: string) {
+    const owned = await query<{ id: string }>(
+      `SELECT a.id
+         FROM assessments a
+         JOIN policy_calculation_snapshots pcs
+           ON pcs.assessment_id = a.id
+        WHERE a.id = $1
+          AND a.user_id = $2
+          AND a.product_channel = 'main'`,
+      [assessmentId, userId]
+    );
+    if (!owned.rows[0]) {
+      throw new ApiError(
+        404,
+        "POLICY_HISTORY_NOT_FOUND",
+        "计算记录不存在"
+      );
+    }
+    const result = await query<{
+      id: string;
+      created_at: string;
+      expires_at: string;
+      status: "active" | "expired" | "revoked";
+    }>(
+      `SELECT id, created_at::text, expires_at::text,
+              CASE
+                WHEN revoked_at IS NOT NULL THEN 'revoked'
+                WHEN expires_at <= now() THEN 'expired'
+                ELSE 'active'
+              END AS status
+         FROM policy_result_shares
+        WHERE assessment_id = $1
+          AND owner_user_id = $2
+        ORDER BY created_at DESC, id DESC`,
+      [assessmentId, userId]
+    );
+    return result.rows.map((row) => ({
+      shareId: row.id,
+      createdAt: row.created_at,
+      expiresAt: row.expires_at,
+      status: row.status
+    }));
   }
 
   async revokeShare(userId: string, shareId: string) {

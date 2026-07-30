@@ -11,7 +11,8 @@ import type {
 
 type PolicyHistoryProps = {
   refreshKey?: string;
-  onRecalculate: (detail: PolicyHistoryDetail) => Promise<void>;
+  recalculating?: boolean;
+  onRecalculate: (detail: PolicyHistoryDetail) => Promise<boolean>;
 };
 
 const formatCny = (fen: number) =>
@@ -33,6 +34,7 @@ const scenarioName: Record<PolicyHistoryItem["scenario"], string> = {
 
 export default function PolicyHistory({
   refreshKey,
+  recalculating = false,
   onRecalculate
 }: PolicyHistoryProps) {
   const [items, setItems] = useState<PolicyHistoryItem[]>([]);
@@ -96,6 +98,11 @@ export default function PolicyHistory({
                 detail.output.rangeFen.high
               )}`}
         </strong>
+        {!detail.input.wageDataConfirmation.confirmed && (
+          <p role="alert" className="history-legacy-warning">
+            该记录创建于工资口径确认上线前，工资明细尚未复核。重新测算前需要逐月核对税前应发工资。
+          </p>
+        )}
         <h4>完整计算公式</h4>
         <ol className="history-formula">
           {detail.output.formulaSteps.map((step) => (
@@ -108,10 +115,10 @@ export default function PolicyHistory({
         <button
           type="button"
           className="secondary-button"
-          disabled={busy}
+          disabled={busy || recalculating}
           onClick={() => void onRecalculate(detail)}
         >
-          按此记录重新测算
+          {recalculating ? "正在重新测算…" : "按此记录重新测算"}
         </button>
       </section>
     );

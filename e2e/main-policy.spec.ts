@@ -5,9 +5,11 @@ import {
   type APIRequestContext,
   type Page
 } from "@playwright/test";
+import { Client } from "pg";
 
 const baseUrl = process.env.E2E_BASE_URL;
 const apiBaseUrl = process.env.E2E_API_URL || baseUrl;
+const e2eDatabaseUrl = process.env.E2E_DATABASE_URL;
 const password = process.env.E2E_POLICY_PASSWORD || "PolicyE2ePass123";
 const runId = process.env.E2E_RUN_ID || "task7-local";
 const policyUser = {
@@ -20,6 +22,7 @@ const otherUser = {
 };
 
 let apiContext: APIRequestContext;
+let userAccessToken = "";
 let otherAccessToken = "";
 
 test.describe.configure({ timeout: 30_000 });
@@ -199,6 +202,31 @@ const fillVisibleManualParameters = async (page: Page) => {
   if (await average.isVisible()) await average.fill("12307");
 };
 
+const createPolicyFixture = async (
+  overrides: Record<string, unknown> = {}
+) => {
+  const response = await apiContext.post("/api/policy/calculate", {
+    headers: { authorization: `Bearer ${userAccessToken}` },
+    data: {
+      regionCode: "420100",
+      startDate: "2020-01-01",
+      endDate: "2026-07-01",
+      terminationScenario: {
+        kind: "ARTICLE_40",
+        noticeMethod: "notice_30_days"
+      },
+      monthlyEarnedWagesFen: Array(12).fill(1_500_000),
+      wageDataConfirmation: {
+        confirmed: true,
+        basis: "pretax_earned_including_bonus_allowance"
+      },
+      ...overrides
+    }
+  });
+  expect(response.status()).toBe(201);
+  return (await response.json()) as { assessmentId: string };
+};
+
 test.beforeAll(async () => {
   requireUrls();
   apiContext = await playwrightRequest.newContext({
@@ -211,7 +239,7 @@ test.beforeAll(async () => {
   });
   const health = await apiContext.get("/api/health");
   expect(health.status()).toBe(200);
-  await ensureUser(apiContext, policyUser);
+  userAccessToken = (await ensureUser(apiContext, policyUser)).accessToken;
   otherAccessToken = (await ensureUser(apiContext, otherUser)).accessToken;
 });
 
@@ -649,6 +677,178 @@ test("未登录用户提交时进入登录流程且不会创建计算记录", as
   expect(calculateRequests).toBe(0);
 });
 
+test("旧历史快照先进入工资复核，重新确认后才创建结果", async ({
+  page
+}) => {
+  test.skip(!e2eDatabaseUrl, "E2E_DATABASE_URL is required for legacy fixture");
+  const legacy = await createPolicyFixture();
+  const database = new Client({ connectionString: e2eDatabaseUrl });
+  await database.connect();
+  try {
+    await database.query(
+      `UPDATE policy_calculation_snapshots
+          SET input = input - 'wageDataConfirmation'
+        WHERE assessment_id = $1`,
+      [legacy.assessmentId]
+    );
+  } finally {
+    await database.end();
+  }
+
+  await loginAs(page, policyUser);
+  await page
+    .getByRole("button", { name: policyUser.displayName, exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: /查看.*武汉/ })
+    .first()
+    .click();
+  const accountDialog = page.getByRole("dialog");
+  await expect(accountDialog).toContainText("工资明细尚未复核");
+
+  let calculateRequests = 0;
+  page.on("request", (request) => {
+    if (
+      request.url().endsWith("/api/policy/calculate") &&
+      request.method() === "POST"
+    ) {
+      calculateRequests += 1;
+    }
+  });
+  await accountDialog
+    .getByRole("button", { name: "按此记录重新测算", exact: true })
+    .click();
+  const submitPanel = page.getByRole("region", { name: "提交政策测算" });
+  await expect(submitPanel).toBeVisible();
+  await expect(submitPanel).toContainText("请重新核对逐月税前应发工资");
+  const confirmation = page.getByRole("checkbox", {
+    name: /我已按工资条或流水逐月核对/
+  });
+  await expect(confirmation).not.toBeChecked();
+  expect(calculateRequests).toBe(0);
+
+  await confirmation.check();
+  const recalculation = page.waitForResponse(
+    (response) =>
+      response.url().endsWith("/api/policy/calculate") &&
+      response.request().method() === "POST"
+  );
+  await page
+    .getByRole("button", { name: "生成政策测算", exact: true })
+    .click();
+  expect((await recalculation).status()).toBe(201);
+  expect(calculateRequests).toBe(1);
+});
+
+test("历史重算双击只创建一个结果且按钮显示忙碌", async ({ page }) => {
+  await createPolicyFixture();
+  const before = await apiContext.get("/api/policy/history", {
+    headers: { authorization: `Bearer ${userAccessToken}` }
+  });
+  const beforeTotal = ((await before.json()) as {
+    pagination: { total: number };
+  }).pagination.total;
+
+  await loginAs(page, policyUser);
+  await page
+    .getByRole("button", { name: policyUser.displayName, exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: /查看.*武汉/ })
+    .first()
+    .click();
+  let calculateRequests = 0;
+  await page.route("**/api/policy/calculate", async (route) => {
+    calculateRequests += 1;
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    await route.fallback();
+  });
+  const recalculate = page.getByRole("button", {
+    name: "按此记录重新测算",
+    exact: true
+  });
+  const completed = page.waitForResponse(
+    (response) =>
+      response.url().endsWith("/api/policy/calculate") &&
+      response.request().method() === "POST" &&
+      response.status() === 201
+  );
+  await recalculate.evaluate((button) => {
+    (button as HTMLButtonElement).click();
+    (button as HTMLButtonElement).click();
+  });
+  await expect(
+    page.getByRole("button", { name: "正在重新测算…", exact: true })
+  ).toBeDisabled();
+  await completed;
+  await expect(
+    page.getByRole("heading", { name: "政策测算结果", exact: true })
+  ).toBeVisible();
+  expect(calculateRequests).toBe(1);
+
+  const after = await apiContext.get("/api/policy/history", {
+    headers: { authorization: `Bearer ${userAccessToken}` }
+  });
+  expect(
+    ((await after.json()) as { pagination: { total: number } }).pagination.total
+  ).toBe(beforeTotal + 1);
+});
+
+test("关闭历史重算并开始新流程后旧响应不会覆盖", async ({ page }) => {
+  await loginAs(page, policyUser);
+  await completeQuestionnaire(page, { city: "武汉" });
+  await page
+    .getByRole("button", { name: "生成政策测算", exact: true })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "政策测算结果", exact: true })
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: policyUser.displayName, exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: /查看.*武汉/ })
+    .first()
+    .click();
+
+  let releaseResponse!: () => void;
+  let markBackendDone!: () => void;
+  const responseGate = new Promise<void>((resolve) => {
+    releaseResponse = resolve;
+  });
+  const backendDone = new Promise<void>((resolve) => {
+    markBackendDone = resolve;
+  });
+  await page.route("**/api/policy/calculate", async (route) => {
+    const target = new URL(route.request().url());
+    const backend = new URL(apiBaseUrl!);
+    target.protocol = backend.protocol;
+    target.host = backend.host;
+    const response = await route.fetch({ url: target.toString() });
+    markBackendDone();
+    await responseGate;
+    await route.fulfill({ response }).catch(() => undefined);
+  });
+  await page
+    .getByRole("button", { name: "按此记录重新测算", exact: true })
+    .click();
+  await backendDone;
+  await page.keyboard.press("Escape");
+  await page.getByRole("button", { name: "重算", exact: true }).click();
+  releaseResponse();
+  await page.waitForTimeout(350);
+
+  await expect(page.getByRole("main")).toContainText("你在哪个城市工作？");
+  await expect(
+    page.getByRole("heading", { name: "政策测算结果", exact: true })
+  ).toHaveCount(0);
+  expect(
+    await page.evaluate(() =>
+      window.sessionStorage.getItem("peileme-latest-policy-result")
+    )
+  ).toBeNull();
+});
+
 test("历史列表展示完整详情且其他用户访问返回 404", async ({ page }) => {
   const assertCleanRuntime = watchRuntime(page);
   await loginAs(page, policyUser);
@@ -782,12 +982,52 @@ test("结果分享可匿名查看且创建者撤销后立即失效", async ({
     anonymousPage.getByRole("button", { name: "查看历史" })
   ).toHaveCount(0);
 
-  await page.getByRole("button", { name: "撤销分享", exact: true }).click();
-  await expect(page.getByRole("status")).toContainText("分享已撤销");
+  await page.reload();
+  await expect(
+    page.getByRole("heading", { name: "政策测算结果", exact: true })
+  ).toBeVisible();
+  await expect(page.getByRole("status")).toContainText("已有有效分享");
+  await expect(
+    page.getByRole("button", { name: "撤销分享", exact: true })
+  ).toBeVisible();
+  const replacedShare = page.waitForResponse(
+    (response) =>
+      /\/api\/policy\/history\/[^/]+\/share$/.test(response.url()) &&
+      response.request().method() === "POST" &&
+      response.status() === 201
+  );
+  await page
+    .getByRole("button", { name: "重新生成分享", exact: true })
+    .click();
+  const replacement = (await (await replacedShare).json()) as {
+    token: string;
+  };
   await anonymousPage.reload();
   await expect(
     anonymousPage.getByRole("heading", { name: "分享链接已失效" })
   ).toBeVisible();
+
+  const replacementContext = await browser.newContext();
+  const replacementPage = await replacementContext.newPage();
+  await bridgeApi(replacementPage);
+  await replacementPage.goto(
+    `/?share=${encodeURIComponent(replacement.token)}`
+  );
+  await expect(
+    replacementPage.getByRole("heading", {
+      name: "政策测算结果",
+      exact: true
+    })
+  ).toBeVisible();
+  await page.reload();
+  await expect(page.getByRole("status")).toContainText("已有有效分享");
+  await page.getByRole("button", { name: "撤销分享", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("分享已撤销");
+  await replacementPage.reload();
+  await expect(
+    replacementPage.getByRole("heading", { name: "分享链接已失效" })
+  ).toBeVisible();
+  await replacementContext.close();
   await anonymousContext.close();
   assertCleanRuntime();
 });

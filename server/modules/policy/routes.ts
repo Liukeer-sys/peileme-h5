@@ -200,6 +200,16 @@ export const createPolicyRouter = (
     }
   );
 
+  router.get("/history/:id/shares", requireAuth, async (request, response) => {
+    const assessmentId = z.string().uuid().parse(request.params.id);
+    response.json({
+      items: await repository.listShares(
+        request.authUser!.id,
+        assessmentId
+      )
+    });
+  });
+
   router.delete("/shares/:id", requireAuth, async (request, response) => {
     const shareId = z.string().uuid().parse(request.params.id);
     await repository.revokeShare(request.authUser!.id, shareId);

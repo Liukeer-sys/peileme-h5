@@ -4,7 +4,8 @@ import type {
   PolicyHistoryDetail,
   PolicyHistoryItem,
   PolicyRegion,
-  PolicyShare
+  PolicyShare,
+  PolicyShareStatus
 } from "../types";
 
 const VISITOR_KEY = "peileme-visitor-id";
@@ -201,6 +202,12 @@ export const createPolicyShare = (
       auth: true,
       body: { expiresInDays }
     }
+  );
+
+export const listPolicyShares = (assessmentId: string) =>
+  api<{ items: PolicyShareStatus[] }>(
+    `/api/policy/history/${encodeURIComponent(assessmentId)}/shares`,
+    { auth: true }
   );
 
 export const revokePolicyShare = (shareId: string) =>

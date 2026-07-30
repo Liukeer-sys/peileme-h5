@@ -2611,6 +2611,22 @@ button {
   color: #765b27;
 }
 
+.legacy-wage-review,
+.history-legacy-warning {
+  margin: 0;
+  padding: 10px 11px;
+  border: 1px solid rgba(181, 127, 42, 0.24);
+  border-radius: 12px;
+  background: #fff8e8;
+  color: #78561a;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.legacy-wage-review {
+  margin-bottom: 10px;
+}
+
 .wage-month-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3911,7 +3927,6 @@ button {
   color: #5a5064;
   box-shadow: none;
 }
-
 
 
 

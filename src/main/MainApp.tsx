@@ -23,6 +23,7 @@ import {
   track
 } from "../lib/api";
 import { useDialogFocus } from "../hooks/useDialogFocus";
+import { useLatestSingleFlight } from "../hooks/useLatestSingleFlight";
 import type {
   Answers,
   PolicyApiResult,
@@ -82,6 +83,20 @@ const isCalendarDate = (value: string) => {
 const yuanToFen = (yuan?: number) =>
   Number.isFinite(yuan) ? Math.round(Number(yuan) * 100) : 0;
 
+const hasConfirmedWageBasis = (
+  value: unknown
+): value is {
+  confirmed: true;
+  basis: "pretax_earned_including_bonus_allowance";
+} =>
+  Boolean(
+    value &&
+      typeof value === "object" &&
+      (value as Record<string, unknown>).confirmed === true &&
+      (value as Record<string, unknown>).basis ===
+        "pretax_earned_including_bonus_allowance"
+  );
+
 const normalizeStoredDetail = (detail: PolicyHistoryDetail): Answers => ({
   regionCode: detail.input.regionCode,
   regionName: detail.input.regionName,
@@ -94,7 +109,9 @@ const normalizeStoredDetail = (detail: PolicyHistoryDetail): Answers => ({
       100
     : 0,
   monthlyEarnedWagesFen: [...detail.input.monthlyEarnedWagesFen],
-  wageDataConfirmed: detail.input.wageDataConfirmation.confirmed,
+  wageDataConfirmed: hasConfirmedWageBasis(
+    detail.input.wageDataConfirmation
+  ),
   terminationScenario: detail.input.terminationScenario,
   followUps: {}
 });
@@ -155,17 +172,19 @@ export default function MainApp() {
   >([]);
   const [shareError, setShareError] = useState("");
   const [loadingIndex, setLoadingIndex] = useState(0);
-  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [legacyWageReview, setLegacyWageReview] = useState(false);
   const [authOpen, setAuthOpen] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
   const bottomRef = useRef<HTMLDivElement | null>(null);
-  const submitLockRef = useRef(false);
-  const calculationGenerationRef = useRef(0);
-  const calculationAbortRef = useRef<AbortController | null>(null);
   const regionRequestSequenceRef = useRef(0);
   const regionAbortRef = useRef<AbortController | null>(null);
   const regionDialogRef = useRef<HTMLDivElement | null>(null);
   const regionSearchRef = useRef<HTMLInputElement | null>(null);
+  const {
+    busy: policyOperationBusy,
+    cancel: cancelPolicyOperation,
+    run: runPolicyOperation
+  } = useLatestSingleFlight();
 
   useDialogFocus(
     regionPickerOpen,
@@ -586,7 +605,6 @@ export default function MainApp() {
   };
 
   const submitPolicyCalculation = async () => {
-    if (submitLockRef.current) return;
     if (!user) {
       setAuthOpen(true);
       return;
@@ -634,70 +652,56 @@ export default function MainApp() {
       setRequestError("请补充缺失的当地参数后再提交");
       return;
     }
-    submitLockRef.current = true;
-    setIsSubmitting(true);
-    const generation = ++calculationGenerationRef.current;
-    calculationAbortRef.current?.abort();
-    const controller = new AbortController();
-    calculationAbortRef.current = controller;
-    setMode("loading");
-    setRequestError("");
-    try {
-      const response = await calculatePolicy(buildRequest(), controller.signal);
-      if (generation !== calculationGenerationRef.current) return;
-      setServerResult(response);
-      persistResult(response, answers);
-      track("policy_calculation_completed", {
-        assessmentId: response.assessmentId,
-        accuracyLevel: response.accuracyLevel
-      });
-      setMode("result");
-    } catch (error) {
-      if (
-        generation !== calculationGenerationRef.current ||
-        controller.signal.aborted ||
-        (error instanceof DOMException && error.name === "AbortError")
-      ) {
-        return;
+    await runPolicyOperation(
+      (signal) => calculatePolicy(buildRequest(), signal),
+      {
+        onStart: () => {
+          setMode("loading");
+          setRequestError("");
+        },
+        onSuccess: (response) => {
+          setServerResult(response);
+          persistResult(response, answers);
+          setLegacyWageReview(false);
+          track("policy_calculation_completed", {
+            assessmentId: response.assessmentId,
+            accuracyLevel: response.accuracyLevel
+          });
+          setMode("result");
+        },
+        onError: (error) => {
+          setMode("chat");
+          if (
+            error instanceof ApiError &&
+            error.code === "REGIONAL_PARAMETERS_REQUIRED"
+          ) {
+            const details =
+              error.details && typeof error.details === "object"
+                ? (error.details as { missing?: unknown }).missing
+                : undefined;
+            const missing = Array.isArray(details)
+              ? details.filter(
+                  (item): item is string =>
+                    item === "minimumMonthlyWageFen" ||
+                    item === "employeeAverageMonthlyWageFen"
+                )
+              : [];
+            setServerMissingParameters(missing);
+            setRequestError(error.message);
+          } else {
+            setRequestError(
+              error instanceof ApiError
+                ? error.message
+                : "测算失败，请稍后重试"
+            );
+          }
+        }
       }
-      setMode("chat");
-      if (
-        error instanceof ApiError &&
-        error.code === "REGIONAL_PARAMETERS_REQUIRED"
-      ) {
-        const details =
-          error.details && typeof error.details === "object"
-            ? (error.details as { missing?: unknown }).missing
-            : undefined;
-        const missing = Array.isArray(details)
-          ? details.filter(
-              (item): item is string =>
-                item === "minimumMonthlyWageFen" ||
-                item === "employeeAverageMonthlyWageFen"
-            )
-          : [];
-        setServerMissingParameters(missing);
-        setRequestError(error.message);
-      } else {
-        setRequestError(
-          error instanceof ApiError ? error.message : "测算失败，请稍后重试"
-        );
-      }
-    } finally {
-      if (generation === calculationGenerationRef.current) {
-        submitLockRef.current = false;
-        setIsSubmitting(false);
-        calculationAbortRef.current = null;
-      }
-    }
+    );
   };
 
   const restart = () => {
-    calculationGenerationRef.current += 1;
-    calculationAbortRef.current?.abort();
-    calculationAbortRef.current = null;
-    submitLockRef.current = false;
-    setIsSubmitting(false);
+    cancelPolicyOperation();
     window.sessionStorage.removeItem(RESULT_KEY);
     window.sessionStorage.removeItem(ANSWERS_KEY);
     setAnswers(freshAnswers());
@@ -721,6 +725,7 @@ export default function MainApp() {
     setTerminationNodeId(rootTerminationReasonNode.id);
     setTerminationDetail(false);
     setReadyToCalculate(false);
+    setLegacyWageReview(false);
     setTextValue("");
     setRequestError("");
     setServerMissingParameters([]);
@@ -761,8 +766,25 @@ export default function MainApp() {
     setRequestError("");
   };
 
-  const recalculateHistory = async (detail: PolicyHistoryDetail) => {
+  const recalculateHistory = async (
+    detail: PolicyHistoryDetail
+  ): Promise<boolean> => {
     setRequestError("");
+    const nextAnswers = normalizeStoredDetail(detail);
+    if (!hasConfirmedWageBasis(detail.input.wageDataConfirmation)) {
+      cancelPolicyOperation();
+      window.sessionStorage.removeItem(RESULT_KEY);
+      window.sessionStorage.removeItem(ANSWERS_KEY);
+      setAnswers({ ...nextAnswers, wageDataConfirmed: false });
+      setServerResult(null);
+      setLegacyWageReview(true);
+      setReadyToCalculate(true);
+      setMode("chat");
+      setRequestError(
+        "请重新核对逐月税前应发工资，并勾选确认后再生成结果。"
+      );
+      return true;
+    }
     const request: PolicyCalculateRequest = {
       regionCode: detail.input.regionCode,
       startDate: detail.input.startDate,
@@ -777,23 +799,29 @@ export default function MainApp() {
           detail.input.employeeAverageMonthlyWageFen
       }
     };
-    const nextAnswers = normalizeStoredDetail(detail);
-    try {
-      const result = await calculatePolicy(request);
-      setAnswers(nextAnswers);
-      setServerResult(result);
-      persistResult(result, nextAnswers);
-      setMode("result");
-      track("policy_history_recalculated", {
-        sourceAssessmentId: detail.id,
-        assessmentId: result.assessmentId
-      });
-    } catch (error) {
-      setRequestError(
-        error instanceof ApiError ? error.message : "重新测算失败，请稍后重试"
-      );
-      throw error;
-    }
+    return runPolicyOperation(
+      (signal) => calculatePolicy(request, signal),
+      {
+        onSuccess: (result) => {
+          setAnswers(nextAnswers);
+          setServerResult(result);
+          persistResult(result, nextAnswers);
+          setLegacyWageReview(false);
+          setMode("result");
+          track("policy_history_recalculated", {
+            sourceAssessmentId: detail.id,
+            assessmentId: result.assessmentId
+          });
+        },
+        onError: (error) => {
+          setRequestError(
+            error instanceof ApiError
+              ? error.message
+              : "重新测算失败，请稍后重试"
+          );
+        }
+      }
+    );
   };
 
   const provinces = regions.filter((region) => region.level === "province");
@@ -1058,6 +1086,11 @@ export default function MainApp() {
                       ? "，请按工资条或流水逐月调整。"
                       : "，你仍可按实际工资条调整。"}
                   </p>
+                  {legacyWageReview && (
+                    <p role="alert" className="legacy-wage-review">
+                      请重新核对逐月税前应发工资。该历史记录没有可靠的工资口径确认，勾选下方确认后才能生成新结果。
+                    </p>
+                  )}
                   <div className="wage-month-grid">
                     {wageSeries.map((wageFen, index) => {
                       const first = index === 0;
@@ -1159,10 +1192,12 @@ export default function MainApp() {
                 <button
                   className="primary-button"
                   type="button"
-                  disabled={!answers.wageDataConfirmed || isSubmitting}
+                  disabled={
+                    !answers.wageDataConfirmed || policyOperationBusy
+                  }
                   onClick={() => void submitPolicyCalculation()}
                 >
-                  {isSubmitting ? "正在生成…" : "生成政策测算"}
+                  {policyOperationBusy ? "正在生成…" : "生成政策测算"}
                 </button>
               </section>
             )}
@@ -1245,8 +1280,12 @@ export default function MainApp() {
       <AuthModal open={authOpen} onClose={() => setAuthOpen(false)} />
       <AccountPanel
         open={accountOpen}
-        onClose={() => setAccountOpen(false)}
+        onClose={() => {
+          cancelPolicyOperation();
+          setAccountOpen(false);
+        }}
         historyRefreshKey={serverResult?.assessmentId}
+        policyRecalculating={accountOpen && policyOperationBusy}
         onPolicyRecalculate={recalculateHistory}
       />
     </main>

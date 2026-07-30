@@ -122,6 +122,13 @@ export type PolicyShare = {
   expiresAt: string;
 };
 
+export type PolicyShareStatus = {
+  shareId: string;
+  createdAt: string;
+  expiresAt: string;
+  status: "active" | "expired" | "revoked";
+};
+
 export type PolicyCalculateRequest = {
   regionCode: string;
   startDate: string;
@@ -165,10 +172,15 @@ export type PolicyHistoryDetail = {
     endDate: string;
     terminationScenario: TerminationScenario;
     monthlyEarnedWagesFen: number[];
-    wageDataConfirmation: {
-      confirmed: true;
-      basis: "pretax_earned_including_bonus_allowance";
-    };
+    wageDataConfirmation:
+      | {
+          confirmed: true;
+          basis: "pretax_earned_including_bonus_allowance";
+        }
+      | {
+          confirmed: false;
+          basis: "legacy_unverified";
+        };
     minimumMonthlyWageFen: number;
     employeeAverageMonthlyWageFen: number;
     alreadyPaidFen: number;

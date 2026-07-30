@@ -17,7 +17,8 @@ type AccountPanelProps = {
   open: boolean;
   onClose: () => void;
   historyRefreshKey?: string;
-  onPolicyRecalculate?: (detail: PolicyHistoryDetail) => Promise<void>;
+  policyRecalculating?: boolean;
+  onPolicyRecalculate?: (detail: PolicyHistoryDetail) => Promise<boolean>;
 };
 
 const moduleNames: Record<GrantModule, string> = {
@@ -29,6 +30,7 @@ export default function AccountPanel({
   open,
   onClose,
   historyRefreshKey,
+  policyRecalculating = false,
   onPolicyRecalculate
 }: AccountPanelProps) {
   const { user, grants, logout, redeemInvite, updateProfile } = useAuth();
@@ -152,9 +154,13 @@ export default function AccountPanel({
         <div className="account-panel-section">
           <PolicyHistory
             refreshKey={historyRefreshKey}
+            recalculating={policyRecalculating}
             onRecalculate={async (detail) => {
-              if (onPolicyRecalculate) await onPolicyRecalculate(detail);
-              onClose();
+              const completed = onPolicyRecalculate
+                ? await onPolicyRecalculate(detail)
+                : false;
+              if (completed) onClose();
+              return completed;
             }}
           />
         </div>

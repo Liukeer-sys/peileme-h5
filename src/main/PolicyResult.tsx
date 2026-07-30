@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ApiError,
   createPolicyShare,
+  listPolicyShares,
   revokePolicyShare
 } from "../lib/api";
 import type { PolicyApiResult } from "../types";
@@ -51,6 +52,9 @@ export default function PolicyResult({
   const [shareMessage, setShareMessage] = useState("");
   const [activeShareId, setActiveShareId] = useState("");
   const [shareBusy, setShareBusy] = useState(false);
+  const [shareStatusLoading, setShareStatusLoading] = useState(
+    !sharedReadOnly
+  );
   const accuracy = accuracyCopy[result.accuracyLevel];
   const sources = Object.values(result.parameters).filter(
     (item, index, all) =>
@@ -59,29 +63,83 @@ export default function PolicyResult({
         index
   );
 
+  useEffect(() => {
+    if (sharedReadOnly) return;
+    let active = true;
+    setShareStatusLoading(true);
+    void listPolicyShares(result.assessmentId)
+      .then(({ items }) => {
+        if (!active) return;
+        const current = items.find((item) => item.status === "active");
+        setActiveShareId(current?.shareId || "");
+        setShareMessage(
+          current
+            ? `已有有效分享，可撤销或重新生成；有效期至 ${new Date(
+                current.expiresAt
+              ).toLocaleString("zh-CN")}`
+            : ""
+        );
+      })
+      .catch((error) => {
+        if (!active) return;
+        setShareMessage(
+          error instanceof ApiError
+            ? error.message
+            : "分享状态加载失败，请重试"
+        );
+      })
+      .finally(() => {
+        if (active) setShareStatusLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [result.assessmentId, sharedReadOnly]);
+
+  const createAndPresentShare = async () => {
+    const created = await createPolicyShare(result.assessmentId);
+    setActiveShareId(created.shareId);
+    const url = new URL(window.location.href);
+    url.search = "";
+    url.searchParams.set("share", created.token);
+    try {
+      await navigator.clipboard.writeText(url.toString());
+      setShareMessage(
+        `分享链接已复制，有效期至 ${new Date(
+          created.expiresAt
+        ).toLocaleString("zh-CN")}`
+      );
+    } catch {
+      setShareMessage(`分享链接：${url.toString()}`);
+    }
+  };
+
   const share = async () => {
-    if (shareBusy) return;
+    if (shareBusy || shareStatusLoading) return;
     setShareBusy(true);
     setShareMessage("");
     try {
-      const created = await createPolicyShare(result.assessmentId);
-      setActiveShareId(created.shareId);
-      const url = new URL(window.location.href);
-      url.search = "";
-      url.searchParams.set("share", created.token);
-      try {
-        await navigator.clipboard.writeText(url.toString());
-        setShareMessage(
-          `分享链接已复制，有效期至 ${new Date(
-            created.expiresAt
-          ).toLocaleString("zh-CN")}`
-        );
-      } catch {
-        setShareMessage(`分享链接：${url.toString()}`);
-      }
+      await createAndPresentShare();
     } catch (error) {
       setShareMessage(
         error instanceof ApiError ? error.message : "分享链接创建失败，请重试"
+      );
+    } finally {
+      setShareBusy(false);
+    }
+  };
+
+  const replaceShare = async () => {
+    if (!activeShareId || shareBusy) return;
+    setShareBusy(true);
+    setShareMessage("");
+    try {
+      await revokePolicyShare(activeShareId);
+      setActiveShareId("");
+      await createAndPresentShare();
+    } catch (error) {
+      setShareMessage(
+        error instanceof ApiError ? error.message : "重新生成分享失败，请重试"
       );
     } finally {
       setShareBusy(false);
@@ -170,22 +228,36 @@ export default function PolicyResult({
             查看历史
           </button>
           {activeShareId ? (
-            <button
-              type="button"
-              className="secondary-button"
-              disabled={shareBusy}
-              onClick={() => void revokeShare()}
-            >
-              撤销分享
-            </button>
+            <>
+              <button
+                type="button"
+                className="secondary-button"
+                disabled={shareBusy}
+                onClick={() => void revokeShare()}
+              >
+                撤销分享
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                disabled={shareBusy}
+                onClick={() => void replaceShare()}
+              >
+                {shareBusy ? "正在生成…" : "重新生成分享"}
+              </button>
+            </>
           ) : (
             <button
               type="button"
               className="secondary-button"
-              disabled={shareBusy}
+              disabled={shareBusy || shareStatusLoading}
               onClick={() => void share()}
             >
-              {shareBusy ? "正在创建…" : "分享结果"}
+              {shareBusy
+                ? "正在创建…"
+                : shareStatusLoading
+                  ? "正在检查分享…"
+                  : "分享结果"}
             </button>
           )}
           <button type="button" className="ghost-button" onClick={onRecalculate}>
