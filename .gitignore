@@ -9,6 +9,7 @@ data/
 playwright-report/
 test-results/
 .playwright-mcp/
+.worktrees/
 
 # Environment variables
 .env
