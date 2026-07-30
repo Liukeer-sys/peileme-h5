@@ -115,6 +115,7 @@ Add focused tests to `server/tests/run-api-tests.test.ts` for:
 - two contenders released from the same barrier against one stale sidecar, with exactly one winner and one fast active-lock failure;
 - active ownership returning nonzero without issuing any Compose command, with separate diagnostics for a known sidecar owner and an occupied mutex with no sidecar;
 - cleanup and lock-release failures preserving an earlier up/test failure, while a release failure after success returns `1`;
+- wrapper upload cleanup refusing same-path replacements with a missing/wrong ownership marker and refusing symlink replacements, while preserving an earlier test/signal exit;
 - explicit `--lifecycle-test-exit-code`, `--lifecycle-test-hold-ms`, and `--lifecycle-test-stubborn-ms` acceptance controls; the stubborn control is signal-acceptance-only and exits `97` when its timeout is reached without the expected signal.
 
 Run:
@@ -161,7 +162,7 @@ process.env.COOKIE_DOMAIN = "";
 process.env.CSRF_SECRET = "test-csrf-secret-that-is-longer-than-thirty-two-characters";
 ```
 
-For direct `npm test`, create each run's upload directory with `mkdtempSync(path.join(tmpdir(), "peileme-test-uploads-"))`, register it in the setup module, and remove it in `afterAll`. For `test:api`, the wrapper creates one lifecycle directory while holding the database mutex, writes a random-token ownership marker, and passes the directory and token explicitly to Vitest. Every worker validates that marker and uses the shared directory without taking deletion ownership; the wrapper performs the single idempotent removal in its outer `finally`, including child-SIGKILL and down/release failure paths. `server/tests/test-setup.test.ts` must prove that cleanup removes its owned directory and preserves an unknown directory and sentinel, including an unknown directory with the expected filename prefix.
+For direct `npm test`, create each run's upload directory with `mkdtempSync(path.join(tmpdir(), "peileme-test-uploads-"))`, register it in the setup module, and remove it in `afterAll`. For `test:api`, the wrapper creates one lifecycle directory while holding the database mutex, writes a random-token ownership marker, and passes the directory and token explicitly to Vitest. Every worker validates that marker and uses the shared directory without taking deletion ownership; the wrapper performs the single idempotent removal in its outer `finally`, including child-SIGKILL and down/release failure paths. Before removal, compare `lstat`, directory and marker `realpath`, regular-file type, exact marker contents, and token against the in-memory ownership record, then repeat validation immediately before recursive removal. Missing/mismatched markers and directory symlinks remain untouched and make an otherwise successful lifecycle exit `1`; an earlier failure or signal code remains primary. Node exposes no directory-handle-anchored recursive removal, so the final revalidation narrows the local same-user replacement race but cannot provide a kernel-level guarantee against a malicious replacement between that check and `rm`. `server/tests/test-setup.test.ts` must prove that cleanup removes its owned directory and preserves an unknown directory and sentinel, including an unknown directory with the expected filename prefix.
 
 Add behavior-level assertions to `server/tests/api.test.ts`:
 
@@ -178,7 +179,7 @@ npx vitest run server/tests/run-api-tests.test.ts
 npm run test:api
 ```
 
-Expected: 22 wrapper/lock tests pass; the complete server suite reports 38/38; the wrapper-owned upload directory, lock sidecar, mutex listener, Compose container/network, and port `55432` are removed.
+Expected: 25 wrapper/lock tests pass; the complete server suite reports 41/41; the wrapper-owned upload directory, lock sidecar, mutex listener, Compose container/network, and port `55432` are removed.
 
 Exercise a real nonzero child:
 

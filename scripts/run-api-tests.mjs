@@ -1,6 +1,15 @@
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
-import { mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdtemp,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+  writeFile
+} from "node:fs/promises";
 import { createServer } from "node:net";
 import { constants as osConstants, tmpdir } from "node:os";
 import path from "node:path";
@@ -142,21 +151,71 @@ export const releaseTestDbLock = async (lock) => {
 };
 
 const createLifecycleUploadOwnership = async () => {
-  const directory = await mkdtemp(TEST_UPLOAD_PATH_PREFIX);
-  const ownership = {
-    directory: path.resolve(directory),
-    token: crypto.randomUUID()
-  };
+  const directory = path.resolve(await mkdtemp(TEST_UPLOAD_PATH_PREFIX));
+  const token = crypto.randomUUID();
+  const markerPath = path.join(directory, TEST_UPLOAD_OWNER_FILENAME);
+  const markerContents = `${JSON.stringify({ token })}\n`;
   try {
+    const ownership = {
+      directory,
+      markerContents,
+      markerPath,
+      realDirectory: await realpath(directory),
+      token
+    };
     await writeFile(
-      path.join(ownership.directory, TEST_UPLOAD_OWNER_FILENAME),
-      `${JSON.stringify({ token: ownership.token })}\n`,
+      ownership.markerPath,
+      ownership.markerContents,
       { encoding: "utf8", flag: "wx" }
     );
     return ownership;
   } catch (error) {
     await rm(ownership.directory, { recursive: true, force: true });
     throw error;
+  }
+};
+
+const validateLifecycleUploadOwnership = async (ownership) => {
+  const directory = path.resolve(ownership.directory);
+  try {
+    const directoryStat = await lstat(directory);
+    if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+      throw new Error("upload path is not the owned directory");
+    }
+
+    const currentRealDirectory = await realpath(directory);
+    if (currentRealDirectory !== ownership.realDirectory) {
+      throw new Error("upload directory realpath changed");
+    }
+
+    const markerStat = await lstat(ownership.markerPath);
+    if (!markerStat.isFile() || markerStat.isSymbolicLink()) {
+      throw new Error("ownership marker is not a regular file");
+    }
+
+    const currentMarkerRealpath = await realpath(ownership.markerPath);
+    const expectedMarkerRealpath = path.join(
+      ownership.realDirectory,
+      TEST_UPLOAD_OWNER_FILENAME
+    );
+    if (currentMarkerRealpath !== expectedMarkerRealpath) {
+      throw new Error("ownership marker realpath changed");
+    }
+
+    const markerContents = await readFile(ownership.markerPath, "utf8");
+    const marker = JSON.parse(markerContents);
+    if (
+      markerContents !== ownership.markerContents ||
+      marker?.token !== ownership.token
+    ) {
+      throw new Error("ownership marker token changed");
+    }
+  } catch (error) {
+    throw new Error(
+      `Lifecycle upload ownership validation failed for ${directory}: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
   }
 };
 
@@ -169,6 +228,10 @@ const cleanupLifecycleUploadOwnership = async (ownership) => {
   ) {
     throw new Error(`Refusing to remove unowned upload directory: ${directory}`);
   }
+  await validateLifecycleUploadOwnership(ownership);
+  // Node has no directory-handle recursive removal; revalidate immediately
+  // before rm to narrow the remaining same-user replacement race.
+  await validateLifecycleUploadOwnership(ownership);
   await rm(directory, { recursive: true, force: true });
   return true;
 };

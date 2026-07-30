@@ -1,6 +1,15 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter, once } from "node:events";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile
+} from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -161,6 +170,96 @@ afterEach(async () => {
 });
 
 describe("API test lifecycle wrapper", () => {
+  const exerciseLifecycleUploadReplacement = async ({
+    replacement,
+    testExitCode = 0,
+    testSignal = null
+  }: {
+    replacement: "missing-marker" | "wrong-token" | "symlink";
+    testExitCode?: number;
+    testSignal?: NodeJS.Signals | null;
+  }) => {
+    const { runApiTestLifecycle } = await loadWrapper();
+    const errors: string[] = [];
+    let wrapperUploadDir = "";
+    let replacementRoot = "";
+    let sentinelPath = "";
+
+    try {
+      const result = await withWatchdog(
+        runApiTestLifecycle({
+          lockPath,
+          lockPort,
+          logError: (message: string) => errors.push(message),
+          runCommand: async ({
+            phase,
+            env
+          }: {
+            phase: string;
+            env?: NodeJS.ProcessEnv;
+          }) => {
+            if (phase !== "test") return { exitCode: 0, signal: null };
+            wrapperUploadDir = env?.TEST_WRAPPER_UPLOAD_DIR ?? "";
+            if (!wrapperUploadDir) return { exitCode: 91, signal: null };
+
+            await rm(wrapperUploadDir, { recursive: true, force: true });
+            if (replacement === "symlink") {
+              replacementRoot = await mkdtemp(
+                path.join(tmpdir(), "peileme-unknown-upload-")
+              );
+              sentinelPath = path.join(replacementRoot, "sentinel.txt");
+              await writeFile(sentinelPath, "keep", "utf8");
+              await symlink(replacementRoot, wrapperUploadDir, "dir");
+            } else {
+              await mkdir(wrapperUploadDir);
+              sentinelPath = path.join(wrapperUploadDir, "sentinel.txt");
+              await writeFile(sentinelPath, "keep", "utf8");
+              if (replacement === "wrong-token") {
+                await writeFile(
+                  path.join(
+                    wrapperUploadDir,
+                    ".peileme-wrapper-owner.json"
+                  ),
+                  `${JSON.stringify({ token: "wrong-token" })}\n`,
+                  "utf8"
+                );
+              }
+            }
+            return {
+              exitCode: testSignal ? null : testExitCode,
+              signal: testSignal
+            };
+          }
+        }),
+        1_000,
+        `${replacement} upload replacement lifecycle`
+      );
+      return {
+        errors,
+        result,
+        sentinelPath,
+        wrapperUploadDir,
+        replacementRoot,
+        cleanup: async () => {
+          if (wrapperUploadDir) {
+            await rm(wrapperUploadDir, { recursive: true, force: true });
+          }
+          if (replacementRoot) {
+            await rm(replacementRoot, { recursive: true, force: true });
+          }
+        }
+      };
+    } catch (error) {
+      if (wrapperUploadDir) {
+        await rm(wrapperUploadDir, { recursive: true, force: true });
+      }
+      if (replacementRoot) {
+        await rm(replacementRoot, { recursive: true, force: true });
+      }
+      throw error;
+    }
+  };
+
   const exerciseLeaderExitWithStubbornDescendant = async ({
     signal,
     secondSignal,
@@ -936,6 +1035,67 @@ describe("API test lifecycle wrapper", () => {
       await rm(unknownUploadDir, { recursive: true, force: true });
     }
   });
+
+  it("preserves a same-path replacement without its ownership marker", async () => {
+    const observation = await exerciseLifecycleUploadReplacement({
+      replacement: "missing-marker"
+    });
+
+    try {
+      expect(observation.result).toEqual({ exitCode: 1, signal: null });
+      await expect(access(observation.wrapperUploadDir)).resolves.toBeUndefined();
+      await expect(access(observation.sentinelPath)).resolves.toBeUndefined();
+      expect(observation.errors.join("\n")).toContain(
+        "Test upload cleanup failed"
+      );
+    } finally {
+      await observation.cleanup();
+    }
+  });
+
+  it("preserves the test exit code and a same-path replacement with the wrong token", async () => {
+    const observation = await exerciseLifecycleUploadReplacement({
+      replacement: "wrong-token",
+      testExitCode: 23
+    });
+
+    try {
+      expect(observation.result).toEqual({ exitCode: 23, signal: null });
+      await expect(access(observation.wrapperUploadDir)).resolves.toBeUndefined();
+      await expect(access(observation.sentinelPath)).resolves.toBeUndefined();
+      expect(observation.errors.join("\n")).toContain(
+        "Test upload cleanup failed"
+      );
+    } finally {
+      await observation.cleanup();
+    }
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "preserves a symlink that replaces its owned upload directory",
+    async () => {
+      const observation = await exerciseLifecycleUploadReplacement({
+        replacement: "symlink",
+        testSignal: "SIGTERM"
+      });
+
+      try {
+        expect(observation.result).toEqual({
+          exitCode: 143,
+          signal: "SIGTERM"
+        });
+        expect(
+          (await lstat(observation.wrapperUploadDir)).isSymbolicLink()
+        ).toBe(true);
+        await expect(access(observation.sentinelPath)).resolves.toBeUndefined();
+        expect(observation.errors.join("\n")).toContain(
+          "Test upload cleanup failed"
+        );
+      } finally {
+        await observation.cleanup();
+      }
+    }
+  );
 
   it("parses explicit lifecycle-only failure, hold, and stubborn controls", async () => {
     const { parseLifecycleArgs } = await loadWrapper();
