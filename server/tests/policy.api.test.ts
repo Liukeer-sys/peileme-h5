@@ -1191,7 +1191,7 @@ describe("policy capability administration", () => {
       .expect(400);
   });
 
-  it("requires publish review and trustworthy official evidence for verified parameters", async () => {
+  it("requires publish review and trustworthy official evidence for calculation parameters", async () => {
     await query(
       `INSERT INTO role_capabilities(role, capability)
        VALUES ('analyst', 'policy.write')
@@ -1213,18 +1213,25 @@ describe("policy capability administration", () => {
       .set(authHeader(analystToken))
       .send({ ...base, status: "draft" })
       .expect(200);
-    const forbiddenVerification = await request(createApp())
-      .put("/api/admin/policy/regional-parameters")
-      .set(authHeader(analystToken))
-      .send({ ...base, status: "verified" })
-      .expect(403);
-    expect(forbiddenVerification.body.error).toBe("CAPABILITY_REQUIRED");
+    for (const status of ["verified", "stale"]) {
+      const forbiddenReview = await request(createApp())
+        .put("/api/admin/policy/regional-parameters")
+        .set(authHeader(analystToken))
+        .send({ ...base, status })
+        .expect(403);
+      expect(forbiddenReview.body.error).toBe("CAPABILITY_REQUIRED");
+    }
 
     for (const invalid of [
       {
         ...base,
         sourceUrl: "https://gov.cn.attacker.example/source",
         status: "verified"
+      },
+      {
+        ...base,
+        sourceUrl: "https://gov.cn.attacker.example/stale-source",
+        status: "stale"
       },
       {
         ...base,
@@ -1256,6 +1263,13 @@ describe("policy capability administration", () => {
         .expect(400);
       expect(rejected.body.error).toBe("VALIDATION_ERROR");
     }
+
+    const staleResponse = await request(createApp())
+      .put("/api/admin/policy/regional-parameters")
+      .set(authHeader(adminToken))
+      .send({ ...base, status: "stale" })
+      .expect(200);
+    expect(staleResponse.body.status).toBe("stale");
 
     const response = await request(createApp())
       .put("/api/admin/policy/regional-parameters")

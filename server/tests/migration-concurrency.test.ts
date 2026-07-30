@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import pg from "pg";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -51,6 +52,151 @@ const runMigrationProcess = (
   );
 
 describe("migration concurrency", () => {
+  it(
+    "backfills immutable parameter provenance when upgrading from 002 to 003",
+    async () => {
+      const baseUrl = new URL(process.env.DATABASE_URL!);
+      const databaseName =
+        `peileme_upgrade_${randomUUID().replaceAll("-", "")}`;
+      const adminUrl = new URL(baseUrl);
+      adminUrl.pathname = "/postgres";
+      const databaseUrl = new URL(baseUrl);
+      databaseUrl.pathname = `/${databaseName}`;
+      const legacyProvenance = {
+        minimumMonthlyWage: {
+          source: "database",
+          parameterId: "11111111-1111-4111-8111-111111111111",
+          amountFen: 240000,
+          sourceName: "迁移前官方来源"
+        }
+      };
+      const admin = new Client({ connectionString: adminUrl.toString() });
+      let databaseCreated = false;
+      try {
+        await admin.connect();
+        await admin.query(`CREATE DATABASE "${databaseName}"`);
+        databaseCreated = true;
+
+        const setup = new Client({ connectionString: databaseUrl.toString() });
+        await setup.connect();
+        try {
+          for (const version of [
+            "001_initial.sql",
+            "002_policy_foundation.sql"
+          ]) {
+            const sql = await readFile(
+              path.resolve("database/migrations", version),
+              "utf8"
+            );
+            await setup.query(sql);
+            await setup.query(
+              `INSERT INTO schema_migrations(version)
+               VALUES ($1)
+               ON CONFLICT DO NOTHING`,
+              [version]
+            );
+          }
+          const ruleSet = await setup.query<{ id: string }>(
+            `INSERT INTO policy_rule_sets(code, name, product_channel)
+             VALUES ('legacy-upgrade', '升级测试', 'main')
+             RETURNING id`
+          );
+          const version = await setup.query<{ id: string }>(
+            `INSERT INTO policy_rule_versions(
+               rule_set_id, version, status, definition, source_snapshot,
+               effective_from, published_at
+             )
+             VALUES (
+               $1, 1, 'published', '{}'::jsonb, '[]'::jsonb,
+               DATE '2020-01-01', now()
+             )
+             RETURNING id`,
+            [ruleSet.rows[0].id]
+          );
+          const assessments = await setup.query<{ id: string; marker: string }>(
+            `INSERT INTO assessments(
+               visitor_id, session_id, answers, product_channel,
+               rule_version_id, input_snapshot, result_snapshot
+             )
+             VALUES
+               (
+                 'legacy-object', 'legacy-object',
+                 jsonb_build_object(
+                   'marker', 'object',
+                   'parameterProvenance', $1::jsonb
+                 ),
+                 'main', $2, '{}'::jsonb, '{}'::jsonb
+               ),
+               (
+                 'legacy-missing', 'legacy-missing',
+                 '{"marker":"missing"}'::jsonb,
+                 'main', $2, '{}'::jsonb, '{}'::jsonb
+               ),
+               (
+                 'legacy-array', 'legacy-array',
+                 '{"marker":"array","parameterProvenance":[]}'::jsonb,
+                 'main', $2, '{}'::jsonb, '{}'::jsonb
+               )
+             RETURNING id, answers->>'marker' AS marker`,
+            [JSON.stringify(legacyProvenance), version.rows[0].id]
+          );
+          for (const assessment of assessments.rows) {
+            await setup.query(
+              `INSERT INTO policy_calculation_snapshots(
+                 assessment_id, rule_version_id, input, output, input_hash
+               )
+               VALUES ($1, $2, '{}'::jsonb, '{}'::jsonb, $3)`,
+              [assessment.id, version.rows[0].id, assessment.marker]
+            );
+          }
+        } finally {
+          await setup.end();
+        }
+
+        const migrated = await runMigrationProcess(databaseUrl.toString());
+        expect(migrated.status, `${migrated.stdout}\n${migrated.stderr}`).toBe(
+          0
+        );
+
+        const verify = new Client({ connectionString: databaseUrl.toString() });
+        await verify.connect();
+        try {
+          const snapshots = await verify.query<{
+            input_hash: string;
+            parameter_provenance: unknown;
+          }>(
+            `SELECT input_hash, parameter_provenance
+               FROM policy_calculation_snapshots
+              ORDER BY input_hash`
+          );
+          expect(snapshots.rows).toEqual([
+            { input_hash: "array", parameter_provenance: {} },
+            { input_hash: "missing", parameter_provenance: {} },
+            {
+              input_hash: "object",
+              parameter_provenance: legacyProvenance
+            }
+          ]);
+        } finally {
+          await verify.end();
+        }
+      } finally {
+        if (databaseCreated) {
+          await admin.query(
+            `SELECT pg_terminate_backend(pid)
+               FROM pg_stat_activity
+              WHERE datname = $1
+                AND pid <> pg_backend_pid()`,
+            [databaseName]
+          );
+          await admin.query(`DROP DATABASE IF EXISTS "${databaseName}"`);
+        }
+        await admin.end();
+      }
+    },
+    15_000
+  );
+
   it(
     "serializes two migration processes against one clean database",
     async () => {

@@ -166,6 +166,11 @@ const sourceSnapshotSchema = z
   .array(z.record(z.string(), z.unknown()))
   .max(100);
 
+export const calendarDateInShanghai = (now = new Date()) =>
+  new Date(now.getTime() + 8 * 60 * 60 * 1_000)
+    .toISOString()
+    .slice(0, 10);
+
 const regionalParameterSchema = z
   .object({
     regionCode: z.string().regex(/^\d{6}$/),
@@ -187,7 +192,7 @@ const regionalParameterSchema = z
   })
   .superRefine((value, context) => {
     if (value.status === "draft") return;
-    const currentDate = new Date().toISOString().slice(0, 10);
+    const currentDate = calendarDateInShanghai();
     const currentYear = Number(currentDate.slice(0, 4));
     if (!isGovernmentHttpsUrl(value.sourceUrl)) {
       context.addIssue({
@@ -221,7 +226,8 @@ const requireRegionalParameterCapability = (
   next: NextFunction
 ) =>
   requireCapability(
-    request.body?.status === "verified"
+    request.body?.status === "verified" ||
+    request.body?.status === "stale"
       ? "policy.publish"
       : "policy.write"
   )(request, response, next);

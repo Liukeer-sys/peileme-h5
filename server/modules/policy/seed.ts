@@ -170,7 +170,7 @@ export const seedPolicyFoundation = async () => {
 
     const definitionJson = JSON.stringify(severanceDefinition);
     const sourceSnapshotJson = JSON.stringify(severanceSourceSnapshot);
-    const insertedVersion = await client.query<{ id: string }>(
+    await client.query(
       `INSERT INTO policy_rule_versions(
          rule_set_id,
          version,
@@ -181,8 +181,7 @@ export const seedPolicyFoundation = async () => {
          published_at
        )
        VALUES ($1, 1, 'published', $2::jsonb, $3::jsonb, $4::date, now())
-       ON CONFLICT (rule_set_id, version) DO NOTHING
-       RETURNING id`,
+       ON CONFLICT (rule_set_id, version) DO NOTHING`,
       [
         ruleSetId,
         definitionJson,
@@ -190,40 +189,6 @@ export const seedPolicyFoundation = async () => {
         "2013-07-01"
       ]
     );
-    if (!insertedVersion.rows[0]) {
-      const existingVersion = await client.query<{
-        id: string;
-        status: string;
-      }>(
-        `SELECT id, status
-         FROM policy_rule_versions
-         WHERE rule_set_id = $1 AND version = 1
-         FOR UPDATE`,
-        [ruleSetId]
-      );
-      const existing = existingVersion.rows[0];
-      if (!existing) {
-        throw new Error("Policy rule version disappeared during seed");
-      }
-      if (existing.status === "published") {
-        await client.query(
-          `UPDATE policy_rule_versions
-           SET definition = $2::jsonb,
-               source_snapshot = $3::jsonb,
-               updated_at = now()
-           WHERE id = $1
-             AND (
-               definition IS DISTINCT FROM $2::jsonb OR
-               source_snapshot IS DISTINCT FROM $3::jsonb
-             )`,
-          [
-            existing.id,
-            definitionJson,
-            sourceSnapshotJson
-          ]
-        );
-      }
-    }
 
     const currentVersion = await client.query<{ id: string }>(
       `SELECT id

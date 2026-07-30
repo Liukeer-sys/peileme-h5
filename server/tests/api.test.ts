@@ -622,32 +622,66 @@ describe("policy persistence foundation", () => {
     expect(after.rows).toEqual(before.rows);
   });
 
-  it("updates the version timestamp only when baseline content changes", async () => {
-    const changed = await query<{ updated_at: string }>(
-      `UPDATE policy_rule_versions
-       SET definition = '{}'::jsonb
-       WHERE rule_set_id = (
-         SELECT id FROM policy_rule_sets WHERE code = 'cn-severance'
-       )
-         AND version = 1
-       RETURNING updated_at::text`
-    );
+  it("never mutates an existing published baseline definition or source", async () => {
     await seed();
-    const restored = await query<{
-      definition: Record<string, unknown>;
+    const original = await query<{
+      id: string;
+      definition: unknown;
+      source_snapshot: unknown;
+    }>(
+      `SELECT id, definition, source_snapshot
+         FROM policy_rule_versions
+        WHERE rule_set_id = (
+          SELECT id FROM policy_rule_sets WHERE code = 'cn-severance'
+        )
+          AND version = 1`
+    );
+    const customized = await query<{
+      definition_text: string;
+      source_snapshot_text: string;
       updated_at: string;
     }>(
-      `SELECT definition, updated_at::text
-       FROM policy_rule_versions
-       WHERE rule_set_id = (
-         SELECT id FROM policy_rule_sets WHERE code = 'cn-severance'
-       )
-         AND version = 1`
+      `UPDATE policy_rule_versions
+          SET definition = '{"schemaVersion":2,"managedBy":"admin"}'::jsonb,
+              source_snapshot =
+                '[{"source":"admin-published-custom-source"}]'::jsonb
+        WHERE rule_set_id = (
+          SELECT id FROM policy_rule_sets WHERE code = 'cn-severance'
+        )
+          AND version = 1
+          AND status = 'published'
+        RETURNING definition::text AS definition_text,
+                  source_snapshot::text AS source_snapshot_text,
+                  updated_at::text`
     );
-    expect(restored.rows[0].definition).toMatchObject({ schemaVersion: 2 });
-    expect(
-      Date.parse(restored.rows[0].updated_at)
-    ).toBeGreaterThan(Date.parse(changed.rows[0].updated_at));
+    try {
+      await seed();
+      const afterSeed = await query<{
+        definition_text: string;
+        source_snapshot_text: string;
+        updated_at: string;
+      }>(
+        `SELECT definition::text AS definition_text,
+                source_snapshot::text AS source_snapshot_text,
+                updated_at::text
+           FROM policy_rule_versions
+          WHERE id = $1`,
+        [original.rows[0].id]
+      );
+      expect(afterSeed.rows[0]).toEqual(customized.rows[0]);
+    } finally {
+      await query(
+        `UPDATE policy_rule_versions
+            SET definition = $2::jsonb,
+                source_snapshot = $3::jsonb
+          WHERE id = $1`,
+        [
+          original.rows[0].id,
+          JSON.stringify(original.rows[0].definition),
+          JSON.stringify(original.rows[0].source_snapshot)
+        ]
+      );
+    }
   });
 
   it("imports the official administrative-region snapshot idempotently", async () => {
