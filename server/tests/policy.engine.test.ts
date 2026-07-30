@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { Decimal } from "decimal.js";
 import { describe, expect, it } from "vitest";
 import { calculatePolicy } from "../modules/policy/engine.js";
@@ -43,6 +44,17 @@ const monetaryValues = (output: PolicyOutput) => [
   output.rangeFen.low,
   output.rangeFen.high
 ];
+
+const decimalConfig = () => ({
+  precision: Decimal.precision,
+  rounding: Decimal.rounding,
+  toExpNeg: Decimal.toExpNeg,
+  toExpPos: Decimal.toExpPos,
+  maxE: Decimal.maxE,
+  minE: Decimal.minE,
+  modulo: Decimal.modulo,
+  crypto: Decimal.crypto
+});
 
 describe("calculatePolicy service time", () => {
   it("counts 6 years and 6 complete months as 7 compensation months", () => {
@@ -135,6 +147,83 @@ describe("calculatePolicy service time", () => {
 });
 
 describe("calculatePolicy wage basis", () => {
+  it("uses complete private defaults when Decimal is polluted before first import", () => {
+    const parentConfigBefore = decimalConfig();
+    const childScript = `
+      import { Decimal } from "decimal.js";
+
+      Decimal.set({
+        precision: 1,
+        rounding: Decimal.ROUND_DOWN,
+        toExpNeg: 0,
+        toExpPos: 0,
+        maxE: 1,
+        minE: -1,
+        modulo: Decimal.EUCLID,
+        crypto: true
+      });
+
+      const { calculatePolicy } = await import(
+        "./server/modules/policy/engine.ts"
+      );
+      const input = {
+        regionCode: "310000",
+        regionName: "上海市",
+        startDate: "2024-06-30",
+        endDate: "2024-07-01",
+        terminationScenario: {
+          kind: "ARTICLE_40",
+          noticeMethod: "notice_30_days"
+        },
+        monthlyEarnedWagesFen: [100, 101],
+        minimumMonthlyWageFen: 1,
+        employeeAverageMonthlyWageFen: 1_000
+      };
+      const importedAfterPollution = calculatePolicy(input);
+
+      Decimal.set({
+        precision: 2,
+        rounding: Decimal.ROUND_UP,
+        toExpNeg: -1,
+        toExpPos: 1,
+        maxE: 2,
+        minE: -2,
+        modulo: Decimal.ROUND_FLOOR,
+        crypto: false
+      });
+      const pollutedAfterImport = calculatePolicy(input);
+
+      console.log(JSON.stringify({
+        importedAfterPollution,
+        pollutedAfterImport
+      }));
+    `;
+    const child = spawnSync(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "--eval", childScript],
+      {
+        cwd: process.cwd(),
+        encoding: "utf8"
+      }
+    );
+
+    if (child.status !== 0) {
+      throw new Error(
+        `fresh Decimal import child failed (${child.status}): ${child.stderr}`
+      );
+    }
+    const childResult = JSON.parse(child.stdout) as {
+      importedAfterPollution: PolicyOutput;
+      pollutedAfterImport: PolicyOutput;
+    };
+    expect(childResult.importedAfterPollution.rawAverageWageFen).toBe(101);
+    expect(childResult.importedAfterPollution.baseCompensationFen).toBe(51);
+    expect(childResult.pollutedAfterImport).toEqual(
+      childResult.importedAfterPollution
+    );
+    expect(decimalConfig()).toEqual(parentConfigBefore);
+  });
+
   it("is unaffected by external Decimal global precision and rounding", () => {
     const input = {
       ...baseInput(),

@@ -671,9 +671,10 @@ instead of pre-collapsing them into a payout multiplier.
   wage parameters are positive safe integers. Negative zero and overflow are
   rejected. The earned-wage total is checked before division, so an unsafe
   intermediate total cannot be hidden by a safe average.
-- All arithmetic uses a module-private Decimal clone with precision 40 and
-  half-up rounding. External changes to Decimal's global precision or rounding
-  do not affect engine results.
+- All arithmetic uses a module-private Decimal clone reset with
+  `defaults: true`, precision 40, and half-up rounding. External changes to
+  Decimal's global configuration before or after the engine's first import do
+  not affect results.
 - Output also includes `serviceRemainderDays` and `noticePayBasisFen`.
   `formulaSteps` explains service, average wage, minimum adjustment,
   three-times cap, legal scenario, notice pay, paid amount, and difference in
@@ -873,6 +874,7 @@ import { Decimal } from "decimal.js";
 import type { PolicyInput, PolicyOutput } from "./types.js";
 
 const PolicyDecimal = Decimal.clone({
+  defaults: true,
   precision: 40,
   rounding: Decimal.ROUND_HALF_UP
 });
@@ -1006,7 +1008,7 @@ Run:
 npm test -- --run server/tests/policy.engine.test.ts
 ```
 
-Expected: all 56 Task 3 engine tests pass.
+Expected: all 57 Task 3 engine tests pass.
 
 - [ ] **Step 7: Commit**
 

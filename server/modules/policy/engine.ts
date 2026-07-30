@@ -7,6 +7,7 @@ import type {
 } from "./types.js";
 
 const PolicyDecimal = Decimal.clone({
+  defaults: true,
   precision: 40,
   rounding: Decimal.ROUND_HALF_UP
 });
