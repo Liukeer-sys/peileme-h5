@@ -248,6 +248,8 @@ const assertScenario = (
   }
   if (
     scenario.kind === "ARTICLE_38_EMPLOYEE_TERMINATION" ||
+    scenario.kind === "STATUTORY_COMPENSATION" ||
+    scenario.kind === "ARTICLE_39_NO_COMPENSATION" ||
     scenario.kind === "VOLUNTARY_RESIGNATION" ||
     scenario.kind === "UNCLEAR"
   ) {
@@ -364,6 +366,10 @@ const describeScenario = (
         : "用人单位依据第四十条解除并选择支付代通知金";
     case "ARTICLE_38_EMPLOYEE_TERMINATION":
       return "劳动者依据第三十八条解除，按N计算经济补偿";
+    case "STATUTORY_COMPENSATION":
+      return "劳动合同依法解除或终止，按N计算法定经济补偿";
+    case "ARTICLE_39_NO_COMPENSATION":
+      return "用人单位依据第三十九条过失性解除，法定经济补偿为0分";
     case "VOLUNTARY_RESIGNATION":
       return "劳动者自愿辞职，法定经济补偿按0分计算";
     case "UNLAWFUL_TERMINATION":
@@ -450,9 +456,11 @@ export const calculatePolicy = (value: unknown): PolicyOutput => {
       rangeFen = { low: payableFen, high: payableFen };
       break;
     case "ARTICLE_38_EMPLOYEE_TERMINATION":
+    case "STATUTORY_COMPENSATION":
       payableFen = baseCompensationFen;
       rangeFen = { low: payableFen, high: payableFen };
       break;
+    case "ARTICLE_39_NO_COMPENSATION":
     case "VOLUNTARY_RESIGNATION":
       break;
     case "UNLAWFUL_TERMINATION":

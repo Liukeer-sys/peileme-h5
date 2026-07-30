@@ -22,6 +22,8 @@ const otherUser = {
 let apiContext: APIRequestContext;
 let otherAccessToken = "";
 
+test.describe.configure({ timeout: 30_000 });
+
 const requireUrls = () => {
   if (!baseUrl) {
     throw new Error("E2E_BASE_URL is required for the main policy acceptance suite");
@@ -123,6 +125,7 @@ const completeQuestionnaire = async (
     startMonth?: string;
     endMonth?: string;
     salary?: string;
+    bonus?: string;
     termination?: "notice" | "unlawful";
   } = {}
 ) => {
@@ -148,7 +151,10 @@ const completeQuestionnaire = async (
     .click();
   await sendInput(page, "最近一年平均月工资（元）", options.salary || "15000");
   await page
-    .getByRole("button", { name: "没有年终奖", exact: true })
+    .getByRole("button", {
+      name: options.bonus || "没有年终奖",
+      exact: true
+    })
     .click();
   await page.getByRole("button", { name: /单位要辞退我/ }).click();
 
@@ -209,10 +215,26 @@ test.beforeEach(async ({ page }) => {
 test("登录后完整问卷使用服务端结果并在刷新后恢复", async ({ page }) => {
   const assertCleanRuntime = watchRuntime(page);
   await loginAs(page, policyUser);
-  await completeQuestionnaire(page, { city: "上海" });
+  await completeQuestionnaire(page, {
+    city: "上海",
+    bonus: "1个月工资左右"
+  });
   await expect(
     page.getByRole("region", { name: "提交政策测算" })
   ).toContainText("补充后本次结果会标记为估算");
+  await expect(
+    page.getByRole("region", { name: "近12个月应发工资" })
+  ).toContainText("从早到晚");
+  await page
+    .getByLabel("第1个月应发工资（元，最早）")
+    .fill("16001");
+  await page
+    .getByLabel("第12个月应发工资（元，解除前完整月）")
+    .fill("17002");
+  await page.screenshot({
+    path: "test-results/task7-wage-series.png",
+    fullPage: true
+  });
   await fillVisibleManualParameters(page);
 
   const calculation = page.waitForResponse(
@@ -223,7 +245,20 @@ test("登录后完整问卷使用服务端结果并在刷新后恢复", async ({
   await page
     .getByRole("button", { name: "生成政策测算", exact: true })
     .click();
-  expect((await calculation).status()).toBe(201);
+  const created = await calculation;
+  expect(created.status()).toBe(201);
+  const submitted = created.request().postDataJSON() as {
+    terminationScenario: unknown;
+    monthlyEarnedWagesFen: number[];
+  };
+  expect(submitted.terminationScenario).toEqual({
+    kind: "ARTICLE_40",
+    noticeMethod: "notice_30_days"
+  });
+  expect(submitted.monthlyEarnedWagesFen).toHaveLength(12);
+  expect(submitted.monthlyEarnedWagesFen[0]).toBe(1_600_100);
+  expect(submitted.monthlyEarnedWagesFen[1]).toBe(1_625_000);
+  expect(submitted.monthlyEarnedWagesFen[11]).toBe(1_700_200);
   await expect(
     page.getByRole("heading", { name: "政策测算结果", exact: true })
   ).toBeVisible();
@@ -240,19 +275,32 @@ test("登录后完整问卷使用服务端结果并在刷新后恢复", async ({
   await expect(
     page.getByRole("heading", { name: "政策测算结果", exact: true })
   ).toBeVisible();
+  const restoredAnswers = await page.evaluate(() => {
+    const raw = window.sessionStorage.getItem("peileme-policy-answers");
+    return raw ? JSON.parse(raw) : null;
+  });
+  expect(restoredAnswers.monthlyEarnedWagesFen).toEqual(
+    submitted.monthlyEarnedWagesFen
+  );
   assertCleanRuntime();
 });
 
 test("完整省市搜索可选择非快捷城市并补录缺失参数", async ({ page }) => {
   const assertCleanRuntime = watchRuntime(page);
   await loginAs(page, policyUser);
-  await completeQuestionnaire(page, { searchCity: "阿拉善盟" });
+  await completeQuestionnaire(page, {
+    searchCity: "阿拉善盟",
+    bonus: "说不清 / 还没发"
+  });
   await expect(
     page.getByRole("region", { name: "提交政策测算" })
   ).toContainText(/内蒙古自治区.*阿拉善盟/);
   await expect(
     page.getByRole("region", { name: "提交政策测算" })
   ).toContainText("补充后本次结果会标记为估算");
+  await expect(
+    page.getByRole("region", { name: "近12个月应发工资" })
+  ).toContainText("奖金金额不确定，默认未计入");
   await fillVisibleManualParameters(page);
   const calculation = page.waitForResponse(
     (response) =>
@@ -262,7 +310,14 @@ test("完整省市搜索可选择非快捷城市并补录缺失参数", async ({
   await page
     .getByRole("button", { name: "生成政策测算", exact: true })
     .click();
-  expect((await calculation).status()).toBe(201);
+  const created = await calculation;
+  expect(created.status()).toBe(201);
+  const submitted = created.request().postDataJSON() as {
+    monthlyEarnedWagesFen: number[];
+  };
+  expect(submitted.monthlyEarnedWagesFen).toEqual(
+    Array(12).fill(1_500_000)
+  );
   await expect(
     page.getByRole("region", { name: "政策测算结果" })
   ).toContainText("估算");
@@ -308,6 +363,55 @@ test("网络失败会回到可重试状态并保留输入", async ({ page }) => 
   ).toContainText("武汉市");
 });
 
+test("工资月明细支持1个月并在无效时阻止提交", async ({ page }) => {
+  await loginAs(page, policyUser);
+  await completeQuestionnaire(page, { city: "武汉" });
+  await page.getByLabel("应发工资月份数").selectOption("1");
+  await page
+    .getByLabel("第1个月应发工资（元，最早，解除前完整月）")
+    .fill("-1");
+  let calculateRequests = 0;
+  page.on("request", (request) => {
+    if (
+      request.url().endsWith("/api/policy/calculate") &&
+      request.method() === "POST"
+    ) {
+      calculateRequests += 1;
+    }
+  });
+  await page
+    .getByRole("button", { name: "生成政策测算", exact: true })
+    .click();
+
+  await expect(page.getByRole("alert")).toContainText(
+    "请检查近1至12个月的应发工资"
+  );
+  expect(calculateRequests).toBe(0);
+  await expect(
+    page.getByRole("region", { name: "近1个月应发工资" })
+  ).toBeVisible();
+  await page
+    .getByLabel("第1个月应发工资（元，最早，解除前完整月）")
+    .fill("12345");
+  const calculation = page.waitForResponse(
+    (response) =>
+      response.url().endsWith("/api/policy/calculate") &&
+      response.request().method() === "POST"
+  );
+  await page
+    .getByRole("button", { name: "生成政策测算", exact: true })
+    .click();
+  const created = await calculation;
+  expect(created.status()).toBe(201);
+  expect(
+    (
+      created.request().postDataJSON() as {
+        monthlyEarnedWagesFen: number[];
+      }
+    ).monthlyEarnedWagesFen
+  ).toEqual([1_234_500]);
+});
+
 test("未登录用户提交时进入登录流程且不会创建计算记录", async ({ page }) => {
   await bridgeApi(page);
   await page.goto("/");
@@ -335,8 +439,15 @@ test("历史列表展示完整详情且其他用户访问返回 404", async ({ p
   await loginAs(page, policyUser);
   await completeQuestionnaire(page, {
     city: "武汉",
-    termination: "unlawful"
+    termination: "unlawful",
+    bonus: "2个月工资左右"
   });
+  await page
+    .getByLabel("第1个月应发工资（元，最早）")
+    .fill("17777");
+  await page
+    .getByLabel("第12个月应发工资（元，解除前完整月）")
+    .fill("18888");
   const calculation = page.waitForResponse(
     (response) =>
       response.url().endsWith("/api/policy/calculate") &&
@@ -347,6 +458,17 @@ test("历史列表展示完整详情且其他用户访问返回 404", async ({ p
     .click();
   const created = await calculation;
   expect(created.status()).toBe(201);
+  const originalInput = created.request().postDataJSON() as {
+    terminationScenario: unknown;
+    monthlyEarnedWagesFen: number[];
+  };
+  expect(originalInput.terminationScenario).toEqual({
+    kind: "UNLAWFUL_TERMINATION",
+    continuedPerformanceRequested: false,
+    continuedPerformancePossible: false
+  });
+  expect(originalInput.monthlyEarnedWagesFen[0]).toBe(1_777_700);
+  expect(originalInput.monthlyEarnedWagesFen[11]).toBe(1_888_800);
   const { assessmentId } = (await created.json()) as { assessmentId: string };
 
   await page
@@ -377,7 +499,18 @@ test("历史列表展示完整详情且其他用户访问返回 404", async ({ p
   await accountDialog
     .getByRole("button", { name: "按此记录重新测算", exact: true })
     .click();
-  expect((await recalculation).status()).toBe(201);
+  const recalculated = await recalculation;
+  expect(recalculated.status()).toBe(201);
+  const restoredInput = recalculated.request().postDataJSON() as {
+    terminationScenario: unknown;
+    monthlyEarnedWagesFen: number[];
+  };
+  expect(restoredInput.terminationScenario).toEqual(
+    originalInput.terminationScenario
+  );
+  expect(restoredInput.monthlyEarnedWagesFen).toEqual(
+    originalInput.monthlyEarnedWagesFen
+  );
   await expect(
     page.getByRole("heading", { name: "政策测算结果", exact: true })
   ).toBeVisible();

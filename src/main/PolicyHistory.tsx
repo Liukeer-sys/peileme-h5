@@ -24,6 +24,8 @@ const scenarioName: Record<PolicyHistoryItem["scenario"], string> = {
   MUTUAL_AGREEMENT: "协商解除",
   ARTICLE_40: "无过失性解除",
   ARTICLE_38_EMPLOYEE_TERMINATION: "因单位过错解除",
+  STATUTORY_COMPENSATION: "法定经济补偿",
+  ARTICLE_39_NO_COMPENSATION: "过失性解除",
   VOLUNTARY_RESIGNATION: "主动辞职",
   UNLAWFUL_TERMINATION: "违法解除",
   UNCLEAR: "待核对情形"

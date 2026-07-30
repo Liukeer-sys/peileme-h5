@@ -49,6 +49,8 @@ const terminationScenarioSchema = z.discriminatedUnion("kind", [
     })
     .strict(),
   z.object({ kind: z.literal("ARTICLE_38_EMPLOYEE_TERMINATION") }).strict(),
+  z.object({ kind: z.literal("STATUTORY_COMPENSATION") }).strict(),
+  z.object({ kind: z.literal("ARTICLE_39_NO_COMPENSATION") }).strict(),
   z.object({ kind: z.literal("VOLUNTARY_RESIGNATION") }).strict(),
   z
     .object({

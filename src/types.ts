@@ -15,6 +15,7 @@
   takeHomeSalary?: number;
   bonusInfo?: string;
   bonusLevel?: string;
+  monthlyEarnedWagesFen?: number[];
   terminationReason?: string;
   terminationReasonType?: string;
   terminationScenario?: TerminationScenario;
@@ -34,6 +35,8 @@ export type TerminationScenario =
       noticeMethod: "notice_30_days" | "payment_in_lieu";
     }
   | { kind: "ARTICLE_38_EMPLOYEE_TERMINATION" }
+  | { kind: "STATUTORY_COMPENSATION" }
+  | { kind: "ARTICLE_39_NO_COMPENSATION" }
   | { kind: "VOLUNTARY_RESIGNATION" }
   | {
       kind: "UNLAWFUL_TERMINATION";

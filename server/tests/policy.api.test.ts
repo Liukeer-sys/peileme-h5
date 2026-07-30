@@ -889,6 +889,118 @@ describe("versioned policy public API", () => {
     await request(app).get("/api/policy/history").expect(401);
   });
 
+  it.each([
+    [
+      "statutory N",
+      { kind: "STATUTORY_COMPENSATION" },
+      7_000_000
+    ],
+    [
+      "Article 39 zero",
+      { kind: "ARTICLE_39_NO_COMPENSATION" },
+      0
+    ],
+    [
+      "Article 38 N",
+      { kind: "ARTICLE_38_EMPLOYEE_TERMINATION" },
+      7_000_000
+    ],
+    [
+      "voluntary zero",
+      { kind: "VOLUNTARY_RESIGNATION" },
+      0
+    ],
+    [
+      "Article 40 notice",
+      { kind: "ARTICLE_40", noticeMethod: "notice_30_days" },
+      7_000_000
+    ],
+    [
+      "Article 40 payment in lieu",
+      { kind: "ARTICLE_40", noticeMethod: "payment_in_lieu" },
+      8_100_000
+    ],
+    [
+      "unlawful 2N",
+      {
+        kind: "UNLAWFUL_TERMINATION",
+        continuedPerformanceRequested: false,
+        continuedPerformancePossible: false
+      },
+      14_000_000
+    ],
+    ["unclear range", { kind: "UNCLEAR" }, 0]
+  ] as const)(
+    "accepts and snapshots the normalized %s scenario",
+    async (_name, scenario, expectedPayableFen) => {
+      const response = await request(createApp())
+        .post("/api/policy/calculate")
+        .set(authHeader(userToken))
+        .send(
+          calculationBody({
+            terminationScenario: scenario,
+            monthlyEarnedWagesFen: [900_000, 1_100_000]
+          })
+        )
+        .expect(201);
+
+      expect(response.body.result.payableFen).toBe(expectedPayableFen);
+      const snapshot = await query<{
+        input: { terminationScenario: Record<string, unknown> };
+      }>(
+        `SELECT input
+           FROM policy_calculation_snapshots
+          WHERE assessment_id = $1`,
+        [response.body.assessmentId]
+      );
+      expect(snapshot.rows[0].input.terminationScenario).toEqual(scenario);
+    }
+  );
+
+  it("keeps chronological wage months unchanged in the snapshot and uses the final month for notice pay", async () => {
+    const monthlyEarnedWagesFen = [900_001, 1_100_002, 1_300_003];
+    const response = await request(createApp())
+      .post("/api/policy/calculate")
+      .set(authHeader(userToken))
+      .send(
+        calculationBody({
+          terminationScenario: {
+            kind: "ARTICLE_40",
+            noticeMethod: "payment_in_lieu"
+          },
+          monthlyEarnedWagesFen
+        })
+      )
+      .expect(201);
+
+    expect(response.body.result.noticePayBasisFen).toBe(1_300_003);
+    const snapshot = await query<{
+      input: { monthlyEarnedWagesFen: number[] };
+    }>(
+      `SELECT input
+         FROM policy_calculation_snapshots
+        WHERE assessment_id = $1`,
+      [response.body.assessmentId]
+    );
+    expect(snapshot.rows[0].input.monthlyEarnedWagesFen).toEqual(
+      monthlyEarnedWagesFen
+    );
+  });
+
+  it.each([
+    ["zero months", []],
+    ["thirteen months", Array(13).fill(1_000_000)],
+    ["negative wage", [1_000_000, -1]]
+  ])("rejects %s at the API boundary", async (_name, wages) => {
+    const response = await request(createApp())
+      .post("/api/policy/calculate")
+      .set(authHeader(userToken))
+      .send(calculationBody({ monthlyEarnedWagesFen: wages }))
+      .expect(400);
+
+    expect(response.body.error).toBe("VALIDATION_ERROR");
+  });
+
   it("marks a verified parent fallback estimated and persists an atomic snapshot", async () => {
     const response = await request(createApp())
       .post("/api/policy/calculate")

@@ -13,8 +13,7 @@ import { baseQuestions, loadingMessages } from "../data/questions";
 import {
   forcedOtherReasonLeaf,
   getTerminationReasonNode,
-  rootTerminationReasonNode,
-  type TerminationLeaf
+  rootTerminationReasonNode
 } from "../data/terminationReasonFlow";
 import {
   ApiError,
@@ -27,9 +26,12 @@ import type {
   PolicyApiResult,
   PolicyCalculateRequest,
   PolicyHistoryDetail,
-  PolicyRegion,
-  TerminationScenario
+  PolicyRegion
 } from "../types";
+import {
+  buildDefaultWageSeries,
+  scenarioForLeaf
+} from "./policyQuestionnaire";
 import PolicyResult from "./PolicyResult";
 
 type ChatMessage = {
@@ -80,32 +82,6 @@ const monthEnd = (month?: string) => {
 const yuanToFen = (yuan?: number) =>
   Number.isFinite(yuan) ? Math.round(Number(yuan) * 100) : 0;
 
-const scenarioForLeaf = (leaf: TerminationLeaf): TerminationScenario => {
-  if (leaf.resultMode === "nPlusOne") {
-    return { kind: "ARTICLE_40", noticeMethod: "payment_in_lieu" };
-  }
-  if (leaf.id.startsWith("nofault_") && leaf.id.endsWith("_notice_yes")) {
-    return { kind: "ARTICLE_40", noticeMethod: "notice_30_days" };
-  }
-  if (leaf.id.startsWith("forced_")) {
-    return { kind: "ARTICLE_38_EMPLOYEE_TERMINATION" };
-  }
-  if (
-    leaf.id === "self_resign_normal" ||
-    leaf.id === "contract_expired_employee_not_renew"
-  ) {
-    return { kind: "VOLUNTARY_RESIGNATION" };
-  }
-  if (leaf.resultMode === "twoN") {
-    return {
-      kind: "UNLAWFUL_TERMINATION",
-      continuedPerformanceRequested: false,
-      continuedPerformancePossible: false
-    };
-  }
-  return { kind: "UNCLEAR" };
-};
-
 const normalizeStoredDetail = (detail: PolicyHistoryDetail): Answers => ({
   regionCode: detail.input.regionCode,
   regionName: detail.input.regionName,
@@ -117,6 +93,7 @@ const normalizeStoredDetail = (detail: PolicyHistoryDetail): Answers => ({
       detail.input.monthlyEarnedWagesFen.length /
       100
     : 0,
+  monthlyEarnedWagesFen: [...detail.input.monthlyEarnedWagesFen],
   terminationScenario: detail.input.terminationScenario,
   followUps: {}
 });
@@ -199,6 +176,14 @@ export default function MainApp() {
   const manualAverageRequired =
     selectedRegion?.parameterAvailability?.employeeAverageMonthlyWage ===
     "manual-needed";
+  const wagePreset = buildDefaultWageSeries(
+    yuanToFen(answers.avgMonthlySalary),
+    answers.bonusInfo,
+    answers.startMonth,
+    answers.endMonth
+  );
+  const wageSeries =
+    answers.monthlyEarnedWagesFen || wagePreset.monthlyEarnedWagesFen;
 
   const append = (...next: ChatMessage[]) =>
     setMessages((current) => [...current, ...next]);
@@ -449,10 +434,20 @@ export default function MainApp() {
       return;
     }
     if (currentQuestion.id === "bonusInfo") {
+      const preset = buildDefaultWageSeries(
+        yuanToFen(answers.avgMonthlySalary),
+        value,
+        answers.startMonth,
+        answers.endMonth
+      );
       recordBaseAnswer(
         currentQuestion.id,
         value,
-        { ...answers, bonusInfo: value },
+        {
+          ...answers,
+          bonusInfo: value,
+          monthlyEarnedWagesFen: preset.monthlyEarnedWagesFen
+        },
         6
       );
       return;
@@ -496,7 +491,14 @@ export default function MainApp() {
       startDate: monthStart(answers.startMonth),
       endDate: monthEnd(answers.endMonth),
       terminationScenario: answers.terminationScenario || { kind: "UNCLEAR" },
-      monthlyEarnedWagesFen: Array.from({ length: 12 }, () => salaryFen),
+      monthlyEarnedWagesFen:
+        answers.monthlyEarnedWagesFen ||
+        buildDefaultWageSeries(
+          salaryFen,
+          answers.bonusInfo,
+          answers.startMonth,
+          answers.endMonth
+        ).monthlyEarnedWagesFen,
       ...(Object.keys(manualParameters).length ? { manualParameters } : {})
     };
   };
@@ -518,6 +520,19 @@ export default function MainApp() {
       !answers.avgMonthlySalary
     ) {
       setRequestError("请先完成全部问卷");
+      return;
+    }
+    if (
+      wageSeries.length < 1 ||
+      wageSeries.length > 12 ||
+      wageSeries.some(
+        (wage) =>
+          !Number.isSafeInteger(wage) ||
+          wage < 0 ||
+          Object.is(wage, -0)
+      )
+    ) {
+      setRequestError("请检查近1至12个月的应发工资，金额需为有效数字");
       return;
     }
     if (
@@ -580,6 +595,32 @@ export default function MainApp() {
     setTextValue("");
     setRequestError("");
     track("assessment_restarted");
+  };
+
+  const resizeWageSeries = (nextCount: number) => {
+    const count = Math.min(12, Math.max(1, nextCount));
+    const current = [...wageSeries];
+    const salaryFen = yuanToFen(answers.avgMonthlySalary);
+    const next =
+      count <= current.length
+        ? current.slice(current.length - count)
+        : [
+            ...Array.from(
+              { length: count - current.length },
+              () => salaryFen
+            ),
+            ...current
+          ];
+    setAnswers({ ...answers, monthlyEarnedWagesFen: next });
+    setRequestError("");
+  };
+
+  const updateWageMonth = (index: number, rawValue: string) => {
+    const next = [...wageSeries];
+    const yuan = rawValue === "" ? Number.NaN : Number(rawValue);
+    next[index] = Number.isFinite(yuan) ? yuanToFen(yuan) : Number.NaN;
+    setAnswers({ ...answers, monthlyEarnedWagesFen: next });
+    setRequestError("");
   };
 
   const recalculateHistory = async (detail: PolicyHistoryDetail) => {
@@ -792,6 +833,93 @@ export default function MainApp() {
                   <span>{answers.startMonth} 至 {answers.endMonth}</span>
                   <span>月工资 {answers.avgMonthlySalary?.toLocaleString("zh-CN")} 元</span>
                 </div>
+                <section
+                  className="wage-series-card"
+                  aria-label={`近${wageSeries.length}个月应发工资`}
+                >
+                  <div className="wage-series-heading">
+                    <div>
+                      <strong>近{wageSeries.length}个月应发工资</strong>
+                      <p>
+                        按时间从早到晚填写，最后一项是解除前一个完整月。
+                      </p>
+                    </div>
+                    <label>
+                      <span>月份数</span>
+                      <select
+                        aria-label="应发工资月份数"
+                        value={wageSeries.length}
+                        onChange={(event) =>
+                          resizeWageSeries(Number(event.target.value))
+                        }
+                      >
+                        {Array.from({ length: 12 }, (_, index) => index + 1).map(
+                          (count) => (
+                            <option key={count} value={count}>
+                              {count}个月
+                            </option>
+                          )
+                        )}
+                      </select>
+                    </label>
+                  </div>
+                  <p
+                    className={
+                      wagePreset.bonusNeedsReview
+                        ? "wage-series-note is-warning"
+                        : "wage-series-note"
+                    }
+                  >
+                    {wagePreset.explanation}
+                    {wagePreset.bonusNeedsReview
+                      ? "，请按工资条或流水逐月调整。"
+                      : "，你仍可按实际工资条调整。"}
+                  </p>
+                  <div className="wage-month-grid">
+                    {wageSeries.map((wageFen, index) => {
+                      const first = index === 0;
+                      const last = index === wageSeries.length - 1;
+                      const inputLabel = `第${index + 1}个月应发工资（元${
+                        first && last
+                          ? "，最早，解除前完整月"
+                          : first
+                          ? "，最早"
+                          : last
+                            ? "，解除前完整月"
+                            : ""
+                      }）`;
+                      return (
+                        <label key={`${wageSeries.length}-${index}`}>
+                          <span>
+                            第{index + 1}月
+                            {first && last
+                              ? " · 最早 / 解除前"
+                              : first
+                                ? " · 最早"
+                                : last
+                                  ? " · 解除前"
+                                  : ""}
+                          </span>
+                          <input
+                            aria-label={inputLabel}
+                            type="number"
+                            inputMode="decimal"
+                            min="0"
+                            step="0.01"
+                            value={
+                              Number.isFinite(wageFen)
+                                ? String(wageFen / 100)
+                                : ""
+                            }
+                            onChange={(event) =>
+                              updateWageMonth(index, event.target.value)
+                            }
+                          />
+                        </label>
+                      );
+                    })}
+                  </div>
+                </section>
                 {(manualMinimumRequired || manualAverageRequired) && (
                   <div className="manual-parameter-card">
                     <strong>当地参数待补充</strong>

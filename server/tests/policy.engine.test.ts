@@ -459,6 +459,38 @@ describe("calculatePolicy wage basis", () => {
 });
 
 describe("calculatePolicy legal scenario matrix", () => {
+  it.each([
+    [
+      "statutory N compensation",
+      { kind: "STATUTORY_COMPENSATION" },
+      1,
+      "法定经济补偿"
+    ],
+    [
+      "Article 39 no-compensation termination",
+      { kind: "ARTICLE_39_NO_COMPENSATION" },
+      0,
+      "第三十九条"
+    ]
+  ])(
+    "supports the explicit %s scenario",
+    (_name, scenario, payableMultiplier, scenarioText) => {
+      const result = calculatePolicy({
+        ...baseInput(),
+        terminationScenario: scenario as unknown as TerminationScenario
+      });
+
+      expect(result.payableFen).toBe(
+        result.baseCompensationFen * (payableMultiplier as number)
+      );
+      expect(result.payableDetermined).toBe(true);
+      expect(result.reviewRequired).toBe(false);
+      expect(
+        result.formulaSteps.find((step) => step.key === "scenario")?.value
+      ).toContain(scenarioText);
+    }
+  );
+
   const scenarios: Array<{
     name: string;
     scenario: TerminationScenario;
