@@ -221,6 +221,9 @@ const csrfCookieOptions = (): CookieOptions => ({
   maxAge: getConfig().REFRESH_TOKEN_TTL_DAYS * 86_400_000
 });
 
+const REFRESH_COOKIE_NAME = "peileme_refresh_v2";
+const LEGACY_REFRESH_COOKIE_NAME = "peileme_refresh";
+
 const csrfSignature = (nonce: string) =>
   crypto
     .createHmac("sha256", getConfig().CSRF_SECRET)
@@ -252,16 +255,29 @@ export const verifyCsrfRequest = (request: Request) => {
   return Boolean(signature) && safeEqual(signature, csrfSignature(nonce));
 };
 
+const clearLegacyRefreshCookies = (response: Response) => {
+  const { maxAge: _refreshMaxAge, ...refreshOptions } = refreshCookieOptions();
+  response.clearCookie(LEGACY_REFRESH_COOKIE_NAME, {
+    ...refreshOptions,
+    domain: undefined
+  });
+  if (getConfig().COOKIE_DOMAIN) {
+    response.clearCookie(LEGACY_REFRESH_COOKIE_NAME, refreshOptions);
+  }
+};
+
 const setSessionCookies = (response: Response, refreshToken: string) => {
-  response.cookie("peileme_refresh", refreshToken, refreshCookieOptions());
+  response.cookie(REFRESH_COOKIE_NAME, refreshToken, refreshCookieOptions());
   response.cookie("peileme_csrf", createCsrfToken(), csrfCookieOptions());
+  clearLegacyRefreshCookies(response);
 };
 
 export const clearRefreshCookie = (response: Response) => {
   const { maxAge: _refreshMaxAge, ...refreshOptions } = refreshCookieOptions();
   const { maxAge: _csrfMaxAge, ...csrfOptions } = csrfCookieOptions();
-  response.clearCookie("peileme_refresh", refreshOptions);
+  response.clearCookie(REFRESH_COOKIE_NAME, refreshOptions);
   response.clearCookie("peileme_csrf", csrfOptions);
+  clearLegacyRefreshCookies(response);
 };
 
 export type DeviceSession = {
@@ -312,24 +328,104 @@ export const revokeOwnedSession = async (
   userId: string,
   sessionId: string,
   refreshToken: string
-) => {
-  const result = await query<{ token_hash: string }>(
-    `UPDATE refresh_sessions
-        SET revoked_at = now()
-      WHERE id = $1
-        AND user_id = $2
-        AND revoked_at IS NULL
-      RETURNING token_hash`,
-    [sessionId, userId]
-  );
-  const session = result.rows[0];
-  if (!session) {
-    throw new ApiError(404, "SESSION_NOT_FOUND", "设备会话不存在");
+) =>
+  withTransaction(async (client) => {
+    const lineage = await lockOwnedSessionLineage(client, userId, sessionId);
+    if (!lineage.length) {
+      throw new ApiError(404, "SESSION_NOT_FOUND", "设备会话不存在");
+    }
+    await client.query(
+      `UPDATE refresh_sessions
+          SET revoked_at = COALESCE(revoked_at, now())
+        WHERE user_id = $1
+          AND id = ANY($2::uuid[])`,
+      [userId, lineage.map((session) => session.id)]
+    );
+    const currentHash = refreshToken ? sha256(refreshToken) : "";
+    return {
+      isCurrent:
+        Boolean(currentHash) &&
+        lineage.some((session) => safeEqual(session.tokenHash, currentHash))
+    };
+  });
+
+type LockedSession = {
+  id: string;
+  tokenHash: string;
+};
+
+async function lockOwnedSessionLineage(
+  client: pg.PoolClient,
+  userId: string,
+  initialSessionId: string
+): Promise<LockedSession[]> {
+  const lineage: LockedSession[] = [];
+  const visited = new Set<string>();
+  let sessionId: string | undefined = initialSessionId;
+  while (sessionId) {
+    if (visited.has(sessionId) || visited.size >= 100) {
+      throw new Error("Invalid refresh-session lineage");
+    }
+    visited.add(sessionId);
+    const current = await client.query<{
+      id: string;
+      token_hash: string;
+    }>(
+      `SELECT id, token_hash
+         FROM refresh_sessions
+        WHERE id = $1
+          AND user_id = $2
+        FOR UPDATE`,
+      [sessionId, userId]
+    );
+    if (!current.rows[0]) break;
+    lineage.push({
+      id: current.rows[0].id,
+      tokenHash: current.rows[0].token_hash
+    });
+    const child: pg.QueryResult<{ id: string }> = await client.query<{
+      id: string;
+    }>(
+      `SELECT id
+         FROM refresh_sessions
+        WHERE parent_session_id = $1
+          AND user_id = $2
+        LIMIT 1
+        FOR UPDATE`,
+      [sessionId, userId]
+    );
+    sessionId = child.rows[0]?.id;
   }
-  return {
-    isCurrent:
-      Boolean(refreshToken) && safeEqual(session.token_hash, sha256(refreshToken))
-  };
+  return lineage;
+}
+
+export const revokeSessionByRefreshToken = async (refreshToken: string) => {
+  if (!refreshToken) return 0;
+  return withTransaction(async (client) => {
+    const initial = await client.query<{ id: string; user_id: string }>(
+      `SELECT id, user_id
+         FROM refresh_sessions
+        WHERE token_hash = $1
+        LIMIT 1
+        FOR UPDATE`,
+      [sha256(refreshToken)]
+    );
+    if (!initial.rows[0]) return 0;
+    const lineage = await lockOwnedSessionLineage(
+      client,
+      initial.rows[0].user_id,
+      initial.rows[0].id
+    );
+    const revoked = await client.query(
+      `UPDATE refresh_sessions
+          SET revoked_at = COALESCE(revoked_at, now())
+        WHERE user_id = $1
+          AND id = ANY($2::uuid[])
+          AND revoked_at IS NULL`,
+      [initial.rows[0].user_id, lineage.map((session) => session.id)]
+    );
+    return revoked.rowCount || 0;
+  });
 };
 
 export const revokeOtherSessions = async (
@@ -396,6 +492,90 @@ export const issueSession = async (
     accessToken: await signAccessToken(user),
     expiresInSeconds: getConfig().ACCESS_TOKEN_TTL_MINUTES * 60,
     user: publicUser(user)
+  };
+};
+
+type RefreshSessionUserRow = {
+  session_id: string;
+  revoked_at: Date | null;
+  expires_at: Date;
+  id: string;
+  role: AuthUser["role"];
+  email: string | null;
+  phone: string | null;
+  display_name: string | null;
+  status: AuthUser["status"];
+};
+
+const authUserFromRefreshRow = (row: RefreshSessionUserRow): AuthUser => ({
+  id: row.id,
+  role: row.role,
+  email: row.email,
+  phone: row.phone,
+  displayName: row.display_name,
+  status: row.status
+});
+
+export const rotateRefreshSession = async (
+  refreshToken: string,
+  request: Request,
+  response: Response
+) => {
+  const rotated = await withTransaction(async (client) => {
+    const result = await client.query<RefreshSessionUserRow>(
+      `SELECT s.id AS session_id, s.revoked_at, s.expires_at,
+              u.id, u.role, u.email, u.phone, u.display_name, u.status
+         FROM refresh_sessions s
+         JOIN users u ON u.id = s.user_id
+        WHERE s.token_hash = $1
+        LIMIT 1
+        FOR UPDATE OF s`,
+      [sha256(refreshToken)]
+    );
+    const row = result.rows[0];
+    if (
+      !row ||
+      row.status !== "active" ||
+      row.revoked_at ||
+      row.expires_at.getTime() <= Date.now()
+    ) {
+      throw new ApiError(401, "REFRESH_INVALID", "会话已过期，请重新登录");
+    }
+    const consumed = await client.query(
+      `UPDATE refresh_sessions
+          SET revoked_at = now(), last_used_at = now()
+        WHERE id = $1
+          AND revoked_at IS NULL
+          AND expires_at > now()`,
+      [row.session_id]
+    );
+    if (consumed.rowCount !== 1) {
+      throw new ApiError(401, "REFRESH_INVALID", "会话已过期，请重新登录");
+    }
+    const successorToken = createOpaqueToken();
+    await client.query(
+      `INSERT INTO refresh_sessions
+         (user_id, parent_session_id, token_hash, user_agent, ip, expires_at)
+       VALUES ($1, $2, $3, $4, $5, now() + ($6 || ' days')::interval)`,
+      [
+        row.id,
+        row.session_id,
+        sha256(successorToken),
+        request.header("user-agent")?.slice(0, 500) || null,
+        request.ip || null,
+        getConfig().REFRESH_TOKEN_TTL_DAYS
+      ]
+    );
+    return {
+      refreshToken: successorToken,
+      user: authUserFromRefreshRow(row)
+    };
+  });
+  setSessionCookies(response, rotated.refreshToken);
+  return {
+    accessToken: await signAccessToken(rotated.user),
+    expiresInSeconds: getConfig().ACCESS_TOKEN_TTL_MINUTES * 60,
+    user: publicUser(rotated.user)
   };
 };
 

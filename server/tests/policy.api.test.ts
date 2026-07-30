@@ -21,30 +21,39 @@ const authHeader = (token: string) => ({
   authorization: `Bearer ${token}`
 });
 
-const firstSetCookie = (response: request.Response) => {
+const setCookies = (response: request.Response) => {
   const value = response.headers["set-cookie"];
-  if (!Array.isArray(value) || !value[0]) {
+  if (!Array.isArray(value) || !value.length) {
     throw new Error("Expected a Set-Cookie response header");
   }
-  return value[0];
+  return value;
 };
 
-const cookieHeader = (response: request.Response) =>
-  firstSetCookie(response).split(";", 1)[0];
+const firstSetCookie = (response: request.Response) => setCookies(response)[0];
 
-const allCookieHeaders = (response: request.Response) => {
-  const value = response.headers["set-cookie"];
-  if (!Array.isArray(value)) {
-    throw new Error("Expected Set-Cookie response headers");
-  }
-  return value.map((cookie) => cookie.split(";", 1)[0]).join("; ");
+const refreshCookiePair = (response: request.Response) => {
+  const cookie = setCookies(response).find(
+    (item) =>
+      item.startsWith("peileme_refresh_v2=") ||
+      (item.startsWith("peileme_refresh=") &&
+        !item.startsWith("peileme_refresh=;"))
+  );
+  if (!cookie) throw new Error("Expected a refresh cookie");
+  return cookie.split(";", 1)[0];
 };
+
+const cookieHeader = refreshCookiePair;
+
+const allCookieHeaders = (response: request.Response) =>
+  setCookies(response)
+    .map((cookie) => cookie.split(";", 1)[0])
+    .filter((pair) => !pair.endsWith("="))
+    .join("; ");
 
 const csrfToken = (response: request.Response) => {
-  const value = response.headers["set-cookie"];
-  const cookie = Array.isArray(value)
-    ? value.find((item) => item.startsWith("peileme_csrf="))
-    : undefined;
+  const cookie = setCookies(response).find((item) =>
+    item.startsWith("peileme_csrf=")
+  );
   if (!cookie) throw new Error("Expected a CSRF cookie");
   return decodeURIComponent(cookie.slice("peileme_csrf=".length).split(";", 1)[0]);
 };
@@ -191,6 +200,42 @@ describe("shared authentication sessions", () => {
       .set("user-agent", userAgent)
       .send({ identifier, password: "PolicyPass123" });
 
+  const installRefreshInsertTrigger = async (
+    functionBody: string,
+    functionName: string
+  ) => {
+    await query(`
+      CREATE OR REPLACE FUNCTION ${functionName}()
+      RETURNS trigger AS $$
+      BEGIN
+        ${functionBody}
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+      CREATE TRIGGER ${functionName}_trigger
+      BEFORE INSERT ON refresh_sessions
+      FOR EACH ROW EXECUTE FUNCTION ${functionName}()
+    `);
+  };
+
+  const removeRefreshInsertTrigger = async (functionName: string) => {
+    await query(`DROP TRIGGER IF EXISTS ${functionName}_trigger ON refresh_sessions`);
+    await query(`DROP FUNCTION IF EXISTS ${functionName}()`);
+  };
+
+  const activeSessionCount = async (email = "policy-user@peileme.test") => {
+    const result = await query<{ count: string }>(
+      `SELECT count(*)::text AS count
+         FROM refresh_sessions s
+         JOIN users u ON u.id = s.user_id
+        WHERE u.email = $1
+          AND s.revoked_at IS NULL
+          AND s.expires_at > now()`,
+      [email]
+    );
+    return Number(result.rows[0].count);
+  };
+
   it("requires a production CSRF secret distinct from the development default", () => {
     const original = {
       NODE_ENV: process.env.NODE_ENV,
@@ -249,12 +294,25 @@ describe("shared authentication sessions", () => {
           password: "PolicyPass123"
         })
         .expect(200);
-      const issued = firstSetCookie(loginResponse);
+      const issued = setCookies(loginResponse).find((value) =>
+        value.startsWith("peileme_refresh_v2=")
+      );
+      expect(issued).toBeDefined();
       expect(issued).toContain("Domain=.peileme.art");
       expect(issued).toContain("Path=/api/auth");
       expect(issued).toContain("HttpOnly");
       expect(issued).toContain("Secure");
       expect(issued).toContain("SameSite=Lax");
+      const issuedLegacyClears = setCookies(loginResponse).filter((value) =>
+        value.startsWith("peileme_refresh=;")
+      );
+      expect(issuedLegacyClears).toHaveLength(2);
+      expect(
+        issuedLegacyClears.some((value) => value.includes("Domain=.peileme.art"))
+      ).toBe(true);
+      expect(
+        issuedLegacyClears.some((value) => !value.includes("Domain="))
+      ).toBe(true);
 
       const logoutResponse = await request(createApp())
         .post("/api/auth/logout")
@@ -262,14 +320,20 @@ describe("shared authentication sessions", () => {
         .set("cookie", allCookieHeaders(loginResponse))
         .set("x-csrf-token", csrfToken(loginResponse))
         .expect(204);
-      const cleared = firstSetCookie(logoutResponse);
-      expect(cleared).toContain("peileme_refresh=;");
+      const cleared = setCookies(logoutResponse).find((value) =>
+        value.startsWith("peileme_refresh_v2=;")
+      )!;
+      expect(cleared).toContain("peileme_refresh_v2=;");
       expect(cleared).toContain("Domain=.peileme.art");
       expect(cleared).toContain("Path=/api/auth");
       expect(cleared).toContain("HttpOnly");
       expect(cleared).toContain("Secure");
       expect(cleared).toContain("SameSite=Lax");
       expect(cleared).toContain("Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+      const logoutLegacyClears = setCookies(logoutResponse).filter((value) =>
+        value.startsWith("peileme_refresh=;")
+      );
+      expect(logoutLegacyClears).toHaveLength(2);
     } finally {
       Object.entries(original).forEach(([key, value]) => {
         if (value === undefined) delete process.env[key];
@@ -277,6 +341,52 @@ describe("shared authentication sessions", () => {
       });
       resetConfigForTests();
     }
+  });
+
+  it("migrates one legacy refresh cookie to v2 and clears legacy scope", async () => {
+    const loggedIn = await login("http://localhost:5173").expect(200);
+    const refreshToken = refreshCookiePair(loggedIn).split("=", 2)[1];
+    const migrated = await request(createApp())
+      .post("/api/auth/refresh")
+      .set("origin", "http://localhost:5173")
+      .set(
+        "cookie",
+        `peileme_refresh=${refreshToken}; peileme_csrf=${encodeURIComponent(csrfToken(loggedIn))}`
+      )
+      .set("x-csrf-token", csrfToken(loggedIn))
+      .expect(200);
+
+    expect(
+      setCookies(migrated).some((value) =>
+        value.startsWith("peileme_refresh_v2=")
+      )
+    ).toBe(true);
+    expect(
+      setCookies(migrated).some((value) =>
+        value.startsWith("peileme_refresh=;")
+      )
+    ).toBe(true);
+  });
+
+  it("uses the unambiguous v2 cookie when duplicate legacy names are present", async () => {
+    const loggedIn = await login("http://localhost:5173").expect(200);
+    const refreshToken = refreshCookiePair(loggedIn).split("=", 2)[1];
+    const response = await request(createApp())
+      .post("/api/auth/refresh")
+      .set("origin", "http://localhost:5173")
+      .set(
+        "cookie",
+        [
+          "peileme_refresh=stale-host-token",
+          "peileme_refresh=stale-domain-token",
+          `peileme_refresh_v2=${refreshToken}`,
+          `peileme_csrf=${encodeURIComponent(csrfToken(loggedIn))}`
+        ].join("; ")
+      )
+      .set("x-csrf-token", csrfToken(loggedIn))
+      .expect(200);
+
+    expect(response.body.accessToken).toBeTruthy();
   });
 
   it.each([
@@ -294,7 +404,7 @@ describe("shared authentication sessions", () => {
       .expect(200);
     expect(refreshed.headers["access-control-allow-origin"]).toBe(origin);
     expect(refreshed.body.accessToken).toBeTruthy();
-    expect(firstSetCookie(refreshed)).toContain("peileme_refresh=");
+    expect(firstSetCookie(refreshed)).toContain("peileme_refresh_v2=");
   });
 
   it("rejects cookie-auth requests from an unknown Origin", async () => {
@@ -311,6 +421,44 @@ describe("shared authentication sessions", () => {
       error: "ORIGIN_FORBIDDEN",
       message: "请求来源未获授权"
     });
+  });
+
+  it("rejects refresh and logout mutations when Origin is missing", async () => {
+    for (const path of ["/api/auth/refresh", "/api/auth/logout"]) {
+      const loggedIn = await login("http://localhost:5173").expect(200);
+      const response = await request(createApp())
+        .post(path)
+        .set("cookie", allCookieHeaders(loggedIn))
+        .set("x-csrf-token", csrfToken(loggedIn))
+        .expect(403);
+      expect(response.body).toEqual({
+        error: "ORIGIN_FORBIDDEN",
+        message: "请求来源未获授权"
+      });
+    }
+  });
+
+  it("rejects device-session mutations when Origin is missing", async () => {
+    const loggedIn = await login("http://localhost:5173").expect(200);
+    const sessions = await request(createApp())
+      .get("/api/auth/sessions")
+      .set(authHeader(loggedIn.body.accessToken))
+      .set("cookie", cookieHeader(loggedIn))
+      .expect(200);
+
+    await request(createApp())
+      .delete(`/api/auth/sessions/${sessions.body.items[0].id}`)
+      .set(authHeader(loggedIn.body.accessToken))
+      .set("cookie", allCookieHeaders(loggedIn))
+      .set("x-csrf-token", csrfToken(loggedIn))
+      .expect(403);
+    await request(createApp())
+      .post("/api/auth/sessions/revoke-others")
+      .set(authHeader(loggedIn.body.accessToken))
+      .set("cookie", allCookieHeaders(loggedIn))
+      .set("x-csrf-token", csrfToken(loggedIn))
+      .expect(403);
+    expect(await activeSessionCount()).toBe(1);
   });
 
   it("requires a matching signed CSRF token for refresh mutations", async () => {
@@ -340,6 +488,144 @@ describe("shared authentication sessions", () => {
       .set("cookie", allCookieHeaders(loggedIn))
       .set("x-csrf-token", csrfToken(loggedIn))
       .expect(200);
+  });
+
+  it("allows only one successor when the same refresh token is used concurrently", async () => {
+    const loggedIn = await login("http://localhost:5173").expect(200);
+    await query(`
+      CREATE OR REPLACE FUNCTION slow_refresh_consumption_for_test()
+      RETURNS trigger AS $$
+      BEGIN
+        IF NEW.last_used_at IS NOT NULL AND OLD.last_used_at IS NULL THEN
+          PERFORM pg_sleep(0.4);
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+      CREATE TRIGGER slow_refresh_consumption_for_test_trigger
+      BEFORE UPDATE ON refresh_sessions
+      FOR EACH ROW EXECUTE FUNCTION slow_refresh_consumption_for_test()
+    `);
+    const makeRefresh = () =>
+      request(createApp())
+        .post("/api/auth/refresh")
+        .set("origin", "http://localhost:5173")
+        .set("cookie", allCookieHeaders(loggedIn))
+        .set("x-csrf-token", csrfToken(loggedIn));
+
+    try {
+      const responses = await Promise.all([makeRefresh(), makeRefresh()]);
+      expect(responses.map((response) => response.status).sort()).toEqual([
+        200,
+        401
+      ]);
+      expect(await activeSessionCount()).toBe(1);
+    } finally {
+      await query(
+        "DROP TRIGGER IF EXISTS slow_refresh_consumption_for_test_trigger ON refresh_sessions"
+      );
+      await query("DROP FUNCTION IF EXISTS slow_refresh_consumption_for_test()");
+    }
+  });
+
+  it("rolls back refresh-token consumption when successor insertion fails", async () => {
+    const loggedIn = await login("http://localhost:5173").expect(200);
+    const functionName = "fail_refresh_successor_for_test";
+    await installRefreshInsertTrigger(
+      "IF NEW.user_agent = 'Fail Refresh' THEN RAISE EXCEPTION 'forced refresh successor failure'; END IF;",
+      functionName
+    );
+    try {
+      await request(createApp())
+        .post("/api/auth/refresh")
+        .set("origin", "http://localhost:5173")
+        .set("user-agent", "Fail Refresh")
+        .set("cookie", allCookieHeaders(loggedIn))
+        .set("x-csrf-token", csrfToken(loggedIn))
+        .expect(500);
+      expect(await activeSessionCount()).toBe(1);
+    } finally {
+      await removeRefreshInsertTrigger(functionName);
+    }
+
+    await request(createApp())
+      .post("/api/auth/refresh")
+      .set("origin", "http://localhost:5173")
+      .set("cookie", allCookieHeaders(loggedIn))
+      .set("x-csrf-token", csrfToken(loggedIn))
+      .expect(200);
+  });
+
+  it("does not resurrect a successor when logout races refresh", async () => {
+    const loggedIn = await login("http://localhost:5173").expect(200);
+    const functionName = "slow_refresh_successor_for_logout_test";
+    await installRefreshInsertTrigger(
+      "IF NEW.user_agent = 'Race Refresh Logout' THEN PERFORM pg_sleep(0.6); END IF;",
+      functionName
+    );
+    try {
+      const refreshing = request(createApp())
+        .post("/api/auth/refresh")
+        .set("origin", "http://localhost:5173")
+        .set("user-agent", "Race Refresh Logout")
+        .set("cookie", allCookieHeaders(loggedIn))
+        .set("x-csrf-token", csrfToken(loggedIn))
+        .then((response) => response);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const loggingOut = request(createApp())
+        .post("/api/auth/logout")
+        .set("origin", "http://localhost:5173")
+        .set("cookie", allCookieHeaders(loggedIn))
+        .set("x-csrf-token", csrfToken(loggedIn));
+      const [refreshResponse, logoutResponse] = await Promise.all([
+        refreshing,
+        loggingOut
+      ]);
+      expect(refreshResponse.status).toBe(200);
+      expect(logoutResponse.status).toBe(204);
+      expect(await activeSessionCount()).toBe(0);
+    } finally {
+      await removeRefreshInsertTrigger(functionName);
+    }
+  });
+
+  it("does not resurrect a successor when device revocation races refresh", async () => {
+    const loggedIn = await login("http://localhost:5173").expect(200);
+    const sessions = await request(createApp())
+      .get("/api/auth/sessions")
+      .set(authHeader(loggedIn.body.accessToken))
+      .set("cookie", cookieHeader(loggedIn))
+      .expect(200);
+    const functionName = "slow_refresh_successor_for_revoke_test";
+    await installRefreshInsertTrigger(
+      "IF NEW.user_agent = 'Race Refresh Revoke' THEN PERFORM pg_sleep(0.6); END IF;",
+      functionName
+    );
+    try {
+      const refreshing = request(createApp())
+        .post("/api/auth/refresh")
+        .set("origin", "http://localhost:5173")
+        .set("user-agent", "Race Refresh Revoke")
+        .set("cookie", allCookieHeaders(loggedIn))
+        .set("x-csrf-token", csrfToken(loggedIn))
+        .then((response) => response);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const revoking = request(createApp())
+        .delete(`/api/auth/sessions/${sessions.body.items[0].id}`)
+        .set("origin", "http://localhost:5173")
+        .set(authHeader(loggedIn.body.accessToken))
+        .set("cookie", allCookieHeaders(loggedIn))
+        .set("x-csrf-token", csrfToken(loggedIn));
+      const [refreshResponse, revokeResponse] = await Promise.all([
+        refreshing,
+        revoking
+      ]);
+      expect(refreshResponse.status).toBe(200);
+      expect(revokeResponse.status).toBe(204);
+      expect(await activeSessionCount()).toBe(0);
+    } finally {
+      await removeRefreshInsertTrigger(functionName);
+    }
   });
 
   it("lists only the authenticated user's active device sessions", async () => {
@@ -386,7 +672,7 @@ describe("shared authentication sessions", () => {
       "other-policy-user@peileme.test"
     ).expect(200);
     const foreignToken = decodeURIComponent(
-      cookieHeader(foreign).replace("peileme_refresh=", "")
+      cookieHeader(foreign).split("=", 2)[1]
     );
     const foreignRow = await query<{ id: string }>(
       "SELECT id FROM refresh_sessions WHERE token_hash = $1",
@@ -474,7 +760,7 @@ describe("shared authentication sessions", () => {
       .set("x-csrf-token", csrfToken(current))
       .expect(204);
     const cleared = firstSetCookie(revoked);
-    expect(cleared).toContain("peileme_refresh=;");
+    expect(cleared).toContain("peileme_refresh_v2=;");
     expect(cleared).toContain("Path=/api/auth");
 
     await request(createApp())

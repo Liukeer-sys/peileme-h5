@@ -20,12 +20,17 @@ let accessToken: string | null = null;
 let refreshPromise: Promise<boolean> | null = null;
 
 const csrfHeader = (): Record<string, string> => {
-  const token = document.cookie
+  const encodedToken = document.cookie
     .split(";")
     .map((item) => item.trim())
     .find((item) => item.startsWith("peileme_csrf="))
     ?.slice("peileme_csrf=".length);
-  return token ? { "x-csrf-token": decodeURIComponent(token) } : {};
+  if (!encodedToken) return {};
+  try {
+    return { "x-csrf-token": decodeURIComponent(encodedToken) };
+  } catch {
+    return {};
+  }
 };
 
 export class ApiError extends Error {

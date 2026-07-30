@@ -255,7 +255,8 @@ describe("migration concurrency", () => {
           expect(migrations.rows).toEqual([
             { version: "001_initial.sql" },
             { version: "002_policy_foundation.sql" },
-            { version: "003_policy_parameter_provenance.sql" }
+            { version: "003_policy_parameter_provenance.sql" },
+            { version: "004_refresh_session_rotation.sql" }
           ]);
           const tables = await verify.query<{ count: string }>(
             `SELECT count(*)::text AS count

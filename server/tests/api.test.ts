@@ -1744,7 +1744,8 @@ describe("policy persistence foundation", () => {
     expect(migrations.rows).toEqual([
       { version: "001_initial.sql" },
       { version: "002_policy_foundation.sql" },
-      { version: "003_policy_parameter_provenance.sql" }
+      { version: "003_policy_parameter_provenance.sql" },
+      { version: "004_refresh_session_rotation.sql" }
     ]);
 
     const preserved = await query<{

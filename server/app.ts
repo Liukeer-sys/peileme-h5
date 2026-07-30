@@ -32,6 +32,8 @@ import {
   registerUser,
   revokeOtherSessions,
   revokeOwnedSession,
+  revokeSessionByRefreshToken,
+  rotateRefreshSession,
   sendOtp,
   validateInvite,
   verifyCsrfRequest,
@@ -45,9 +47,7 @@ import {
   publicUser,
   requireAdmin,
   requireAuth,
-  requireSuperAdmin,
-  sha256,
-  type AuthUser
+  requireSuperAdmin
 } from "./security.js";
 
 const identifierSchema = z.string().trim().min(4).max(160);
@@ -61,7 +61,11 @@ const passwordSchema = z
 const uuidSchema = z.string().uuid();
 
 const refreshTokenFrom = (request: Request) =>
-  String(request.cookies?.peileme_refresh || "");
+  String(
+    request.cookies?.peileme_refresh_v2 ||
+      request.cookies?.peileme_refresh ||
+      ""
+  );
 
 const requireValidCsrf = (
   request: Request,
@@ -243,15 +247,29 @@ export const createApp = (
       .map((origin) => origin.trim())
       .filter(Boolean)
   );
+  const rejectOrigin = (response: Response) =>
+    response.status(403).json({
+      error: "ORIGIN_FORBIDDEN",
+      message: "请求来源未获授权"
+    });
+  const requireMutationOrigin = (
+    request: Request,
+    response: Response,
+    next: NextFunction
+  ) => {
+    const origin = request.header("origin");
+    if (!origin || !allowedOrigins.has(origin)) {
+      rejectOrigin(response);
+      return;
+    }
+    next();
+  };
   app.use(
     "/api/auth",
     (request: Request, response: Response, next: NextFunction) => {
       const origin = request.header("origin");
       if (origin && !allowedOrigins.has(origin)) {
-        response.status(403).json({
-          error: "ORIGIN_FORBIDDEN",
-          message: "请求来源未获授权"
-        });
+        rejectOrigin(response);
         return;
       }
       next();
@@ -330,61 +348,40 @@ export const createApp = (
     response.json({ reset: true, channel: normalized.channel });
   });
 
-  app.post("/api/auth/refresh", requireValidCsrf, async (request, response) => {
-    const refreshToken = refreshTokenFrom(request);
-    if (!refreshToken) {
-      response.status(204).end();
-      return;
+  app.post(
+    "/api/auth/refresh",
+    requireMutationOrigin,
+    requireValidCsrf,
+    async (request, response) => {
+      const refreshToken = refreshTokenFrom(request);
+      if (!refreshToken) {
+        response.status(204).end();
+        return;
+      }
+      try {
+        response.json(
+          await rotateRefreshSession(refreshToken, request, response)
+        );
+      } catch (error) {
+        if (error instanceof ApiError && error.code === "REFRESH_INVALID") {
+          clearRefreshCookie(response);
+        }
+        throw error;
+      }
     }
-    const result = await query<{
-      session_id: string;
-      id: string;
-      role: AuthUser["role"];
-      email: string | null;
-      phone: string | null;
-      display_name: string | null;
-      status: AuthUser["status"];
-    }>(
-      `SELECT s.id AS session_id, u.id, u.role, u.email, u.phone, u.display_name, u.status
-         FROM refresh_sessions s
-         JOIN users u ON u.id = s.user_id
-        WHERE s.token_hash = $1
-          AND s.revoked_at IS NULL
-          AND s.expires_at > now()
-        LIMIT 1`,
-      [sha256(refreshToken)]
-    );
-    const row = result.rows[0];
-    if (!row || row.status !== "active") {
-      clearRefreshCookie(response);
-      throw new ApiError(401, "REFRESH_INVALID", "会话已过期，请重新登录");
-    }
-    await query(
-      "UPDATE refresh_sessions SET revoked_at = now(), last_used_at = now() WHERE id = $1",
-      [row.session_id]
-    );
-    const user: AuthUser = {
-      id: row.id,
-      role: row.role,
-      email: row.email,
-      phone: row.phone,
-      displayName: row.display_name,
-      status: row.status
-    };
-    response.json(await issueSession(user, request, response));
-  });
+  );
 
-  app.post("/api/auth/logout", requireValidCsrf, async (request, response) => {
-    const refreshToken = refreshTokenFrom(request);
-    if (refreshToken) {
-      await query(
-        "UPDATE refresh_sessions SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL",
-        [sha256(refreshToken)]
-      );
+  app.post(
+    "/api/auth/logout",
+    requireMutationOrigin,
+    requireValidCsrf,
+    async (request, response) => {
+      const refreshToken = refreshTokenFrom(request);
+      await revokeSessionByRefreshToken(refreshToken);
+      clearRefreshCookie(response);
+      response.status(204).end();
     }
-    clearRefreshCookie(response);
-    response.status(204).end();
-  });
+  );
 
   app.get("/api/auth/me", requireAuth, (request, response) => {
     response.json({ user: publicUser(request.authUser!) });
@@ -401,6 +398,7 @@ export const createApp = (
   app.delete(
     "/api/auth/sessions/:id",
     requireAuth,
+    requireMutationOrigin,
     requireValidCsrf,
     async (request, response) => {
       const id = uuidSchema.parse(request.params.id);
@@ -417,6 +415,7 @@ export const createApp = (
   app.post(
     "/api/auth/sessions/revoke-others",
     requireAuth,
+    requireMutationOrigin,
     requireValidCsrf,
     async (request, response) => {
       const revoked = await revokeOtherSessions(

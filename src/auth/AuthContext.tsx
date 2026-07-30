@@ -64,6 +64,34 @@ type AuthContextValue = {
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
+export class LogoutError extends Error {
+  readonly code = "LOGOUT_FAILED";
+  readonly cause: unknown;
+
+  constructor(cause: unknown) {
+    super("远端退出失败，本地登录状态已清除");
+    this.name = "LogoutError";
+    this.cause = cause;
+  }
+}
+
+export const logoutWithLocalCleanup = async (
+  remoteLogout: () => Promise<void>,
+  clearLocal: () => void
+) => {
+  let failed = false;
+  let remoteError: unknown;
+  try {
+    await remoteLogout();
+  } catch (error) {
+    failed = true;
+    remoteError = error;
+  } finally {
+    clearLocal();
+  }
+  if (failed) throw new LogoutError(remoteError);
+};
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [grants, setGrants] = useState<Grant[]>([]);
@@ -171,12 +199,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setUser((current) => current ? { ...current, displayName: result.displayName } : current);
       },
       logout: async () => {
-        await api("/api/auth/logout", { method: "POST" });
-        setAccessToken(null);
-        setUser(null);
-        setGrants([]);
-        setSessions([]);
-        track("auth_logged_out");
+        await logoutWithLocalCleanup(
+          () => api("/api/auth/logout", { method: "POST" }),
+          () => {
+            setAccessToken(null);
+            setUser(null);
+            setGrants([]);
+            setSessions([]);
+            track("auth_logged_out");
+          }
+        );
       },
       revokeSession: async (id) => {
         const revokedCurrent = sessions.some(
