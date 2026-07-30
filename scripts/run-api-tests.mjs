@@ -185,7 +185,12 @@ const spawnCommand = ({ command, args, cwd, onSpawn, logError }) =>
       shell: false,
       detached: process.platform !== "win32"
     });
-    onSpawn(child);
+    onSpawn(child, {
+      processGroupId:
+        process.platform !== "win32" && Number.isInteger(child.pid)
+          ? child.pid
+          : null
+    });
     child.once("error", (error) => {
       logError(`Failed to start ${command}: ${error.message}`);
       resolve({ exitCode: 1, signal: null });
@@ -195,25 +200,48 @@ const spawnCommand = ({ command, args, cwd, onSpawn, logError }) =>
     });
   });
 
-const signalChildTree = (child, signal) => {
-  if (
-    process.platform !== "win32" &&
-    Number.isInteger(child?.pid) &&
-    child.pid > 0
-  ) {
-    try {
-      process.kill(-child.pid, signal);
-      return true;
-    } catch {
-      // Fall through when the child is not a process-group leader.
-    }
-  }
+const signalChild = (child, signal) => {
   try {
     return child?.kill(signal) ?? false;
   } catch {
     return false;
   }
 };
+
+const inspectProcessGroup = (processGroupId) => {
+  if (
+    process.platform === "win32" ||
+    !Number.isInteger(processGroupId) ||
+    processGroupId <= 1
+  ) {
+    return "unsupported";
+  }
+  try {
+    process.kill(-processGroupId, 0);
+    return "alive";
+  } catch (error) {
+    if (error?.code === "ESRCH") return "missing";
+    if (error?.code === "EPERM") return "inaccessible";
+    return "unknown";
+  }
+};
+
+const signalProcessGroup = (processGroupId, signal) => {
+  if (inspectProcessGroup(processGroupId) === "unsupported") {
+    return "unsupported";
+  }
+  try {
+    process.kill(-processGroupId, signal);
+    return "sent";
+  } catch (error) {
+    if (error?.code === "ESRCH") return "missing";
+    if (error?.code === "EPERM") return "inaccessible";
+    return "unknown";
+  }
+};
+
+const waitForPoll = (pollMs) =>
+  new Promise((resolve) => setTimeout(resolve, pollMs));
 
 const waitForHold = (holdMs, wasSignalled) =>
   new Promise((resolve) => {
@@ -269,10 +297,12 @@ export const runApiTestLifecycle = async ({
 
   const { forcedTestExitCode, holdMs, stubbornMs, vitestArgs } = parsedArgs;
   let activeChild = null;
+  let activeProcessGroupId = null;
   let phase = "up";
   let requestedSignal = null;
   let primaryExitCode = 0;
   let signalEscalationTimer = null;
+  let processGroupFallbackWarningLogged = false;
 
   const clearSignalEscalation = () => {
     if (signalEscalationTimer) {
@@ -281,18 +311,81 @@ export const runApiTestLifecycle = async ({
     }
   };
 
-  const escalateActiveChild = () => {
+  const clearTrackedProcessGroup = () => {
+    activeProcessGroupId = null;
     clearSignalEscalation();
-    if (phase !== "down" && activeChild) {
-      signalChildTree(activeChild, "SIGKILL");
+  };
+
+  const signalTrackedTree = (signal) => {
+    if (activeProcessGroupId !== null) {
+      const groupResult = signalProcessGroup(activeProcessGroupId, signal);
+      if (groupResult === "sent") return true;
+      if (groupResult === "missing") {
+        clearTrackedProcessGroup();
+        return true;
+      }
+      if (groupResult === "inaccessible" || groupResult === "unknown") {
+        if (!processGroupFallbackWarningLogged) {
+          logError(
+            `Unable to signal child process group ${activeProcessGroupId}; ` +
+              "falling back to the direct child while retaining group tracking."
+          );
+          processGroupFallbackWarningLogged = true;
+        }
+      }
+    }
+    return signalChild(activeChild, signal);
+  };
+
+  const escalateTrackedTree = () => {
+    clearSignalEscalation();
+    if (activeProcessGroupId !== null || (phase !== "down" && activeChild)) {
+      signalTrackedTree("SIGKILL");
     }
   };
 
   const forwardFirstSignal = () => {
-    if (phase === "down" || !activeChild || !requestedSignal) return;
-    signalChildTree(activeChild, requestedSignal);
+    if (
+      phase === "down" ||
+      (!activeChild && activeProcessGroupId === null) ||
+      !requestedSignal
+    ) {
+      return;
+    }
+    signalTrackedTree(requestedSignal);
     clearSignalEscalation();
-    signalEscalationTimer = setTimeout(escalateActiveChild, signalGraceMs);
+    if (activeChild || activeProcessGroupId !== null) {
+      signalEscalationTimer = setTimeout(escalateTrackedTree, signalGraceMs);
+    }
+  };
+
+  const waitForTrackedTreeExit = async () => {
+    if (activeProcessGroupId === null) {
+      clearSignalEscalation();
+      return;
+    }
+
+    while (activeProcessGroupId !== null) {
+      const groupState = inspectProcessGroup(activeProcessGroupId);
+      if (groupState === "missing") {
+        clearTrackedProcessGroup();
+        return;
+      }
+      if (groupState === "unsupported") {
+        clearTrackedProcessGroup();
+        return;
+      }
+      if (groupState === "inaccessible" || groupState === "unknown") {
+        if (!processGroupFallbackWarningLogged) {
+          logError(
+            `Unable to inspect child process group ${activeProcessGroupId}; ` +
+              "retaining group tracking after the direct-child fallback."
+          );
+          processGroupFallbackWarningLogged = true;
+        }
+      }
+      await waitForPoll(10);
+    }
   };
 
   const handleSignal = (signal) => {
@@ -301,7 +394,7 @@ export const runApiTestLifecycle = async ({
       forwardFirstSignal();
       return;
     }
-    escalateActiveChild();
+    escalateTrackedTree();
   };
   const onSigint = () => handleSignal("SIGINT");
   const onSigterm = () => handleSignal("SIGTERM");
@@ -316,13 +409,27 @@ export const runApiTestLifecycle = async ({
       args,
       cwd,
       logError,
-      onSpawn: (child) => {
+      onSpawn: (child, metadata = {}) => {
         activeChild = child;
+        processGroupFallbackWarningLogged = false;
+        activeProcessGroupId =
+          process.platform !== "win32" &&
+          nextPhase !== "down" &&
+          metadata.processGroupId === child?.pid &&
+          Number.isInteger(metadata.processGroupId) &&
+          metadata.processGroupId > 1 &&
+          metadata.processGroupId !== process.pid
+            ? metadata.processGroupId
+            : null;
         if (requestedSignal) forwardFirstSignal();
       }
     });
-    clearSignalEscalation();
     activeChild = null;
+    if (requestedSignal && nextPhase !== "down") {
+      await waitForTrackedTreeExit();
+    } else {
+      clearTrackedProcessGroup();
+    }
     if (result.signal && !requestedSignal) requestedSignal = result.signal;
     return result;
   };
@@ -372,7 +479,7 @@ export const runApiTestLifecycle = async ({
         SIGNAL_EXIT_CODES[requestedSignal] ?? (primaryExitCode || 1);
     }
   } finally {
-    clearSignalEscalation();
+    await waitForTrackedTreeExit();
     try {
       const down = await runPhase("down", "docker", [
         "compose",

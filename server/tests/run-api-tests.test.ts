@@ -1,3 +1,4 @@
+import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter, once } from "node:events";
 import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
@@ -9,6 +10,83 @@ import * as wrapperModule from "../../scripts/run-api-tests.mjs";
 
 const wrapperPath = path.resolve("scripts/run-api-tests.mjs");
 const loadWrapper = async () => wrapperModule;
+
+const waitFor = async (
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs: number,
+  description: string
+) => {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await predicate())) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for ${description}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+};
+
+const withWatchdog = async <T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  description: string
+) => {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${description} exceeded ${timeoutMs}ms`)),
+          timeoutMs
+        );
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+};
+
+const isProcessAlive = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+    throw error;
+  }
+};
+
+const isProcessGroupAlive = (pgid: number) => {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+    throw error;
+  }
+};
+
+const spawnLeaderWithStubbornDescendant = (readyPath: string) => {
+  const descendantSource = [
+    "const fs = require('node:fs');",
+    "process.on('SIGINT', () => {});",
+    "process.on('SIGTERM', () => {});",
+    `fs.writeFileSync(${JSON.stringify(readyPath)}, String(process.pid));`,
+    "setInterval(() => {}, 1000);"
+  ].join("");
+  const leaderSource = [
+    "const { spawn } = require('node:child_process');",
+    `spawn(process.execPath, ['-e', ${JSON.stringify(descendantSource)}], { stdio: 'ignore' });`,
+    "process.on('SIGINT', () => process.exit(0));",
+    "process.on('SIGTERM', () => process.exit(0));",
+    "setInterval(() => {}, 1000);"
+  ].join("");
+
+  return spawn(process.execPath, ["-e", leaderSource], {
+    detached: true,
+    stdio: "ignore"
+  });
+};
 
 const getAvailablePort = () =>
   new Promise<number>((resolve, reject) => {
@@ -43,6 +121,140 @@ afterEach(async () => {
 });
 
 describe("API test lifecycle wrapper", () => {
+  const exerciseLeaderExitWithStubbornDescendant = async ({
+    signal,
+    secondSignal
+  }: {
+    signal: "SIGINT" | "SIGTERM";
+    secondSignal: boolean;
+  }) => {
+    const { releaseTestDbLock, runApiTestLifecycle } = await loadWrapper();
+    const signalSource = new EventEmitter();
+    const phases: string[] = [];
+    const readyPath = path.join(tempRoot, "descendant-ready");
+    let processGroupId = 0;
+    let descendantPid = 0;
+    let groupAliveAtDown: boolean | null = null;
+    let groupAliveAtRelease: boolean | null = null;
+    let resolveLeaderExit!: () => void;
+    const leaderExit = new Promise<void>((resolve) => {
+      resolveLeaderExit = resolve;
+    });
+    let resolveSecondSignal!: () => void;
+    const secondSignalSent = new Promise<void>((resolve) => {
+      resolveSecondSignal = resolve;
+    });
+    let lifecyclePromise: Promise<{
+      exitCode: number;
+      signal: string | null;
+    }> | null = null;
+
+    try {
+      lifecyclePromise = runApiTestLifecycle({
+        lockPath,
+        lockPort,
+        signalSource,
+        signalGraceMs: secondSignal ? 500 : 50,
+        releaseLock: async (lock: unknown) => {
+          groupAliveAtRelease =
+            processGroupId > 0 && isProcessGroupAlive(processGroupId);
+          return releaseTestDbLock(lock);
+        },
+        runCommand: async ({
+          phase,
+          onSpawn
+        }: {
+          phase: string;
+          onSpawn: (
+            child: ChildProcess,
+            metadata?: { processGroupId: number }
+          ) => void;
+        }) => {
+          phases.push(phase);
+          if (phase === "up") return { exitCode: 0, signal: null };
+          if (phase === "down") {
+            groupAliveAtDown =
+              processGroupId > 0 && isProcessGroupAlive(processGroupId);
+            if (secondSignal) await secondSignalSent;
+            return { exitCode: 0, signal: null };
+          }
+
+          const leader = spawnLeaderWithStubbornDescendant(readyPath);
+          if (!leader.pid || leader.pid === process.pid) {
+            throw new Error("Expected a distinct detached process-group leader");
+          }
+          processGroupId = leader.pid;
+          onSpawn(leader, { processGroupId });
+          return await new Promise((resolve, reject) => {
+            leader.once("error", reject);
+            leader.once("exit", (exitCode, childSignal) => {
+              resolveLeaderExit();
+              resolve({ exitCode, signal: childSignal });
+            });
+          });
+        }
+      });
+
+      await waitFor(
+        async () => {
+          try {
+            descendantPid = Number(await readFile(readyPath, "utf8"));
+            return Number.isInteger(descendantPid) && descendantPid > 0;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+            throw error;
+          }
+        },
+        500,
+        "stubborn descendant readiness"
+      );
+
+      signalSource.emit(signal);
+      if (secondSignal) {
+        await withWatchdog(leaderExit, 500, "leader exit");
+        await new Promise((resolve) => setImmediate(resolve));
+        signalSource.emit(signal);
+        resolveSecondSignal();
+      }
+
+      const result = await withWatchdog(
+        lifecyclePromise,
+        1_000,
+        "real process-tree lifecycle"
+      );
+      return {
+        result,
+        phases,
+        groupAliveAtDown,
+        groupAliveAtRelease,
+        groupAliveAfterLifecycle: isProcessGroupAlive(processGroupId),
+        descendantAliveAfterLifecycle: isProcessAlive(descendantPid)
+      };
+    } finally {
+      resolveSecondSignal();
+      if (processGroupId > 1 && isProcessGroupAlive(processGroupId)) {
+        process.kill(-processGroupId, "SIGKILL");
+      }
+      if (descendantPid > 1 && isProcessAlive(descendantPid)) {
+        process.kill(descendantPid, "SIGKILL");
+      }
+      if (processGroupId > 1) {
+        await waitFor(
+          () => !isProcessGroupAlive(processGroupId),
+          1_000,
+          "test process-group cleanup"
+        );
+      }
+      if (lifecyclePromise) {
+        await withWatchdog(
+          lifecyclePromise,
+          1_000,
+          "lifecycle cleanup after test"
+        ).catch(() => {});
+      }
+    }
+  };
+
   it("exports the lifecycle implementation", async () => {
     await expect(access(wrapperPath)).resolves.toBeUndefined();
     const wrapper = await loadWrapper();
@@ -499,6 +711,48 @@ describe("API test lifecycle wrapper", () => {
     expect(phases).toEqual(["up", "test", "down"]);
     await expect(access(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
+
+  it.runIf(process.platform !== "win32")(
+    "kills a stubborn descendant after its detached leader exits during grace",
+    async () => {
+      const observation = await exerciseLeaderExitWithStubbornDescendant({
+        signal: "SIGTERM",
+        secondSignal: false
+      });
+
+      expect(observation.result).toEqual({
+        exitCode: 143,
+        signal: "SIGTERM"
+      });
+      expect(observation.phases).toEqual(["up", "test", "down"]);
+      expect(observation.groupAliveAtDown).toBe(false);
+      expect(observation.groupAliveAtRelease).toBe(false);
+      expect(observation.groupAliveAfterLifecycle).toBe(false);
+      expect(observation.descendantAliveAfterLifecycle).toBe(false);
+      await expect(access(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "kills a stubborn descendant on a second signal after its leader exits",
+    async () => {
+      const observation = await exerciseLeaderExitWithStubbornDescendant({
+        signal: "SIGINT",
+        secondSignal: true
+      });
+
+      expect(observation.result).toEqual({
+        exitCode: 130,
+        signal: "SIGINT"
+      });
+      expect(observation.phases).toEqual(["up", "test", "down"]);
+      expect(observation.groupAliveAtDown).toBe(false);
+      expect(observation.groupAliveAtRelease).toBe(false);
+      expect(observation.groupAliveAfterLifecycle).toBe(false);
+      expect(observation.descendantAliveAfterLifecycle).toBe(false);
+      await expect(access(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  );
 
   it("parses explicit lifecycle-only failure, hold, and stubborn controls", async () => {
     const { parseLifecycleArgs } = await loadWrapper();

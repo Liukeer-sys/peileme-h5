@@ -107,6 +107,7 @@ Add focused tests to `server/tests/run-api-tests.test.ts` for:
 - test exit `23` and partial-up exit `19`, with down always executed and the original code preserved;
 - SIGTERM cleanup and exit `143`, including a child that ignores the first signal until the grace timer sends `SIGKILL`;
 - a second SIGINT/SIGTERM immediately escalating the active child to `SIGKILL` while preserving the first signal's exit `130`/`143`;
+- real detached process trees where the leader exits on the first signal while an in-group descendant ignores it, covering both grace-timer and second-signal escalation before down/release;
 - a dead owner sidecar replaced by a new owner;
 - an idle mutex replacing a stale sidecar whose PID has been reused by a live, unrelated process;
 - mutex release completing promptly when a client attempts to keep its connection open;
@@ -133,7 +134,7 @@ After ownership, execute Compose up and Vitest. A `finally` block must run:
 docker compose -f docker-compose.test.yml down --volumes --remove-orphans
 ```
 
-Preserve the up or test exit code through cleanup and lock-release failures. On the first SIGINT/SIGTERM, forward that signal to the active child process group where supported, start a two-second grace timer, and escalate to `SIGKILL` when the child remains alive. A second signal escalates immediately. Wait for child exit, run the same cleanup, release ownership, and terminate with the original signal status `130`/`143`.
+Preserve the up or test exit code through cleanup and lock-release failures. On the first SIGINT/SIGTERM, forward that signal to the active child process group where supported, save the detached process-group ID independently from the direct child, start a two-second grace timer, and escalate the saved group to `SIGKILL` when any member remains alive. A second signal escalates immediately, including after the group leader has exited. Confirm the saved group no longer exists before entering down; clear its timer and ID only after that check. Platforms or permissions without process-group control fall back to signalling the direct child. Then run cleanup, release ownership, and terminate with the original signal status `130`/`143`.
 
 Merge these scripts into `package.json`:
 
@@ -176,7 +177,7 @@ npx vitest run server/tests/run-api-tests.test.ts
 npm run test:api
 ```
 
-Expected: 17 wrapper/lock tests pass; the complete server suite reports 32/32; the lock sidecar, mutex listener, Compose container/network, and port `55432` are removed.
+Expected: 19 wrapper/lock tests pass; the complete server suite reports 34/34; the lock sidecar, mutex listener, Compose container/network, and port `55432` are removed.
 
 Exercise a real nonzero child:
 
