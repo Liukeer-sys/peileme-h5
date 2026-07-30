@@ -14,7 +14,7 @@
     "db:seed": "tsx server/seed.ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:e2e:production": "playwright test e2e/production.spec.ts",
+    "test:e2e:production": "playwright test",
     "preview": "vite preview"
   },
   "dependencies": {

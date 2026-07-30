@@ -12,6 +12,9 @@ export default defineConfig({
   use: {
     baseURL: process.env.E2E_BASE_URL || "https://peileme.art",
     headless: true,
+    launchOptions: {
+      executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH || undefined
+    },
     ignoreHTTPSErrors: false,
     trace: "retain-on-failure",
     screenshot: "only-on-failure",

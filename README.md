@@ -39,9 +39,24 @@ Compose 仅把 Web 绑定到 `127.0.0.1:${WEB_PORT}`；数据库和 API 保持�
 ```bash
 npm run build
 npm test
+npm run test:e2e:production
 npm audit --omit=dev
 docker compose config
 ```
+
+生产端到端验收需要独立验收账号，并显式提供用户、管理员和邀请码凭据；凭据不会写入报告或仓库：
+
+```bash
+E2E_USER_EMAIL='独立验收账号' \
+E2E_USER_PASSWORD='验收账号密码' \
+E2E_USER_BUTTON_NAME='账号称呼前四字' \
+E2E_ADMIN_EMAIL=admin@peileme.art \
+E2E_ADMIN_PASSWORD='从生产 .env 安全读取' \
+E2E_INVITE_CODE='从生产 .env 安全读取' \
+npm run test:e2e:production
+```
+
+默认执行移动端测算与持久化管理回查两条真实链路：完成测算、校验邀请码权益、下载私有材料，并在管理后台核对权限、埋点、材料和审计记录。
 
 集成测试使用独立 PostgreSQL，默认连接：
 

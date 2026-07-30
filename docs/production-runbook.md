@@ -31,6 +31,20 @@ curl -fsS https://peileme.art/api/health
 curl -I https://peileme.art/admin
 ```
 
+真实浏览器验收：
+
+```bash
+E2E_USER_EMAIL='独立验收账号' \
+E2E_USER_PASSWORD='验收账号密码' \
+E2E_USER_BUTTON_NAME='账号称呼前四字' \
+E2E_ADMIN_EMAIL=admin@peileme.art \
+E2E_ADMIN_PASSWORD='从生产 .env 安全读取' \
+E2E_INVITE_CODE='从生产 .env 安全读取' \
+npm run test:e2e:production
+```
+
+默认执行移动端测算与持久化管理回查两条真实链路。验收账号需预先写入测算、邀请码兑换、埋点和小型 PDF 材料，测试会核对用户侧私有下载、普通用户越权拦截及管理后台持久化结果。
+
 ## 发布
 
 1. 将确认过的源码同步至编排目录，保留生产 `.env` 和数据卷。
