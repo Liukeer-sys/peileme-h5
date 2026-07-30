@@ -1,10 +1,16 @@
 import { useState } from "react";
+import {
+  ApiError,
+  createPolicyShare,
+  revokePolicyShare
+} from "../lib/api";
 import type { PolicyApiResult } from "../types";
 
 type PolicyResultProps = {
   result: PolicyApiResult;
   onOpenHistory: () => void;
   onRecalculate: () => void;
+  sharedReadOnly?: boolean;
 };
 
 const formatCny = (fen: number) =>
@@ -39,9 +45,12 @@ const accuracyCopy: Record<
 export default function PolicyResult({
   result,
   onOpenHistory,
-  onRecalculate
+  onRecalculate,
+  sharedReadOnly = false
 }: PolicyResultProps) {
   const [shareMessage, setShareMessage] = useState("");
+  const [activeShareId, setActiveShareId] = useState("");
+  const [shareBusy, setShareBusy] = useState(false);
   const accuracy = accuracyCopy[result.accuracyLevel];
   const sources = Object.values(result.parameters).filter(
     (item, index, all) =>
@@ -51,13 +60,47 @@ export default function PolicyResult({
   );
 
   const share = async () => {
-    const url = new URL(window.location.href);
-    url.searchParams.set("assessment", result.assessmentId);
+    if (shareBusy) return;
+    setShareBusy(true);
+    setShareMessage("");
     try {
-      await navigator.clipboard.writeText(url.toString());
-      setShareMessage("分享链接已复制");
-    } catch {
-      setShareMessage(`分享链接：${url.toString()}`);
+      const created = await createPolicyShare(result.assessmentId);
+      setActiveShareId(created.shareId);
+      const url = new URL(window.location.href);
+      url.search = "";
+      url.searchParams.set("share", created.token);
+      try {
+        await navigator.clipboard.writeText(url.toString());
+        setShareMessage(
+          `分享链接已复制，有效期至 ${new Date(
+            created.expiresAt
+          ).toLocaleString("zh-CN")}`
+        );
+      } catch {
+        setShareMessage(`分享链接：${url.toString()}`);
+      }
+    } catch (error) {
+      setShareMessage(
+        error instanceof ApiError ? error.message : "分享链接创建失败，请重试"
+      );
+    } finally {
+      setShareBusy(false);
+    }
+  };
+
+  const revokeShare = async () => {
+    if (!activeShareId || shareBusy) return;
+    setShareBusy(true);
+    try {
+      await revokePolicyShare(activeShareId);
+      setActiveShareId("");
+      setShareMessage("分享已撤销，原链接已立即失效");
+    } catch (error) {
+      setShareMessage(
+        error instanceof ApiError ? error.message : "撤销分享失败，请重试"
+      );
+    } finally {
+      setShareBusy(false);
     }
   };
 
@@ -121,17 +164,35 @@ export default function PolicyResult({
         )}
       </section>
 
-      <div className="policy-result-actions">
-        <button type="button" className="primary-button" onClick={onOpenHistory}>
-          查看历史
-        </button>
-        <button type="button" className="secondary-button" onClick={() => void share()}>
-          分享结果
-        </button>
-        <button type="button" className="ghost-button" onClick={onRecalculate}>
-          重新测算
-        </button>
-      </div>
+      {!sharedReadOnly && (
+        <div className="policy-result-actions">
+          <button type="button" className="primary-button" onClick={onOpenHistory}>
+            查看历史
+          </button>
+          {activeShareId ? (
+            <button
+              type="button"
+              className="secondary-button"
+              disabled={shareBusy}
+              onClick={() => void revokeShare()}
+            >
+              撤销分享
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="secondary-button"
+              disabled={shareBusy}
+              onClick={() => void share()}
+            >
+              {shareBusy ? "正在创建…" : "分享结果"}
+            </button>
+          )}
+          <button type="button" className="ghost-button" onClick={onRecalculate}>
+            重新测算
+          </button>
+        </div>
+      )}
       {shareMessage && <p role="status" className="policy-share-status">{shareMessage}</p>}
       <small className="policy-disclaimer">
         测算用于梳理协商线索，最终权利义务以事实证据、有效规则与专业意见为准。

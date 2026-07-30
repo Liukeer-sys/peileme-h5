@@ -533,6 +533,7 @@ export class PolicyRepository {
         endDate: facts.endDate,
         terminationScenario: facts.terminationScenario,
         monthlyEarnedWagesFen: facts.monthlyEarnedWagesFen,
+        wageDataConfirmation: facts.wageDataConfirmation,
         minimumMonthlyWageFen: minimumProvenance.amountFen,
         employeeAverageMonthlyWageFen: averageProvenance.amountFen,
         alreadyPaidFen: facts.alreadyPaidFen ?? 0
@@ -643,6 +644,7 @@ export class PolicyRepository {
         scenario: row.input.terminationScenario.kind,
         ruleVersion: row.version,
         accuracy: row.accuracy_level,
+        payableDetermined: row.output.payableDetermined,
         payableFen: row.output.payableFen,
         rangeFen: row.output.rangeFen,
         createdAt: row.created_at
@@ -694,6 +696,114 @@ export class PolicyRepository {
       output: row.output,
       createdAt: row.created_at
     };
+  }
+
+  async createShare(
+    userId: string,
+    assessmentId: string,
+    expiresInDays: number
+  ) {
+    const token = crypto.randomBytes(32).toString("base64url");
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    const result = await query<{
+      id: string;
+      expires_at: string;
+    }>(
+      `INSERT INTO policy_result_shares(
+         assessment_id, owner_user_id, token_hash, expires_at
+       )
+       SELECT a.id, a.user_id, $3,
+              now() + ($4::integer * interval '1 day')
+         FROM assessments a
+         JOIN policy_calculation_snapshots pcs
+           ON pcs.assessment_id = a.id
+        WHERE a.id = $1
+          AND a.user_id = $2
+          AND a.product_channel = 'main'
+       RETURNING id, expires_at::text`,
+      [assessmentId, userId, tokenHash, expiresInDays]
+    );
+    const row = result.rows[0];
+    if (!row) {
+      throw new ApiError(
+        404,
+        "POLICY_HISTORY_NOT_FOUND",
+        "计算记录不存在"
+      );
+    }
+    return {
+      shareId: row.id,
+      token,
+      expiresAt: row.expires_at
+    };
+  }
+
+  async revokeShare(userId: string, shareId: string) {
+    const result = await query<{ id: string }>(
+      `UPDATE policy_result_shares
+          SET revoked_at = coalesce(revoked_at, now())
+        WHERE id = $1
+          AND owner_user_id = $2
+       RETURNING id`,
+      [shareId, userId]
+    );
+    if (!result.rows[0]) {
+      throw new ApiError(
+        404,
+        "POLICY_SHARE_NOT_FOUND",
+        "分享链接不存在"
+      );
+    }
+  }
+
+  async getSharedResult(token: string) {
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    return withTransaction(async (client) => {
+      const result = await client.query<{
+        share_id: string;
+        expires_at: string;
+        accuracy_level: CalculationResult["accuracy"];
+        version: number;
+        output: PolicyOutput;
+        parameter_provenance: CalculationResult["parameters"];
+      }>(
+        `SELECT prs.id AS share_id, prs.expires_at::text,
+                a.accuracy_level, prv.version, pcs.output,
+                pcs.parameter_provenance
+           FROM policy_result_shares prs
+           JOIN assessments a ON a.id = prs.assessment_id
+           JOIN policy_calculation_snapshots pcs
+             ON pcs.assessment_id = a.id
+           JOIN policy_rule_versions prv
+             ON prv.id = pcs.rule_version_id
+          WHERE prs.token_hash = $1
+            AND prs.revoked_at IS NULL
+            AND prs.expires_at > now()
+            AND a.product_channel = 'main'
+          FOR UPDATE OF prs`,
+        [tokenHash]
+      );
+      const row = result.rows[0];
+      if (!row) {
+        throw new ApiError(
+          404,
+          "POLICY_SHARE_NOT_FOUND",
+          "分享链接不存在或已失效"
+        );
+      }
+      await client.query(
+        "UPDATE policy_result_shares SET last_accessed_at = now() WHERE id = $1",
+        [row.share_id]
+      );
+      return {
+        shareId: row.share_id,
+        expiresAt: row.expires_at,
+        ruleVersion: row.version,
+        accuracy: row.accuracy_level,
+        parameters: row.parameter_provenance,
+        result: row.output
+      };
+    });
   }
 
   async listVersions(code: string) {

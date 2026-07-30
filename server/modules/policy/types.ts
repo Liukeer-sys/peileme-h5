@@ -16,7 +16,7 @@ export type TerminationScenario =
       continuedPerformanceRequested: boolean;
       continuedPerformancePossible: boolean;
     }
-  | { kind: "UNCLEAR" };
+  | { kind: "UNCLEAR"; factGaps?: string[] };
 
 export type PolicyInput = {
   regionCode: string;
@@ -29,6 +29,10 @@ export type PolicyInput = {
    * The final entry is the complete wage month immediately before termination.
    */
   monthlyEarnedWagesFen: number[];
+  wageDataConfirmation: {
+    confirmed: true;
+    basis: "pretax_earned_including_bonus_allowance";
+  };
   minimumMonthlyWageFen: number;
   employeeAverageMonthlyWageFen: number;
   alreadyPaidFen?: number;
@@ -48,6 +52,7 @@ export type PolicyEngineErrorCode =
   | "INVALID_TERMINATION_SCENARIO"
   | "WAGE_MONTHS_OUT_OF_RANGE"
   | "INVALID_WAGE_VALUE"
+  | "INVALID_WAGE_CONFIRMATION"
   | "INVALID_REGIONAL_PARAMETER"
   | "INVALID_ALREADY_PAID"
   | "COMPUTATION_OVERFLOW";
@@ -61,6 +66,7 @@ export type PolicyEngineErrorDetails = Readonly<{
     | "endDate"
     | "terminationScenario"
     | "monthlyEarnedWagesFen"
+    | "wageDataConfirmation"
     | "minimumMonthlyWageFen"
     | "employeeAverageMonthlyWageFen"
     | "alreadyPaidFen";

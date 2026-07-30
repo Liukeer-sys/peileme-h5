@@ -20,6 +20,10 @@ const baseInput = (): PolicyInput => ({
     noticeMethod: "notice_30_days"
   },
   monthlyEarnedWagesFen: Array(12).fill(1_500_000),
+  wageDataConfirmation: {
+    confirmed: true,
+    basis: "pretax_earned_including_bonus_allowance"
+  },
   minimumMonthlyWageFen: 269_000,
   employeeAverageMonthlyWageFen: 1_250_000
 });
@@ -264,6 +268,10 @@ describe("calculatePolicy wage basis", () => {
           noticeMethod: "notice_30_days"
         },
         monthlyEarnedWagesFen: [100, 101],
+        wageDataConfirmation: {
+          confirmed: true,
+          basis: "pretax_earned_including_bonus_allowance"
+        },
         minimumMonthlyWageFen: 1,
         employeeAverageMonthlyWageFen: 1_000
       };
@@ -710,6 +718,45 @@ describe("calculatePolicy legal scenario matrix", () => {
       .join("\n");
     expect(explanation).not.toContain("应付0");
     expect(explanation).not.toContain("剩余应付0");
+  });
+
+  it("lists every unresolved fact before showing an UNCLEAR range", () => {
+    const result = calculatePolicy({
+      ...baseInput(),
+      terminationScenario: {
+        kind: "UNCLEAR",
+        factGaps: ["需核验过错事实", "需核验单位解除程序"]
+      } as unknown as TerminationScenario
+    });
+
+    expect(result.payableDetermined).toBe(false);
+    expect(result.reviewRequired).toBe(true);
+    expect(
+      result.formulaSteps.find((step) => step.key === "fact-gaps")
+    ).toEqual({
+      key: "fact-gaps",
+      label: "待核验事实",
+      value: "1. 需核验过错事实；2. 需核验单位解除程序"
+    });
+  });
+
+  it("records the confirmed pretax earned-wage basis in the formula", () => {
+    const result = calculatePolicy({
+      ...baseInput(),
+      wageDataConfirmation: {
+        confirmed: true,
+        basis: "pretax_earned_including_bonus_allowance"
+      }
+    });
+
+    expect(
+      result.formulaSteps.find((step) => step.key === "wage-confirmation")
+    ).toEqual({
+      key: "wage-confirmation",
+      label: "工资口径确认",
+      value:
+        "用户已逐月确认：税前应发工资，包含奖金、津贴和补贴；工作不满12个月时按实际月数"
+    });
   });
 
   it("uses a dedicated continued-performance explanation", () => {

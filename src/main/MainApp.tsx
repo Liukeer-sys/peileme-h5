@@ -18,9 +18,11 @@ import {
 import {
   ApiError,
   calculatePolicy,
+  getSharedPolicyResult,
   listPolicyRegions,
   track
 } from "../lib/api";
+import { useDialogFocus } from "../hooks/useDialogFocus";
 import type {
   Answers,
   PolicyApiResult,
@@ -56,9 +58,9 @@ const quickRegions: Record<string, string> = {
   武汉: "420100"
 };
 
-const currentMonth = () => new Date().toISOString().slice(0, 7);
+const currentDate = () => new Date().toISOString().slice(0, 10);
 const freshAnswers = (): Answers => ({
-  endMonth: currentMonth(),
+  endDate: currentDate(),
   followUps: {}
 });
 
@@ -71,13 +73,11 @@ const loadSessionJson = <T,>(key: string): T | null => {
   }
 };
 
-const monthStart = (month?: string) => `${month}-01`;
-const monthEnd = (month?: string) => {
-  const match = /^(\d{4})-(\d{2})$/.exec(month || "");
-  if (!match) return "";
-  const year = Number(match[1]);
-  const monthNumber = Number(match[2]);
-  return new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10);
+const isCalendarDate = (value: string) => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return false;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
 };
 const yuanToFen = (yuan?: number) =>
   Number.isFinite(yuan) ? Math.round(Number(yuan) * 100) : 0;
@@ -86,27 +86,33 @@ const normalizeStoredDetail = (detail: PolicyHistoryDetail): Answers => ({
   regionCode: detail.input.regionCode,
   regionName: detail.input.regionName,
   city: detail.input.regionName,
-  startMonth: detail.input.startDate.slice(0, 7),
-  endMonth: detail.input.endDate.slice(0, 7),
+  startDate: detail.input.startDate,
+  endDate: detail.input.endDate,
   avgMonthlySalary: detail.input.monthlyEarnedWagesFen.length
     ? detail.input.monthlyEarnedWagesFen.reduce((sum, value) => sum + value, 0) /
       detail.input.monthlyEarnedWagesFen.length /
       100
     : 0,
   monthlyEarnedWagesFen: [...detail.input.monthlyEarnedWagesFen],
+  wageDataConfirmed: detail.input.wageDataConfirmation.confirmed,
   terminationScenario: detail.input.terminationScenario,
   followUps: {}
 });
 
 export default function MainApp() {
   const { user } = useAuth();
-  const restoredResult = useMemo(
-    () => loadSessionJson<PolicyApiResult>(RESULT_KEY),
+  const sharedToken = useMemo(
+    () => new URLSearchParams(window.location.search).get("share") || "",
     []
   );
+  const restoredResult = useMemo(
+    () =>
+      sharedToken ? null : loadSessionJson<PolicyApiResult>(RESULT_KEY),
+    [sharedToken]
+  );
   const restoredAnswers = useMemo(
-    () => loadSessionJson<Answers>(ANSWERS_KEY),
-    []
+    () => (sharedToken ? null : loadSessionJson<Answers>(ANSWERS_KEY)),
+    [sharedToken]
   );
   const [answers, setAnswers] = useState<Answers>(
     restoredAnswers || freshAnswers()
@@ -115,7 +121,7 @@ export default function MainApp() {
     restoredResult
   );
   const [mode, setMode] = useState<AppMode>(
-    restoredResult ? "result" : "chat"
+    sharedToken ? "loading" : restoredResult ? "result" : "chat"
   );
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -144,10 +150,29 @@ export default function MainApp() {
   const [regionSearch, setRegionSearch] = useState("");
   const [provinceCode, setProvinceCode] = useState("");
   const [requestError, setRequestError] = useState("");
+  const [serverMissingParameters, setServerMissingParameters] = useState<
+    string[]
+  >([]);
+  const [shareError, setShareError] = useState("");
   const [loadingIndex, setLoadingIndex] = useState(0);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [authOpen, setAuthOpen] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const submitLockRef = useRef(false);
+  const calculationGenerationRef = useRef(0);
+  const calculationAbortRef = useRef<AbortController | null>(null);
+  const regionRequestSequenceRef = useRef(0);
+  const regionAbortRef = useRef<AbortController | null>(null);
+  const regionDialogRef = useRef<HTMLDivElement | null>(null);
+  const regionSearchRef = useRef<HTMLInputElement | null>(null);
+
+  useDialogFocus(
+    regionPickerOpen,
+    regionDialogRef,
+    () => setRegionPickerOpen(false),
+    regionSearchRef
+  );
 
   const currentQuestion = baseQuestions[stepIndex];
   const currentTerminationNode =
@@ -168,19 +193,21 @@ export default function MainApp() {
       )
     : undefined;
   const calculationYear = Number(
-    (answers.endMonth || currentMonth()).slice(0, 4)
+    (answers.endDate || currentDate()).slice(0, 4)
   );
   const manualMinimumRequired =
     selectedRegion?.parameterAvailability?.minimumMonthlyWage ===
-    "manual-needed";
+      "manual-needed" ||
+    serverMissingParameters.includes("minimumMonthlyWageFen");
   const manualAverageRequired =
     selectedRegion?.parameterAvailability?.employeeAverageMonthlyWage ===
-    "manual-needed";
+      "manual-needed" ||
+    serverMissingParameters.includes("employeeAverageMonthlyWageFen");
   const wagePreset = buildDefaultWageSeries(
     yuanToFen(answers.avgMonthlySalary),
     answers.bonusInfo,
-    answers.startMonth,
-    answers.endMonth
+    answers.startDate,
+    answers.endDate
   );
   const wageSeries =
     answers.monthlyEarnedWagesFen || wagePreset.monthlyEarnedWagesFen;
@@ -189,20 +216,64 @@ export default function MainApp() {
     setMessages((current) => [...current, ...next]);
 
   const loadRegions = async (year = calculationYear) => {
+    const sequence = ++regionRequestSequenceRef.current;
+    regionAbortRef.current?.abort();
+    const controller = new AbortController();
+    regionAbortRef.current = controller;
     setRegionError("");
     try {
-      const loaded = await listPolicyRegions(year);
+      const loaded = await listPolicyRegions(year, controller.signal);
+      if (sequence !== regionRequestSequenceRef.current) return;
       setRegions(loaded);
     } catch (error) {
+      if (
+        controller.signal.aborted ||
+        (error instanceof DOMException && error.name === "AbortError")
+      ) {
+        return;
+      }
+      if (sequence !== regionRequestSequenceRef.current) return;
       setRegionError(
         error instanceof ApiError ? error.message : "地区数据加载失败，请重试"
       );
+    } finally {
+      if (sequence === regionRequestSequenceRef.current) {
+        regionAbortRef.current = null;
+      }
     }
   };
 
   useEffect(() => {
-    void loadRegions();
+    void loadRegions(calculationYear);
+    return () => {
+      regionAbortRef.current?.abort();
+    };
   }, [calculationYear]);
+
+  useEffect(() => {
+    if (!sharedToken) return;
+    let active = true;
+    void getSharedPolicyResult(sharedToken)
+      .then((result) => {
+        if (!active) return;
+        setServerResult(result);
+        setShareError("");
+        setMode("result");
+        track("policy_share_viewed", { shareId: result.assessmentId });
+      })
+      .catch((error) => {
+        if (!active) return;
+        setShareError(
+          error instanceof ApiError
+            ? error.message
+            : "分享链接加载失败，请稍后重试"
+        );
+        setMode("chat");
+      });
+    return () => {
+      active = false;
+    };
+  }, [sharedToken]);
 
   useEffect(() => {
     if (mode !== "loading") return;
@@ -237,7 +308,7 @@ export default function MainApp() {
       avatarState: xiaoPeiAvatarStateByMessageIntent.question
     });
     setStepIndex(index);
-    setTextValue(question.id === "endDate" ? answers.endMonth || "" : "");
+    setTextValue(question.id === "endDate" ? answers.endDate || "" : "");
   };
 
   const recordBaseAnswer = (
@@ -283,6 +354,7 @@ export default function MainApp() {
     };
     setRegionPickerOpen(false);
     setRegionSearch("");
+    setServerMissingParameters([]);
     recordBaseAnswer("city", display, next, 1);
   };
 
@@ -321,31 +393,31 @@ export default function MainApp() {
     if (!currentQuestion) return;
 
     if (currentQuestion.id === "startDate") {
-      if (!/^\d{4}-\d{2}$/.test(value)) {
-        setRequestError("请选择有效的入职年月");
+      if (!isCalendarDate(value)) {
+        setRequestError("请选择有效的完整入职日期");
         return;
       }
       recordBaseAnswer(
         currentQuestion.id,
         value,
-        { ...answers, startMonth: value, startDate: value },
+        { ...answers, startDate: value, startMonth: undefined },
         2
       );
       return;
     }
     if (currentQuestion.id === "endDate") {
       if (
-        !/^\d{4}-\d{2}$/.test(value) ||
-        !answers.startMonth ||
-        value < answers.startMonth
+        !isCalendarDate(value) ||
+        !answers.startDate ||
+        value <= answers.startDate
       ) {
-        setRequestError("解除年月需要晚于入职年月");
+        setRequestError("解除日期需要晚于完整入职日期");
         return;
       }
       recordBaseAnswer(
         currentQuestion.id,
         value,
-        { ...answers, endMonth: value, endDate: value },
+        { ...answers, endDate: value, endMonth: undefined },
         3
       );
       return;
@@ -437,8 +509,8 @@ export default function MainApp() {
       const preset = buildDefaultWageSeries(
         yuanToFen(answers.avgMonthlySalary),
         value,
-        answers.startMonth,
-        answers.endMonth
+        answers.startDate,
+        answers.endDate
       );
       recordBaseAnswer(
         currentQuestion.id,
@@ -446,7 +518,8 @@ export default function MainApp() {
         {
           ...answers,
           bonusInfo: value,
-          monthlyEarnedWagesFen: preset.monthlyEarnedWagesFen
+          monthlyEarnedWagesFen: preset.monthlyEarnedWagesFen,
+          wageDataConfirmed: false
         },
         6
       );
@@ -488,17 +561,21 @@ export default function MainApp() {
     };
     return {
       regionCode: answers.regionCode!,
-      startDate: monthStart(answers.startMonth),
-      endDate: monthEnd(answers.endMonth),
+      startDate: answers.startDate!,
+      endDate: answers.endDate!,
       terminationScenario: answers.terminationScenario || { kind: "UNCLEAR" },
       monthlyEarnedWagesFen:
         answers.monthlyEarnedWagesFen ||
         buildDefaultWageSeries(
           salaryFen,
           answers.bonusInfo,
-          answers.startMonth,
-          answers.endMonth
+          answers.startDate,
+          answers.endDate
         ).monthlyEarnedWagesFen,
+      wageDataConfirmation: {
+        confirmed: true,
+        basis: "pretax_earned_including_bonus_allowance"
+      },
       ...(Object.keys(manualParameters).length ? { manualParameters } : {})
     };
   };
@@ -509,17 +586,26 @@ export default function MainApp() {
   };
 
   const submitPolicyCalculation = async () => {
+    if (submitLockRef.current) return;
     if (!user) {
       setAuthOpen(true);
       return;
     }
     if (
       !answers.regionCode ||
-      !answers.startMonth ||
-      !answers.endMonth ||
+      !answers.startDate ||
+      !answers.endDate ||
       !answers.avgMonthlySalary
     ) {
       setRequestError("请先完成全部问卷");
+      return;
+    }
+    if (
+      !isCalendarDate(answers.startDate) ||
+      !isCalendarDate(answers.endDate) ||
+      answers.endDate <= answers.startDate
+    ) {
+      setRequestError("解除日期需要晚于完整入职日期");
       return;
     }
     if (
@@ -535,6 +621,12 @@ export default function MainApp() {
       setRequestError("请检查近1至12个月的应发工资，金额需为有效数字");
       return;
     }
+    if (!answers.wageDataConfirmed) {
+      setRequestError(
+        "请逐月核对税前应发工资（含奖金、津贴、补贴）并确认口径"
+      );
+      return;
+    }
     if (
       (manualMinimumRequired && !answers.manualMinimumMonthlyWage) ||
       (manualAverageRequired && !answers.manualEmployeeAverageMonthlyWage)
@@ -542,10 +634,17 @@ export default function MainApp() {
       setRequestError("请补充缺失的当地参数后再提交");
       return;
     }
+    submitLockRef.current = true;
+    setIsSubmitting(true);
+    const generation = ++calculationGenerationRef.current;
+    calculationAbortRef.current?.abort();
+    const controller = new AbortController();
+    calculationAbortRef.current = controller;
     setMode("loading");
     setRequestError("");
     try {
-      const response = await calculatePolicy(buildRequest());
+      const response = await calculatePolicy(buildRequest(), controller.signal);
+      if (generation !== calculationGenerationRef.current) return;
       setServerResult(response);
       persistResult(response, answers);
       track("policy_calculation_completed", {
@@ -554,21 +653,51 @@ export default function MainApp() {
       });
       setMode("result");
     } catch (error) {
+      if (
+        generation !== calculationGenerationRef.current ||
+        controller.signal.aborted ||
+        (error instanceof DOMException && error.name === "AbortError")
+      ) {
+        return;
+      }
       setMode("chat");
       if (
         error instanceof ApiError &&
         error.code === "REGIONAL_PARAMETERS_REQUIRED"
       ) {
-        setRequestError("当前地区缺少官方参数，请补充当地数值后重试");
+        const details =
+          error.details && typeof error.details === "object"
+            ? (error.details as { missing?: unknown }).missing
+            : undefined;
+        const missing = Array.isArray(details)
+          ? details.filter(
+              (item): item is string =>
+                item === "minimumMonthlyWageFen" ||
+                item === "employeeAverageMonthlyWageFen"
+            )
+          : [];
+        setServerMissingParameters(missing);
+        setRequestError(error.message);
       } else {
         setRequestError(
           error instanceof ApiError ? error.message : "测算失败，请稍后重试"
         );
       }
+    } finally {
+      if (generation === calculationGenerationRef.current) {
+        submitLockRef.current = false;
+        setIsSubmitting(false);
+        calculationAbortRef.current = null;
+      }
     }
   };
 
   const restart = () => {
+    calculationGenerationRef.current += 1;
+    calculationAbortRef.current?.abort();
+    calculationAbortRef.current = null;
+    submitLockRef.current = false;
+    setIsSubmitting(false);
     window.sessionStorage.removeItem(RESULT_KEY);
     window.sessionStorage.removeItem(ANSWERS_KEY);
     setAnswers(freshAnswers());
@@ -594,6 +723,7 @@ export default function MainApp() {
     setReadyToCalculate(false);
     setTextValue("");
     setRequestError("");
+    setServerMissingParameters([]);
     track("assessment_restarted");
   };
 
@@ -611,7 +741,11 @@ export default function MainApp() {
             ),
             ...current
           ];
-    setAnswers({ ...answers, monthlyEarnedWagesFen: next });
+    setAnswers({
+      ...answers,
+      monthlyEarnedWagesFen: next,
+      wageDataConfirmed: false
+    });
     setRequestError("");
   };
 
@@ -619,7 +753,11 @@ export default function MainApp() {
     const next = [...wageSeries];
     const yuan = rawValue === "" ? Number.NaN : Number(rawValue);
     next[index] = Number.isFinite(yuan) ? yuanToFen(yuan) : Number.NaN;
-    setAnswers({ ...answers, monthlyEarnedWagesFen: next });
+    setAnswers({
+      ...answers,
+      monthlyEarnedWagesFen: next,
+      wageDataConfirmed: false
+    });
     setRequestError("");
   };
 
@@ -631,6 +769,7 @@ export default function MainApp() {
       endDate: detail.input.endDate,
       terminationScenario: detail.input.terminationScenario,
       monthlyEarnedWagesFen: detail.input.monthlyEarnedWagesFen,
+      wageDataConfirmation: detail.input.wageDataConfirmation,
       alreadyPaidFen: detail.input.alreadyPaidFen,
       manualParameters: {
         minimumMonthlyWageFen: detail.input.minimumMonthlyWageFen,
@@ -682,11 +821,11 @@ export default function MainApp() {
     terminationDetail
       ? "离职原因补充说明"
       : currentQuestion?.id === "startDate"
-        ? "入职年月"
+      ? "入职日期"
         : currentQuestion?.id === "endDate"
-          ? "解除年月"
+          ? "解除日期"
           : currentQuestion?.id === "avgMonthlySalary"
-            ? "最近一年平均月工资（元）"
+            ? "税前基础月工资（元）"
             : "回答";
   const showInput =
     mode === "chat" &&
@@ -721,11 +860,20 @@ export default function MainApp() {
                 ? (user.displayName || user.email || user.phone || "我的").slice(0, 4)
                 : "登录"}
             </button>
-            <button className="mini-button" type="button" onClick={restart}>重算</button>
+            {!sharedToken && (
+              <button className="mini-button" type="button" onClick={restart}>重算</button>
+            )}
           </div>
         </header>
 
-        {mode !== "result" && (
+        {shareError && (
+          <section className="shared-link-error" aria-labelledby="shared-link-error-title">
+            <h1 id="shared-link-error-title">分享链接已失效</h1>
+            <p role="alert">{shareError}</p>
+          </section>
+        )}
+
+        {!shareError && mode !== "result" && (
           <div className="chat-area">
             {messages.map((message) => (
               <ChatBubble
@@ -749,7 +897,7 @@ export default function MainApp() {
           </div>
         )}
 
-        {mode === "chat" && (
+        {!shareError && mode === "chat" && (
           <footer className="composer">
             {currentQuestion?.id === "city" && !readyToCalculate && (
               <div className="region-quick-select">
@@ -807,7 +955,7 @@ export default function MainApp() {
                   value={textValue}
                   type={
                     ["startDate", "endDate"].includes(currentQuestion?.id || "")
-                      ? "month"
+                      ? "date"
                       : "text"
                   }
                   inputMode={
@@ -830,18 +978,53 @@ export default function MainApp() {
                   <b>{selectedProvince && selectedProvince.code !== selectedRegion?.code
                     ? `${selectedProvince.name} · ${selectedRegion?.name}`
                     : selectedRegion?.name}</b>
-                  <span>{answers.startMonth} 至 {answers.endMonth}</span>
+                  <label>
+                    <span>复核入职日期</span>
+                    <input
+                      aria-label="复核入职日期"
+                      type="date"
+                      value={answers.startDate || ""}
+                      onChange={(event) => {
+                        setAnswers({
+                          ...answers,
+                          startDate: event.target.value,
+                          wageDataConfirmed: false
+                        });
+                        setServerMissingParameters([]);
+                        setRequestError("");
+                      }}
+                    />
+                  </label>
+                  <label>
+                    <span>复核解除日期</span>
+                    <input
+                      aria-label="复核解除日期"
+                      type="date"
+                      value={answers.endDate || ""}
+                      onChange={(event) => {
+                        setAnswers({
+                          ...answers,
+                          endDate: event.target.value,
+                          wageDataConfirmed: false
+                        });
+                        setServerMissingParameters([]);
+                        setRequestError("");
+                      }}
+                    />
+                  </label>
                   <span>月工资 {answers.avgMonthlySalary?.toLocaleString("zh-CN")} 元</span>
                 </div>
                 <section
                   className="wage-series-card"
-                  aria-label={`近${wageSeries.length}个月应发工资`}
+                  aria-label={`近${wageSeries.length}个月税前应发工资`}
                 >
                   <div className="wage-series-heading">
                     <div>
-                      <strong>近{wageSeries.length}个月应发工资</strong>
+                      <strong>
+                        近{wageSeries.length}个月税前应发工资
+                      </strong>
                       <p>
-                        按时间从早到晚填写，最后一项是解除前一个完整月。
+                        含当月奖金、津贴和补贴；按时间从早到晚填写，最后一项是解除前一个完整月。
                       </p>
                     </div>
                     <label>
@@ -879,7 +1062,7 @@ export default function MainApp() {
                     {wageSeries.map((wageFen, index) => {
                       const first = index === 0;
                       const last = index === wageSeries.length - 1;
-                      const inputLabel = `第${index + 1}个月应发工资（元${
+                      const inputLabel = `第${index + 1}个月税前应发工资（含奖金、津贴、补贴，元${
                         first && last
                           ? "，最早，解除前完整月"
                           : first
@@ -919,6 +1102,21 @@ export default function MainApp() {
                       );
                     })}
                   </div>
+                  <label className="wage-confirmation-check">
+                    <input
+                      type="checkbox"
+                      checked={answers.wageDataConfirmed === true}
+                      onChange={(event) =>
+                        setAnswers({
+                          ...answers,
+                          wageDataConfirmed: event.target.checked
+                        })
+                      }
+                    />
+                    <span>
+                      我已按工资条或流水逐月核对以上税前应发工资，奖金、津贴和补贴已填入实际发放月
+                    </span>
+                  </label>
                 </section>
                 {(manualMinimumRequired || manualAverageRequired) && (
                   <div className="manual-parameter-card">
@@ -961,9 +1159,10 @@ export default function MainApp() {
                 <button
                   className="primary-button"
                   type="button"
+                  disabled={!answers.wageDataConfirmed || isSubmitting}
                   onClick={() => void submitPolicyCalculation()}
                 >
-                  生成政策测算
+                  {isSubmitting ? "正在生成…" : "生成政策测算"}
                 </button>
               </section>
             )}
@@ -978,6 +1177,7 @@ export default function MainApp() {
                 user ? setAccountOpen(true) : setAuthOpen(true)
               }
               onRecalculate={restart}
+              sharedReadOnly={Boolean(sharedToken)}
             />
             <div ref={bottomRef} />
           </div>
@@ -985,7 +1185,14 @@ export default function MainApp() {
       </section>
 
       {regionPickerOpen && (
-        <div className="paywall-overlay region-picker-overlay" role="dialog" aria-label="选择工作地区" aria-modal="true">
+        <div
+          ref={regionDialogRef}
+          className="paywall-overlay region-picker-overlay"
+          role="dialog"
+          aria-label="选择工作地区"
+          aria-modal="true"
+          tabIndex={-1}
+        >
           <section className="account-modal region-picker">
             <button
               className="account-close"
@@ -999,6 +1206,7 @@ export default function MainApp() {
             <label className="account-field">
               <span>搜索省份或城市</span>
               <input
+                ref={regionSearchRef}
                 aria-label="搜索省份或城市"
                 value={regionSearch}
                 onChange={(event) => setRegionSearch(event.target.value)}

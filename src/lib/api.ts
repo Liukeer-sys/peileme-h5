@@ -3,7 +3,8 @@ import type {
   PolicyCalculateRequest,
   PolicyHistoryDetail,
   PolicyHistoryItem,
-  PolicyRegion
+  PolicyRegion,
+  PolicyShare
 } from "../types";
 
 const VISITOR_KEY = "peileme-visitor-id";
@@ -146,20 +147,23 @@ type PolicyApiWireResult = Omit<PolicyApiResult, "accuracyLevel"> & {
   accuracyLevel?: PolicyApiResult["accuracyLevel"];
 };
 
-export const listPolicyRegions = async (year: number) =>
+export const listPolicyRegions = async (year: number, signal?: AbortSignal) =>
   (
     await api<{ items: PolicyRegion[] }>(
-      `/api/policy/regions?year=${encodeURIComponent(String(year))}`
+      `/api/policy/regions?year=${encodeURIComponent(String(year))}`,
+      { signal }
     )
   ).items;
 
 export const calculatePolicy = async (
-  body: PolicyCalculateRequest
+  body: PolicyCalculateRequest,
+  signal?: AbortSignal
 ): Promise<PolicyApiResult> => {
   const response = await api<PolicyApiWireResult>("/api/policy/calculate", {
     method: "POST",
     auth: true,
-    body
+    body,
+    signal
   });
   return {
     ...response,
@@ -185,6 +189,42 @@ export const getPolicyHistory = (id: string) =>
     `/api/policy/history/${encodeURIComponent(id)}`,
     { auth: true }
   );
+
+export const createPolicyShare = (
+  assessmentId: string,
+  expiresInDays = 7
+) =>
+  api<PolicyShare>(
+    `/api/policy/history/${encodeURIComponent(assessmentId)}/share`,
+    {
+      method: "POST",
+      auth: true,
+      body: { expiresInDays }
+    }
+  );
+
+export const revokePolicyShare = (shareId: string) =>
+  api<void>(`/api/policy/shares/${encodeURIComponent(shareId)}`, {
+    method: "DELETE",
+    auth: true
+  });
+
+export const getSharedPolicyResult = async (
+  token: string
+): Promise<PolicyApiResult> => {
+  const response = await api<
+    Omit<PolicyApiWireResult, "assessmentId"> & {
+      shareId: string;
+      expiresAt: string;
+    }
+  >(`/api/policy/share/${encodeURIComponent(token)}`);
+  return {
+    ...response,
+    assessmentId: response.shareId,
+    accuracyLevel:
+      response.accuracyLevel || response.accuracy || "unsupported"
+  };
+};
 
 export async function downloadFromApi(path: string, fallbackName: string) {
   if (!accessToken) await refreshSession();

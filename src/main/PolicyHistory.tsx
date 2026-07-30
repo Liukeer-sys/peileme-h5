@@ -125,9 +125,27 @@ export default function PolicyHistory({
       ) : items.length ? (
         <div className="history-list">
           {items.map((item) => (
-            <article key={item.id}>
+            <article
+              key={item.id}
+              aria-label={`${item.regionName} ${
+                item.payableDetermined ? "测算金额" : "参考区间"
+              } ${
+                item.payableDetermined
+                  ? formatCny(item.payableFen)
+                  : `${formatCny(item.rangeFen.low)} 至 ${formatCny(
+                      item.rangeFen.high
+                    )}`
+              }`}
+            >
               <div>
-                <b>{item.regionName} · {formatCny(item.payableFen)}</b>
+                <b>
+                  {item.regionName} ·{" "}
+                  {item.payableDetermined
+                    ? formatCny(item.payableFen)
+                    : `参考区间 ${formatCny(item.rangeFen.low)} – ${formatCny(
+                        item.rangeFen.high
+                      )}`}
+                </b>
                 <span>
                   {scenarioName[item.scenario]} · 规则 v{item.ruleVersion} ·{" "}
                   {new Date(item.createdAt).toLocaleString("zh-CN")}

@@ -1,6 +1,6 @@
 ﻿import { rootTerminationReasonNode } from "./terminationReasonFlow";
 
-export type QuestionKind = "options" | "text" | "number" | "month";
+export type QuestionKind = "options" | "text" | "number" | "date";
 
 export type BaseQuestion = {
   id: string;
@@ -21,13 +21,13 @@ export const baseQuestions: BaseQuestion[] = [
   },
   {
     id: "startDate",
-    message: "那你是什么时候入职的？选个大概年月就行。",
-    kind: "month"
+    message: "你的完整入职日期是哪一天？请按劳动合同或入职记录填写。",
+    kind: "date"
   },
   {
     id: "endDate",
-    message: "公司通知你什么时候离职呢？选个大概年月就行。",
-    kind: "month"
+    message: "劳动关系实际解除或终止日期是哪一天？",
+    kind: "date"
   },
   {
     id: "workSchedule",
@@ -44,7 +44,7 @@ export const baseQuestions: BaseQuestion[] = [
   },
   {
     id: "avgMonthlySalary",
-    message: "你最近一年平均每月大概拿多少钱？",
+    message: "你的税前基础月工资大概是多少？后面还会逐月核对奖金、津贴和补贴。",
     kind: "number",
     placeholder: "例如 12000"
   },
@@ -84,8 +84,6 @@ export const loadingMessages = [
   "正在换算你的牛马等价物……",
   "正在生成你的离职身价报告……"
 ];
-
-
 
 
 

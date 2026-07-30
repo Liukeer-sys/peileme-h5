@@ -250,10 +250,29 @@ const assertScenario = (
     scenario.kind === "ARTICLE_38_EMPLOYEE_TERMINATION" ||
     scenario.kind === "STATUTORY_COMPENSATION" ||
     scenario.kind === "ARTICLE_39_NO_COMPENSATION" ||
-    scenario.kind === "VOLUNTARY_RESIGNATION" ||
-    scenario.kind === "UNCLEAR"
+    scenario.kind === "VOLUNTARY_RESIGNATION"
   ) {
     return { kind: scenario.kind };
+  }
+  if (
+    scenario.kind === "UNCLEAR" &&
+    (scenario.factGaps === undefined ||
+      (Array.isArray(scenario.factGaps) &&
+        scenario.factGaps.length >= 1 &&
+        scenario.factGaps.length <= 10 &&
+        scenario.factGaps.every(
+          (gap) =>
+            typeof gap === "string" &&
+            gap.trim().length >= 1 &&
+            gap.trim().length <= 200
+        )))
+  ) {
+    return {
+      kind: "UNCLEAR",
+      ...(scenario.factGaps
+        ? { factGaps: scenario.factGaps.map((gap) => gap.trim()) }
+        : {})
+    };
   }
   if (
     scenario.kind === "UNLAWFUL_TERMINATION" &&
@@ -319,6 +338,16 @@ const parsePolicyInput = (value: unknown): PolicyInput => {
       return wage;
     }
   );
+  if (
+    !isRecord(value.wageDataConfirmation) ||
+    value.wageDataConfirmation.confirmed !== true ||
+    value.wageDataConfirmation.basis !==
+      "pretax_earned_including_bonus_allowance"
+  ) {
+    fail("INVALID_WAGE_CONFIRMATION", {
+      field: "wageDataConfirmation"
+    });
+  }
 
   assertPositiveMoney(value.minimumMonthlyWageFen, {
     field: "minimumMonthlyWageFen"
@@ -344,6 +373,10 @@ const parsePolicyInput = (value: unknown): PolicyInput => {
     endDate: value.endDate,
     terminationScenario,
     monthlyEarnedWagesFen,
+    wageDataConfirmation: {
+      confirmed: true,
+      basis: "pretax_earned_including_bonus_allowance"
+    },
     minimumMonthlyWageFen: value.minimumMonthlyWageFen,
     employeeAverageMonthlyWageFen:
       value.employeeAverageMonthlyWageFen,
@@ -503,6 +536,12 @@ export const calculatePolicy = (value: unknown): PolicyOutput => {
       value: `[入职日,解除日)共${serviceMonths}个完整月、余${serviceRemainderDays}日，折算${compensationMonths}个月工资`
     },
     {
+      key: "wage-confirmation",
+      label: "工资口径确认",
+      value:
+        "用户已逐月确认：税前应发工资，包含奖金、津贴和补贴；工作不满12个月时按实际月数"
+    },
+    {
       key: "average",
       label: "解除前平均工资",
       value: `${input.monthlyEarnedWagesFen.length}个月应得工资按时间从早到晚求平均并四舍五入，为${rawAverageWageFen}分`
@@ -543,6 +582,15 @@ export const calculatePolicy = (value: unknown): PolicyOutput => {
     }
   ];
   if (reviewRequired) {
+    if (scenario.kind === "UNCLEAR" && scenario.factGaps?.length) {
+      formulaSteps.push({
+        key: "fact-gaps",
+        label: "待核验事实",
+        value: scenario.factGaps
+          .map((gap, index) => `${index + 1}. ${gap}`)
+          .join("；")
+      });
+    }
     formulaSteps.push({
       key: "payment",
       label: "待复核金额",

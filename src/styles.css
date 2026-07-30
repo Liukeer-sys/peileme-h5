@@ -2491,7 +2491,7 @@ button {
 
 .policy-input-review {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 5px 12px;
   padding: 13px 14px;
   border-radius: 16px;
@@ -2504,6 +2504,49 @@ button {
   grid-column: 1 / -1;
   color: #342d3a;
   font-size: 15px;
+}
+
+.policy-input-review label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.policy-input-review input {
+  width: 100%;
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid rgba(99, 83, 114, 0.18);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.82);
+  color: #342d3a;
+  font: inherit;
+}
+
+.policy-input-review > span {
+  grid-column: 1 / -1;
+}
+
+.shared-link-error {
+  display: grid;
+  place-content: center;
+  min-height: 420px;
+  padding: 32px;
+  text-align: center;
+}
+
+.shared-link-error h1 {
+  margin: 0 0 10px;
+  color: #342d3a;
+  font-size: 24px;
+}
+
+.shared-link-error p {
+  margin: 0;
+  color: #766c7c;
+  line-height: 1.65;
 }
 
 .wage-series-card {
@@ -2599,6 +2642,28 @@ button {
 .wage-month-grid input:focus {
   outline: 2px solid rgba(80, 143, 95, 0.18);
   border-color: rgba(80, 143, 95, 0.48);
+}
+
+.wage-confirmation-check {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+  margin-top: 11px;
+  padding: 10px 11px;
+  border: 1px solid rgba(78, 118, 88, 0.16);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.72);
+  color: #4e6254;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.wage-confirmation-check input {
+  width: 17px;
+  height: 17px;
+  margin: 1px 0 0;
+  accent-color: #4f875e;
 }
 
 .manual-parameter-card {
@@ -3846,8 +3911,6 @@ button {
   color: #5a5064;
   box-shadow: none;
 }
-
-
 
 
 

@@ -82,6 +82,10 @@ const calculationBody = (
     noticeMethod: "notice_30_days"
   },
   monthlyEarnedWagesFen: Array(12).fill(1_000_000),
+  wageDataConfirmation: {
+    confirmed: true,
+    basis: "pretax_earned_including_bonus_allowance"
+  },
   alreadyPaidFen: 100_000,
   clientResult: { payableFen: 1 },
   userId: "00000000-0000-0000-0000-000000000000",
@@ -106,6 +110,7 @@ beforeEach(async () => {
     TRUNCATE TABLE
       admin_audit_logs,
       uploads,
+      policy_result_shares,
       policy_calculation_snapshots,
       regional_parameters,
       administrative_regions,
@@ -975,7 +980,10 @@ describe("versioned policy public API", () => {
 
     expect(response.body.result.noticePayBasisFen).toBe(1_300_003);
     const snapshot = await query<{
-      input: { monthlyEarnedWagesFen: number[] };
+      input: {
+        monthlyEarnedWagesFen: number[];
+        wageDataConfirmation: Record<string, unknown>;
+      };
     }>(
       `SELECT input
          FROM policy_calculation_snapshots
@@ -985,6 +993,30 @@ describe("versioned policy public API", () => {
     expect(snapshot.rows[0].input.monthlyEarnedWagesFen).toEqual(
       monthlyEarnedWagesFen
     );
+    expect(snapshot.rows[0].input.wageDataConfirmation).toEqual({
+      confirmed: true,
+      basis: "pretax_earned_including_bonus_allowance"
+    });
+  });
+
+  it.each([
+    ["missing confirmation", undefined],
+    [
+      "unconfirmed wages",
+      {
+        confirmed: false,
+        basis: "pretax_earned_including_bonus_allowance"
+      }
+    ],
+    ["wrong basis", { confirmed: true, basis: "take_home_cash" }]
+  ])("rejects %s instead of issuing a precise result", async (_name, confirmation) => {
+    const response = await request(createApp())
+      .post("/api/policy/calculate")
+      .set(authHeader(userToken))
+      .send(calculationBody({ wageDataConfirmation: confirmation }))
+      .expect(400);
+
+    expect(response.body.error).toBe("VALIDATION_ERROR");
   });
 
   it.each([
@@ -1124,6 +1156,10 @@ describe("versioned policy public API", () => {
         noticeMethod: "notice_30_days"
       },
       monthlyEarnedWagesFen: Array(12).fill(1_000_000),
+      wageDataConfirmation: {
+        confirmed: true,
+        basis: "pretax_earned_including_bonus_allowance"
+      },
       clientResult: { payableFen: 1 },
       unknownFact: "ignored"
     };
@@ -1131,6 +1167,10 @@ describe("versioned policy public API", () => {
       unknownFact: "also ignored",
       alreadyPaidFen: 0,
       monthlyEarnedWagesFen: Array(12).fill(1_000_000),
+      wageDataConfirmation: {
+        basis: "pretax_earned_including_bonus_allowance",
+        confirmed: true
+      },
       terminationScenario: {
         noticeMethod: "notice_30_days",
         kind: "ARTICLE_40"
@@ -1611,6 +1651,86 @@ describe("versioned policy public API", () => {
     await request(createApp())
       .get(`/api/policy/history/${firstAssessmentId}`)
       .set(authHeader(otherUserToken))
+      .expect(404);
+  });
+
+  it("creates hashed expiring share tokens that owners can revoke", async () => {
+    const calculation = await request(createApp())
+      .post("/api/policy/calculate")
+      .set(authHeader(userToken))
+      .send(calculationBody())
+      .expect(201);
+
+    await request(createApp())
+      .post(`/api/policy/history/${calculation.body.assessmentId}/share`)
+      .set(authHeader(otherUserToken))
+      .send({ expiresInDays: 7 })
+      .expect(404);
+
+    const created = await request(createApp())
+      .post(`/api/policy/history/${calculation.body.assessmentId}/share`)
+      .set(authHeader(userToken))
+      .send({ expiresInDays: 7 })
+      .expect(201);
+    expect(created.body).toMatchObject({
+      shareId: expect.any(String),
+      token: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
+      expiresAt: expect.any(String)
+    });
+
+    const stored = await query<{
+      token_hash: string;
+      revoked_at: string | null;
+    }>(
+      "SELECT token_hash, revoked_at::text FROM policy_result_shares WHERE id = $1",
+      [created.body.shareId]
+    );
+    expect(stored.rows[0].token_hash).toMatch(/^[a-f0-9]{64}$/);
+    expect(stored.rows[0].token_hash).not.toContain(created.body.token);
+    expect(stored.rows[0].revoked_at).toBeNull();
+
+    const shared = await request(createApp())
+      .get(`/api/policy/share/${created.body.token}`)
+      .expect(200);
+    expect(shared.body).toMatchObject({
+      shareId: created.body.shareId,
+      expiresAt: created.body.expiresAt,
+      ruleVersion: calculation.body.ruleVersion,
+      accuracy: calculation.body.accuracy,
+      parameters: calculation.body.parameters,
+      result: calculation.body.result
+    });
+    expect(shared.body).not.toHaveProperty("userId");
+    expect(shared.body).not.toHaveProperty("input");
+    expect(shared.body).not.toHaveProperty("visitorId");
+    expect(shared.body).not.toHaveProperty("sessionId");
+
+    await request(createApp())
+      .delete(`/api/policy/shares/${created.body.shareId}`)
+      .set(authHeader(otherUserToken))
+      .expect(404);
+    await request(createApp())
+      .delete(`/api/policy/shares/${created.body.shareId}`)
+      .set(authHeader(userToken))
+      .expect(204);
+    await request(createApp())
+      .get(`/api/policy/share/${created.body.token}`)
+      .expect(404);
+
+    const expiring = await request(createApp())
+      .post(`/api/policy/history/${calculation.body.assessmentId}/share`)
+      .set(authHeader(userToken))
+      .send({ expiresInDays: 1 })
+      .expect(201);
+    await query(
+      `UPDATE policy_result_shares
+          SET created_at = now() - interval '2 days',
+              expires_at = now() - interval '1 second'
+        WHERE id = $1`,
+      [expiring.body.shareId]
+    );
+    await request(createApp())
+      .get(`/api/policy/share/${expiring.body.token}`)
       .expect(404);
   });
 });

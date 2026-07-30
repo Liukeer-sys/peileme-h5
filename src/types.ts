@@ -16,6 +16,7 @@
   bonusInfo?: string;
   bonusLevel?: string;
   monthlyEarnedWagesFen?: number[];
+  wageDataConfirmed?: boolean;
   terminationReason?: string;
   terminationReasonType?: string;
   terminationScenario?: TerminationScenario;
@@ -43,7 +44,7 @@ export type TerminationScenario =
       continuedPerformanceRequested: boolean;
       continuedPerformancePossible: boolean;
     }
-  | { kind: "UNCLEAR" };
+  | { kind: "UNCLEAR"; factGaps?: string[] };
 
 export type PolicyParameterAvailability = {
   minimumMonthlyWage: "exact" | "fallback" | "manual-needed";
@@ -115,12 +116,22 @@ export type PolicyApiResult = {
   result: PolicyOutput;
 };
 
+export type PolicyShare = {
+  shareId: string;
+  token: string;
+  expiresAt: string;
+};
+
 export type PolicyCalculateRequest = {
   regionCode: string;
   startDate: string;
   endDate: string;
   terminationScenario: TerminationScenario;
   monthlyEarnedWagesFen: number[];
+  wageDataConfirmation: {
+    confirmed: true;
+    basis: "pretax_earned_including_bonus_allowance";
+  };
   alreadyPaidFen?: number;
   manualParameters?: {
     minimumMonthlyWageFen?: number;
@@ -136,6 +147,7 @@ export type PolicyHistoryItem = {
   scenario: TerminationScenario["kind"];
   ruleVersion: number;
   accuracy: PolicyApiResult["accuracyLevel"];
+  payableDetermined: boolean;
   payableFen: number;
   rangeFen: { low: number; high: number };
   createdAt: string;
@@ -153,6 +165,10 @@ export type PolicyHistoryDetail = {
     endDate: string;
     terminationScenario: TerminationScenario;
     monthlyEarnedWagesFen: number[];
+    wageDataConfirmation: {
+      confirmed: true;
+      basis: "pretax_earned_including_bonus_allowance";
+    };
     minimumMonthlyWageFen: number;
     employeeAverageMonthlyWageFen: number;
     alreadyPaidFen: number;

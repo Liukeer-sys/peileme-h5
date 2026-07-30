@@ -4,7 +4,6 @@ import {
   terminationReasonFlow,
   type TerminationLeaf
 } from "../../src/data/terminationReasonFlow";
-import type { TerminationScenario } from "../../src/types";
 import {
   buildDefaultWageSeries,
   scenarioForLeaf
@@ -17,33 +16,55 @@ const leaves = [
   forcedOtherReasonLeaf
 ];
 
-const expectedScenarios: Record<string, TerminationScenario> = {
-  termination_company_disappears: { kind: "STATUTORY_COMPENSATION" },
+const expectedScenarios: Record<string, Record<string, unknown>> = {
+  termination_company_disappears: {
+    kind: "UNCLEAR",
+    factGaps: ["需核验单位破产、解散、被吊销或关闭的法定状态"]
+  },
   self_resign_normal: { kind: "VOLUNTARY_RESIGNATION" },
-  forced_bad_conditions: { kind: "ARTICLE_38_EMPLOYEE_TERMINATION" },
+  forced_bad_conditions: {
+    kind: "UNCLEAR",
+    factGaps: ["需核验单位违法事实、劳动者解除通知及对应证据"]
+  },
   forced_unpaid_or_underpaid_wage: {
-    kind: "ARTICLE_38_EMPLOYEE_TERMINATION"
+    kind: "UNCLEAR",
+    factGaps: ["需核验单位违法事实、劳动者解除通知及对应证据"]
   },
   forced_no_social_insurance: {
-    kind: "ARTICLE_38_EMPLOYEE_TERMINATION"
+    kind: "UNCLEAR",
+    factGaps: ["需核验单位违法事实、劳动者解除通知及对应证据"]
   },
-  forced_illegal_rules: { kind: "ARTICLE_38_EMPLOYEE_TERMINATION" },
-  forced_contract_trap: { kind: "ARTICLE_38_EMPLOYEE_TERMINATION" },
+  forced_illegal_rules: {
+    kind: "UNCLEAR",
+    factGaps: ["需核验单位违法事实、劳动者解除通知及对应证据"]
+  },
+  forced_contract_trap: {
+    kind: "UNCLEAR",
+    factGaps: ["需核验单位违法事实、劳动者解除通知及对应证据"]
+  },
   forced_violence_or_restriction: {
-    kind: "ARTICLE_38_EMPLOYEE_TERMINATION"
+    kind: "UNCLEAR",
+    factGaps: ["需核验单位违法事实、劳动者解除通知及对应证据"]
   },
-  forced_other_reason: { kind: "ARTICLE_38_EMPLOYEE_TERMINATION" },
-  fault_pot_basically_true: { kind: "ARTICLE_39_NO_COMPENSATION" },
-  fault_pot_uncertain_severity: { kind: "UNCLEAR" },
+  forced_other_reason: {
+    kind: "UNCLEAR",
+    factGaps: ["需核验单位违法事实、劳动者解除通知及对应证据"]
+  },
+  fault_pot_basically_true: {
+    kind: "UNCLEAR",
+    factGaps: ["需核验过错事实、严重程度、规章依据及单位解除程序"]
+  },
+  fault_pot_uncertain_severity: {
+    kind: "UNCLEAR",
+    factGaps: ["需核验过错事实、严重程度、规章依据及单位解除程序"]
+  },
   fault_not_true_or_exaggerated: {
-    kind: "UNLAWFUL_TERMINATION",
-    continuedPerformanceRequested: false,
-    continuedPerformancePossible: false
+    kind: "UNCLEAR",
+    factGaps: ["需核验过错事实、严重程度、规章依据及单位解除程序"]
   },
   nofault_not_listed_excuse: {
-    kind: "UNLAWFUL_TERMINATION",
-    continuedPerformanceRequested: false,
-    continuedPerformancePossible: false
+    kind: "UNCLEAR",
+    factGaps: ["需核验单位解除理由、事实依据及第四十条适用条件"]
   },
   nofault_medical_notice_yes: {
     kind: "ARTICLE_40",
@@ -69,11 +90,13 @@ const expectedScenarios: Record<string, TerminationScenario> = {
     kind: "ARTICLE_40",
     noticeMethod: "payment_in_lieu"
   },
-  layoff_notice_to_union_or_all_yes: { kind: "STATUTORY_COMPENSATION" },
+  layoff_notice_to_union_or_all_yes: {
+    kind: "UNCLEAR",
+    factGaps: ["需核验经济性裁员人数、法定事由、说明及报告程序"]
+  },
   layoff_notice_to_union_or_all_no: {
-    kind: "UNLAWFUL_TERMINATION",
-    continuedPerformanceRequested: false,
-    continuedPerformancePossible: false
+    kind: "UNCLEAR",
+    factGaps: ["需核验经济性裁员人数、法定事由、说明及报告程序"]
   },
   contract_expired_company_not_renew: {
     kind: "STATUTORY_COMPENSATION"
@@ -100,12 +123,16 @@ describe("scenarioForLeaf", () => {
     }
   );
 
-  it("uses UNCLEAR only for range or zero-versus-two-N leaves", () => {
-    const unclearModes = leaves
+  it("uses UNCLEAR for every leaf whose facts or procedure remain unverified", () => {
+    const unclearModes = new Set(
+      leaves
       .filter((leaf) => scenarioForLeaf(leaf).kind === "UNCLEAR")
-      .map((leaf) => leaf.resultMode);
+      .map((leaf) => leaf.resultMode)
+    );
 
-    expect(unclearModes).toEqual(["zeroOrTwoN"]);
+    expect(unclearModes).toEqual(
+      new Set(["n", "twoN", "zeroRisk", "zeroOrTwoN"])
+    );
   });
 
   it("rejects a future leaf until it is deliberately mapped", () => {
@@ -145,12 +172,9 @@ describe("buildDefaultWageSeries", () => {
     ).toHaveLength(12);
   });
 
-  it.each([
-    ["1个月工资左右", 1_000_000],
-    ["2个月工资左右", 2_000_000]
-  ])(
-    "adds the explicit %s annual bonus without losing a fen",
-    (bonusInfo, annualBonusFen) => {
+  it.each(["1个月工资左右", "2个月工资左右"])(
+    "never invents or allocates the approximate bonus option %s",
+    (bonusInfo) => {
       const result = buildDefaultWageSeries(
         1_000_000,
         bonusInfo,
@@ -159,17 +183,11 @@ describe("buildDefaultWageSeries", () => {
       );
 
       expect(result.monthlyEarnedWagesFen).toHaveLength(12);
-      expect(
-        result.monthlyEarnedWagesFen.reduce(
-          (sum, wage) => sum + wage,
-          0
-        )
-      ).toBe(12_000_000 + annualBonusFen);
-      expect(result.monthlyEarnedWagesFen).not.toEqual(
+      expect(result.monthlyEarnedWagesFen).toEqual(
         Array(12).fill(1_000_000)
       );
-      expect(result.bonusNeedsReview).toBe(false);
-      expect(result.explanation).toContain("均摊");
+      expect(result.bonusNeedsReview).toBe(true);
+      expect(result.explanation).toContain("不会自动计入");
     }
   );
 
@@ -192,7 +210,7 @@ describe("buildDefaultWageSeries", () => {
         Array(12).fill(1_000_000)
       );
       expect(result.bonusNeedsReview).toBe(true);
-      expect(result.explanation).toContain("未计入");
+      expect(result.explanation).toContain("不会自动计入");
     }
   );
 
@@ -204,6 +222,7 @@ describe("buildDefaultWageSeries", () => {
       "2026-07"
     );
 
+    expect(result.explanation).toContain("税前应发");
     expect(result.explanation).toContain("早到晚");
     expect(result.explanation).toContain("最后一项");
   });

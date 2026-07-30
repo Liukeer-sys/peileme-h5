@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useAuth, type GrantModule } from "../auth/AuthContext";
+import { useDialogFocus } from "../hooks/useDialogFocus";
 import { api, ApiError, downloadFromApi, track } from "../lib/api";
 import PolicyHistory from "../main/PolicyHistory";
 import type { PolicyHistoryDetail } from "../types";
@@ -36,6 +37,10 @@ export default function AccountPanel({
   const [uploads, setUploads] = useState<UploadItem[]>([]);
   const [displayName, setDisplayName] = useState("");
   const [busy, setBusy] = useState(false);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const displayNameRef = useRef<HTMLInputElement | null>(null);
+
+  useDialogFocus(open && Boolean(user), dialogRef, onClose, displayNameRef);
 
   useEffect(() => {
     if (!open || !user) return;
@@ -80,7 +85,14 @@ export default function AccountPanel({
   };
 
   return (
-    <div className="paywall-overlay account-overlay" role="dialog" aria-modal="true">
+    <div
+      ref={dialogRef}
+      className="paywall-overlay account-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="account-dialog-title"
+      tabIndex={-1}
+    >
       <section className="account-modal account-panel">
         <button className="account-close" type="button" onClick={onClose} aria-label="关闭">
           ×
@@ -88,7 +100,7 @@ export default function AccountPanel({
         <div className="profile-head">
           <div className="account-mark">{(user.displayName || user.email || user.phone || "赔").slice(0, 1)}</div>
           <div>
-            <h2>{user.displayName || "赔了么用户"}</h2>
+            <h2 id="account-dialog-title">{user.displayName || "赔了么用户"}</h2>
             <p>{user.email || user.phone}</p>
           </div>
         </div>
@@ -97,6 +109,7 @@ export default function AccountPanel({
           <strong>个人资料</strong>
           <div className="account-code-row">
             <input
+              ref={displayNameRef}
               value={displayName}
               maxLength={80}
               placeholder="设置你的称呼"

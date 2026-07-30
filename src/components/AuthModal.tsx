@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useAuth } from "../auth/AuthContext";
+import { useDialogFocus } from "../hooks/useDialogFocus";
 import { ApiError, track } from "../lib/api";
 
 type AuthModalProps = {
@@ -24,6 +25,10 @@ export default function AuthModal({
   const [countdown, setCountdown] = useState(0);
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const targetRef = useRef<HTMLInputElement | null>(null);
+
+  useDialogFocus(open, dialogRef, onClose, targetRef);
 
   useEffect(() => setMode(initialMode), [initialMode, open]);
   useEffect(() => {
@@ -103,13 +108,20 @@ export default function AuthModal({
   };
 
   return (
-    <div className="paywall-overlay account-overlay" role="dialog" aria-modal="true">
+    <div
+      ref={dialogRef}
+      className="paywall-overlay account-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="auth-dialog-title"
+      tabIndex={-1}
+    >
       <section className="account-modal">
         <button className="account-close" type="button" onClick={onClose} aria-label="关闭">
           ×
         </button>
         <div className="account-mark">赔</div>
-        <h2>{mode === "register" ? "建立你的赔了么档案" : mode === "reset" ? "重置登录密码" : "登录赔了么"}</h2>
+        <h2 id="auth-dialog-title">{mode === "register" ? "建立你的赔了么档案" : mode === "reset" ? "重置登录密码" : "登录赔了么"}</h2>
         <p>{mode === "reset" ? "验证邮箱或手机号后设置新密码。" : "保存历史测算、兑换邀请码，并安全管理你上传的材料。"}</p>
 
         {mode === "login" && (
@@ -134,6 +146,7 @@ export default function AuthModal({
         <label className="account-field">
           <span>邮箱 / 手机号</span>
           <input
+            ref={targetRef}
             value={target}
             autoComplete="username"
             placeholder="name@example.com 或 13800138000"

@@ -59,7 +59,12 @@ const terminationScenarioSchema = z.discriminatedUnion("kind", [
       continuedPerformancePossible: z.boolean()
     })
     .strict(),
-  z.object({ kind: z.literal("UNCLEAR") }).strict()
+  z
+    .object({
+      kind: z.literal("UNCLEAR"),
+      factGaps: z.array(z.string().trim().min(1).max(200)).min(1).max(10).optional()
+    })
+    .strict()
 ]);
 const calculateSchema = z.object({
   regionCode: z.string().regex(/^\d{6}$/),
@@ -67,6 +72,12 @@ const calculateSchema = z.object({
   endDate: isoDateSchema,
   terminationScenario: terminationScenarioSchema,
   monthlyEarnedWagesFen: z.array(safeMoneySchema).min(1).max(12),
+  wageDataConfirmation: z
+    .object({
+      confirmed: z.literal(true),
+      basis: z.literal("pretax_earned_including_bonus_allowance")
+    })
+    .strict(),
   alreadyPaidFen: safeMoneySchema.optional(),
   manualParameters: z
     .object({
@@ -87,6 +98,7 @@ const policyEngineMessage: Record<string, string> = {
   INVALID_TERMINATION_SCENARIO: "解除情形无效",
   WAGE_MONTHS_OUT_OF_RANGE: "工资月份数量无效",
   INVALID_WAGE_VALUE: "工资金额无效",
+  INVALID_WAGE_CONFIRMATION: "请确认税前应发工资口径",
   INVALID_REGIONAL_PARAMETER: "地区参数无效",
   INVALID_ALREADY_PAID: "已支付金额无效",
   COMPUTATION_OVERFLOW: "计算金额超出安全范围"
@@ -157,6 +169,41 @@ export const createPolicyRouter = (
         pagination.pageSize
       )
     );
+  });
+
+  router.get("/share/:token", async (request, response) => {
+    const token = z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{43}$/)
+      .parse(request.params.token);
+    response.json(await repository.getSharedResult(token));
+  });
+
+  router.post(
+    "/history/:id/share",
+    requireAuth,
+    async (request, response) => {
+      const assessmentId = z.string().uuid().parse(request.params.id);
+      const body = z
+        .object({
+          expiresInDays: z.number().int().min(1).max(30).default(7)
+        })
+        .strict()
+        .parse(request.body);
+      response.status(201).json(
+        await repository.createShare(
+          request.authUser!.id,
+          assessmentId,
+          body.expiresInDays
+        )
+      );
+    }
+  );
+
+  router.delete("/shares/:id", requireAuth, async (request, response) => {
+    const shareId = z.string().uuid().parse(request.params.id);
+    await repository.revokeShare(request.authUser!.id, shareId);
+    response.status(204).end();
   });
 
   router.get("/history/:id", requireAuth, async (request, response) => {
