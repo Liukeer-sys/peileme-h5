@@ -207,13 +207,22 @@ export class PolicyRepository {
       level: PolicyRegion["level"];
       parent_code: string | null;
     }>(
-      `SELECT code, name, level, parent_code
-         FROM administrative_regions
-        WHERE status = 'active'
-          AND ($1::text IS NULL OR level = $1)
+      `SELECT child.code, child.name, child.level, child.parent_code
+         FROM administrative_regions child
+         LEFT JOIN administrative_regions parent
+           ON parent.code = child.parent_code
+        WHERE child.status = 'active'
+          AND (
+            child.level = 'province' OR
+            (
+              parent.level = 'province' AND
+              parent.status = 'active'
+            )
+          )
+          AND ($1::text IS NULL OR child.level = $1)
         ORDER BY
-          CASE level WHEN 'province' THEN 0 ELSE 1 END,
-          code`,
+          CASE child.level WHEN 'province' THEN 0 ELSE 1 END,
+          child.code`,
       [level ?? null]
     );
     return result.rows.map((row) => ({
@@ -238,7 +247,7 @@ export class PolicyRepository {
     calculate: PolicyCalculator;
   }): Promise<CalculationResult> {
     return withTransaction(async (client) => {
-      const regionResult = await client.query<{
+      const discovery = await client.query<{
         code: string;
         name: string;
         level: PolicyRegion["level"];
@@ -246,13 +255,58 @@ export class PolicyRepository {
       }>(
         `SELECT code, name, level, parent_code
            FROM administrative_regions
-          WHERE code = $1
-            AND status = 'active'
-          FOR SHARE`,
+          WHERE code = $1`,
         [facts.regionCode]
       );
-      const region = regionResult.rows[0];
-      if (!region) {
+      const discoveredRegion = discovery.rows[0];
+      if (!discoveredRegion) {
+        throw new ApiError(
+          422,
+          "REGION_UNAVAILABLE",
+          "所选地区当前不可用于政策计算"
+        );
+      }
+      const hierarchyCodes = [
+        ...new Set(
+          [
+            discoveredRegion.code,
+            discoveredRegion.parent_code
+          ].filter((code): code is string => Boolean(code))
+        )
+      ].sort();
+      const lockedHierarchy = await client.query<{
+        code: string;
+        name: string;
+        level: PolicyRegion["level"];
+        parent_code: string | null;
+        status: "active" | "retired";
+      }>(
+        `SELECT code, name, level, parent_code, status
+           FROM administrative_regions
+          WHERE code = ANY($1::text[])
+          ORDER BY code
+          FOR SHARE`,
+        [hierarchyCodes]
+      );
+      const hierarchyByCode = new Map(
+        lockedHierarchy.rows.map((row) => [row.code, row])
+      );
+      const region = hierarchyByCode.get(discoveredRegion.code);
+      const parent = discoveredRegion.parent_code
+        ? hierarchyByCode.get(discoveredRegion.parent_code)
+        : undefined;
+      const hierarchyActive =
+        region?.status === "active" &&
+        (
+          region.level === "province" ||
+          (
+            region.level === "prefecture" &&
+            parent?.level === "province" &&
+            parent.status === "active" &&
+            region.parent_code === parent.code
+          )
+        );
+      if (!region || !hierarchyActive) {
         throw new ApiError(
           422,
           "REGION_UNAVAILABLE",
@@ -304,16 +358,13 @@ export class PolicyRepository {
           `SELECT rp.id, rp.region_code, rp.region_name, rp.year,
                   rp.parameter_type, rp.amount_fen::text, rp.status
              FROM regional_parameters rp
-             JOIN administrative_regions ar
-               ON ar.code = rp.region_code
-              AND ar.status = 'active'
             WHERE rp.region_code = $1
               AND rp.parameter_type = $2
               AND rp.year <= $3
               AND rp.status IN ('verified', 'stale')
             ORDER BY rp.year DESC
             LIMIT 1
-            FOR SHARE OF rp, ar`,
+            FOR SHARE OF rp`,
           [regionCode, parameterType, maximumYear]
         );
         return result.rows[0];
@@ -394,14 +445,16 @@ export class PolicyRepository {
       };
       const provenanceValues = Object.values(parameters);
       const accuracy = provenanceValues.some(
-        (item) => item.source === "manual"
+        (item) =>
+          item.source === "database" && item.status === "stale"
       )
-        ? "estimated"
+        ? "stale"
         : provenanceValues.some(
               (item) =>
-                item.source === "database" && item.status === "stale"
+                item.source === "manual" ||
+                (item.source === "database" && item.fallback)
             )
-          ? "stale"
+          ? "estimated"
           : "verified";
       const canonicalInput: PolicyInput = {
         regionCode: region.code,
@@ -412,9 +465,7 @@ export class PolicyRepository {
         monthlyEarnedWagesFen: facts.monthlyEarnedWagesFen,
         minimumMonthlyWageFen: minimumProvenance.amountFen,
         employeeAverageMonthlyWageFen: averageProvenance.amountFen,
-        ...(facts.alreadyPaidFen === undefined
-          ? {}
-          : { alreadyPaidFen: facts.alreadyPaidFen })
+        alreadyPaidFen: facts.alreadyPaidFen ?? 0
       };
       const output = calculate(canonicalInput);
       const parameterIds = provenanceValues.flatMap((item) =>
@@ -1170,6 +1221,10 @@ export class PolicyRepository {
                 ELSE 'manual-needed'
               END AS average_status
          FROM administrative_regions r
+         LEFT JOIN administrative_regions parent_region
+           ON parent_region.code = r.parent_code
+          AND parent_region.level = 'province'
+          AND parent_region.status = 'active'
          LEFT JOIN LATERAL (
            SELECT rp.id
              FROM regional_parameters rp
@@ -1184,7 +1239,7 @@ export class PolicyRepository {
            SELECT rp.id
              FROM regional_parameters rp
             WHERE r.level = 'prefecture'
-              AND rp.region_code = r.parent_code
+              AND rp.region_code = parent_region.code
               AND rp.parameter_type = 'minimum_monthly_wage'
               AND rp.year <= $1
               AND rp.status IN ('verified', 'stale')
@@ -1202,6 +1257,10 @@ export class PolicyRepository {
             LIMIT 1
          ) exact_avg ON true
         WHERE r.status = 'active'
+          AND (
+            r.level = 'province' OR
+            parent_region.code IS NOT NULL
+          )
         ORDER BY
           CASE r.level WHEN 'province' THEN 0 ELSE 1 END,
           r.code`,

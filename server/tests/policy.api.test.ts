@@ -10,7 +10,7 @@ import {
   it
 } from "vitest";
 import { createApp } from "../app.js";
-import { closePool, query } from "../db.js";
+import { closePool, getPool, query } from "../db.js";
 import { runMigrations } from "../migrate.js";
 import { seedPolicyFoundation } from "../modules/policy/seed.js";
 
@@ -32,6 +32,18 @@ const runImport = (script: string, csv: string) => {
 const authHeader = (token: string) => ({
   authorization: `Bearer ${token}`
 });
+
+const waitUntil = async (
+  predicate: () => Promise<boolean>,
+  timeoutMs = 3_000
+) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Condition was not met within ${timeoutMs}ms`);
+};
 
 const calculationBody = (
   overrides: Record<string, unknown> = {}
@@ -170,7 +182,7 @@ describe("versioned policy public API", () => {
     await request(app).get("/api/policy/history").expect(401);
   });
 
-  it("calculates from canonical DB facts and persists an atomic verified snapshot", async () => {
+  it("marks a verified parent fallback estimated and persists an atomic snapshot", async () => {
     const response = await request(createApp())
       .post("/api/policy/calculate")
       .set(authHeader(userToken))
@@ -181,7 +193,7 @@ describe("versioned policy public API", () => {
     firstOutput = response.body.result;
     expect(response.body).toMatchObject({
       ruleVersion: 1,
-      accuracy: "verified",
+      accuracy: "estimated",
       parameters: {
         minimumMonthlyWage: {
           source: "database",
@@ -234,7 +246,7 @@ describe("versioned policy public API", () => {
       assessment_id: firstAssessmentId,
       product_channel: "main",
       status: "completed",
-      accuracy_level: "verified",
+      accuracy_level: "estimated",
       version: 1
     });
     expect(stored.rows[0].input_snapshot.regionName).toBe("武汉市");
@@ -263,6 +275,64 @@ describe("versioned policy public API", () => {
       [repeated.body.assessmentId]
     );
     expect(repeatedHash.rows[0].input_hash).toBe(stored.rows[0].input_hash);
+  });
+
+  it("hashes engine-equivalent canonical inputs identically", async () => {
+    const omittedDefault = {
+      regionCode: "420100",
+      startDate: "2020-01-01",
+      endDate: "2026-07-01",
+      terminationScenario: {
+        kind: "ARTICLE_40",
+        noticeMethod: "notice_30_days"
+      },
+      monthlyEarnedWagesFen: Array(12).fill(1_000_000),
+      clientResult: { payableFen: 1 },
+      unknownFact: "ignored"
+    };
+    const explicitDefaultScrambled = {
+      unknownFact: "also ignored",
+      alreadyPaidFen: 0,
+      monthlyEarnedWagesFen: Array(12).fill(1_000_000),
+      terminationScenario: {
+        noticeMethod: "notice_30_days",
+        kind: "ARTICLE_40"
+      },
+      endDate: "2026-07-01",
+      startDate: "2020-01-01",
+      regionName: "客户端名称",
+      regionCode: "420100"
+    };
+    const calculateAndRead = async (body: Record<string, unknown>) => {
+      const response = await request(createApp())
+        .post("/api/policy/calculate")
+        .set(authHeader(userToken))
+        .send(body)
+        .expect(201);
+      const snapshot = await query<{
+        input_hash: string;
+        input: Record<string, unknown>;
+      }>(
+        `SELECT input_hash, input
+           FROM policy_calculation_snapshots
+          WHERE assessment_id = $1`,
+        [response.body.assessmentId]
+      );
+      return snapshot.rows[0];
+    };
+
+    const omitted = await calculateAndRead(omittedDefault);
+    const explicit = await calculateAndRead(explicitDefaultScrambled);
+    const changed = await calculateAndRead({
+      ...omittedDefault,
+      monthlyEarnedWagesFen: Array(12).fill(1_000_001)
+    });
+
+    expect(omitted.input.alreadyPaidFen).toBe(0);
+    expect(explicit.input.alreadyPaidFen).toBe(0);
+    expect(omitted.input).not.toHaveProperty("unknownFact");
+    expect(omitted.input_hash).toBe(explicit.input_hash);
+    expect(changed.input_hash).not.toBe(omitted.input_hash);
   });
 
   it("uses manual values only for missing parameters and marks accuracy estimated", async () => {
@@ -294,18 +364,28 @@ describe("versioned policy public API", () => {
   });
 
   it("marks stale DB provenance and requires absent values", async () => {
-    const inserted = await query<{ id: string }>(
+    const inserted = await query<{ id: string; region_code: string }>(
       `INSERT INTO regional_parameters(
          region_code, region_name, year, parameter_type, amount_fen,
          source_name, source_url, source_published_at, status
        )
-       VALUES (
-         '420100', '武汉市', 2026, 'minimum_monthly_wage', 250000,
-         '过期测试来源', 'https://example.test/stale', DATE '2026-01-01', 'stale'
-       )
-       RETURNING id`
+       VALUES
+         (
+           '420100', '武汉市', 2026, 'minimum_monthly_wage', 250000,
+           '过期测试来源', 'https://example.test/stale',
+           DATE '2026-01-01', 'stale'
+         ),
+         (
+           '130100', '石家庄市', 2026, 'minimum_monthly_wage', 230000,
+           '过期测试来源', 'https://example.test/stale-manual',
+           DATE '2026-01-01', 'stale'
+         )
+       RETURNING id, region_code`
     );
     try {
+      const wuhanStale = inserted.rows.find(
+        (row) => row.region_code === "420100"
+      )!;
       const stale = await request(createApp())
         .post("/api/policy/calculate")
         .set(authHeader(userToken))
@@ -313,15 +393,40 @@ describe("versioned policy public API", () => {
         .expect(201);
       expect(stale.body.accuracy).toBe("stale");
       expect(stale.body.parameters.minimumMonthlyWage).toMatchObject({
-        parameterId: inserted.rows[0].id,
+        parameterId: wuhanStale.id,
         status: "stale",
         regionCode: "420100",
         fallback: false
       });
+
+      const staleWithManual = await request(createApp())
+        .post("/api/policy/calculate")
+        .set(authHeader(userToken))
+        .send(
+          calculationBody({
+            regionCode: "130100",
+            manualParameters: {
+              employeeAverageMonthlyWageFen: 800000
+            }
+          })
+        )
+        .expect(201);
+      expect(staleWithManual.body.accuracy).toBe("stale");
+      expect(staleWithManual.body.parameters).toMatchObject({
+        minimumMonthlyWage: {
+          source: "database",
+          status: "stale",
+          fallback: false
+        },
+        employeeAverageMonthlyWage: {
+          source: "manual"
+        }
+      });
     } finally {
-      await query("DELETE FROM regional_parameters WHERE id = $1", [
-        inserted.rows[0].id
-      ]);
+      await query(
+        "DELETE FROM regional_parameters WHERE id = ANY($1::uuid[])",
+        [inserted.rows.map((row) => row.id)]
+      );
     }
 
     const missing = await request(createApp())
@@ -385,18 +490,120 @@ describe("versioned policy public API", () => {
       "UPDATE administrative_regions SET status = 'retired' WHERE code = '420000'"
     );
     try {
+      const regions = await request(createApp())
+        .get("/api/policy/regions?level=prefecture")
+        .expect(200);
+      expect(regions.body.items).not.toContainEqual(
+        expect.objectContaining({ code: "420100" })
+      );
+
+      const coverage = await request(createApp())
+        .get("/api/admin/policy/coverage?year=2026")
+        .set(authHeader(adminToken))
+        .expect(200);
+      expect(coverage.body.items).not.toContainEqual(
+        expect.objectContaining({ regionCode: "420100" })
+      );
+
       const inactiveParent = await request(createApp())
         .post("/api/policy/calculate")
         .set(authHeader(userToken))
         .send(calculationBody())
         .expect(422);
       expect(inactiveParent.body).toMatchObject({
-        error: "REGIONAL_PARAMETERS_REQUIRED",
-        detail: { missing: ["minimumMonthlyWageFen"] }
+        error: "REGION_UNAVAILABLE"
       });
     } finally {
       await query(
         "UPDATE administrative_regions SET status = 'active' WHERE code = '420000'"
+      );
+    }
+  });
+
+  it("locks child and parent in global order against concurrent retirement", async () => {
+    const retireClient = await getPool().connect();
+    const before = await query<{ count: string }>(
+      `SELECT count(*)::text AS count
+         FROM assessments a
+         JOIN users u ON u.id = a.user_id
+        WHERE u.email = 'policy-user@peileme.test'`
+    );
+    let retireError: unknown;
+    let transactionOpen = false;
+    try {
+      await retireClient.query("BEGIN");
+      transactionOpen = true;
+      await retireClient.query("SET LOCAL deadlock_timeout = '100ms'");
+      const backend = await retireClient.query<{ pid: number }>(
+        "SELECT pg_backend_pid() AS pid"
+      );
+      await retireClient.query(
+        `SELECT code
+           FROM administrative_regions
+          WHERE code = '420000'
+          FOR UPDATE`
+      );
+
+      const calculationPromise = request(createApp())
+        .post("/api/policy/calculate")
+        .set(authHeader(userToken))
+        .send(calculationBody())
+        .then((response) => response);
+      await waitUntil(async () => {
+        const waiting = await query<{ waiting: boolean }>(
+          `SELECT EXISTS (
+             SELECT 1
+               FROM pg_stat_activity
+              WHERE datname = current_database()
+                AND pid <> $1
+                AND wait_event_type = 'Lock'
+           ) AS waiting`,
+          [backend.rows[0].pid]
+        );
+        return waiting.rows[0].waiting;
+      });
+
+      try {
+        await retireClient.query(
+          `UPDATE administrative_regions
+              SET status = 'retired'
+            WHERE code = '420100'`
+        );
+        await retireClient.query(
+          `UPDATE administrative_regions
+              SET status = 'retired'
+            WHERE code = '420000'`
+        );
+        await retireClient.query("COMMIT");
+        transactionOpen = false;
+      } catch (error) {
+        retireError = error;
+        await retireClient.query("ROLLBACK");
+        transactionOpen = false;
+      }
+      const calculation = await calculationPromise;
+      expect((retireError as { code?: string } | undefined)?.code).not.toBe(
+        "40P01"
+      );
+      expect([201, 404, 422]).toContain(calculation.status);
+
+      const after = await query<{ count: string }>(
+        `SELECT count(*)::text AS count
+           FROM assessments a
+           JOIN users u ON u.id = a.user_id
+          WHERE u.email = 'policy-user@peileme.test'`
+      );
+      expect(Number(after.rows[0].count) - Number(before.rows[0].count)).toBe(
+        calculation.status === 201 ? 1 : 0
+      );
+    } finally {
+      if (transactionOpen) await retireClient.query("ROLLBACK");
+      retireClient.release();
+      await query(
+        `UPDATE administrative_regions
+            SET status = 'active'
+          WHERE code = ANY($1::text[])`,
+        [["420000", "420100"]]
       );
     }
   });
@@ -516,7 +723,7 @@ describe("versioned policy public API", () => {
     expect(detail.body).toMatchObject({
       id: firstAssessmentId,
       ruleVersion: 1,
-      accuracy: "verified",
+      accuracy: "estimated",
       output: firstOutput
     });
     expect(detail.body.input).not.toHaveProperty("clientResult");
@@ -674,6 +881,76 @@ describe("policy capability administration", () => {
       .post(`${path}/${futureDraft.id}/publish`)
       .set(authHeader(adminToken))
       .expect(200);
+
+    const managedBeforeSeed = await query<{
+      definition: unknown;
+      source_snapshot: unknown;
+    }>(
+      `SELECT definition, source_snapshot
+         FROM policy_rule_versions
+        WHERE id = $1`,
+      [futureDraft.id]
+    );
+    await seedPolicyFoundation();
+    await seedPolicyFoundation();
+    const seedState = await query<{
+      active_version_id: string | null;
+      current_version_id: string | null;
+      baseline_effective_to: string | null;
+      overlap_count: string;
+      managed_definition: unknown;
+      managed_source_snapshot: unknown;
+    }>(
+      `SELECT prs.active_version_id,
+              (
+                SELECT id
+                  FROM policy_rule_versions
+                 WHERE rule_set_id = prs.id
+                   AND status = 'published'
+                   AND effective_from <= current_date
+                   AND (
+                     effective_to IS NULL OR
+                     effective_to >= current_date
+                   )
+                 ORDER BY version DESC
+                 LIMIT 1
+              ) AS current_version_id,
+              (
+                SELECT effective_to::text
+                  FROM policy_rule_versions
+                 WHERE rule_set_id = prs.id
+                   AND version = 1
+              ) AS baseline_effective_to,
+              (
+                SELECT count(*)::text
+                  FROM policy_rule_versions left_version
+                  JOIN policy_rule_versions right_version
+                    ON right_version.rule_set_id = left_version.rule_set_id
+                   AND right_version.id > left_version.id
+                   AND right_version.status = 'published'
+                   AND left_version.status = 'published'
+                   AND right_version.effective_from <=
+                       coalesce(left_version.effective_to, DATE '9999-12-31')
+                   AND left_version.effective_from <=
+                       coalesce(right_version.effective_to, DATE '9999-12-31')
+                 WHERE left_version.rule_set_id = prs.id
+              ) AS overlap_count,
+              managed.definition AS managed_definition,
+              managed.source_snapshot AS managed_source_snapshot
+         FROM policy_rule_sets prs
+         JOIN policy_rule_versions managed ON managed.id = $1
+        WHERE prs.code = 'cn-severance'`,
+      [futureDraft.id]
+    );
+    expect(seedState.rows[0]).toMatchObject({
+      baseline_effective_to: "2029-12-31",
+      overlap_count: "0",
+      managed_definition: managedBeforeSeed.rows[0].definition,
+      managed_source_snapshot: managedBeforeSeed.rows[0].source_snapshot
+    });
+    expect(seedState.rows[0].active_version_id).toBe(
+      seedState.rows[0].current_version_id
+    );
 
     const current = await request(createApp())
       .post("/api/policy/calculate")
@@ -880,6 +1157,18 @@ describe("policy capability administration", () => {
     expect(persisted.rows[0].detail).toMatchObject({
       source: "武汉最低工资官方公告"
     });
+
+    const exactCalculation = await request(createApp())
+      .post("/api/policy/calculate")
+      .set(authHeader(userToken))
+      .send(calculationBody())
+      .expect(201);
+    expect(exactCalculation.body.accuracy).toBe("verified");
+    expect(exactCalculation.body.parameters.minimumMonthlyWage).toMatchObject({
+      source: "database",
+      fallback: false,
+      status: "verified"
+    });
   });
 
   it("reports active-region coverage with exact, fallback, and manual-needed status", async () => {
@@ -907,6 +1196,64 @@ describe("policy capability administration", () => {
     ).toMatchObject({
       minimumMonthlyWage: "fallback",
       employeeAverageMonthlyWage: "manual-needed"
+    });
+  });
+
+  it("recomputes the seed active pointer from the current effective interval", async () => {
+    const promoted = await query<{
+      id: string;
+      source_snapshot: unknown;
+    }>(
+      `SELECT prv.id, prv.source_snapshot
+         FROM policy_rule_versions prv
+         JOIN policy_rule_sets prs ON prs.id = prv.rule_set_id
+        WHERE prs.code = 'cn-severance'
+          AND prv.status = 'published'
+          AND prv.version > 1
+        ORDER BY prv.effective_from, prv.version
+        LIMIT 1`
+    );
+    const baseline = await query<{ id: string }>(
+      `SELECT prv.id
+         FROM policy_rule_versions prv
+         JOIN policy_rule_sets prs ON prs.id = prv.rule_set_id
+        WHERE prs.code = 'cn-severance'
+          AND prv.version = 1`
+    );
+    await query(
+      `UPDATE policy_rule_versions
+          SET effective_to = current_date - 1
+        WHERE id = $1`,
+      [baseline.rows[0].id]
+    );
+    await query(
+      `UPDATE policy_rule_versions
+          SET effective_from = current_date
+        WHERE id = $1`,
+      [promoted.rows[0].id]
+    );
+    await query(
+      `UPDATE policy_rule_sets
+          SET active_version_id = $1
+        WHERE code = 'cn-severance'`,
+      [baseline.rows[0].id]
+    );
+
+    await seedPolicyFoundation();
+    await seedPolicyFoundation();
+    const active = await query<{
+      active_version_id: string | null;
+      source_snapshot: unknown;
+    }>(
+      `SELECT prs.active_version_id, prv.source_snapshot
+         FROM policy_rule_sets prs
+         JOIN policy_rule_versions prv ON prv.id = $1
+        WHERE prs.code = 'cn-severance'`,
+      [promoted.rows[0].id]
+    );
+    expect(active.rows[0]).toEqual({
+      active_version_id: promoted.rows[0].id,
+      source_snapshot: promoted.rows[0].source_snapshot
     });
   });
 });

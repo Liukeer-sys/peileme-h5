@@ -192,8 +192,11 @@ export const seedPolicyFoundation = async () => {
     );
     let versionId = insertedVersion.rows[0]?.id;
     if (!versionId) {
-      const existingVersion = await client.query<{ id: string }>(
-        `SELECT id
+      const existingVersion = await client.query<{
+        id: string;
+        status: string;
+      }>(
+        `SELECT id, status
          FROM policy_rule_versions
          WHERE rule_set_id = $1 AND version = 1
          FOR UPDATE`,
@@ -203,42 +206,85 @@ export const seedPolicyFoundation = async () => {
       if (!versionId) {
         throw new Error("Policy rule version disappeared during seed");
       }
-      await client.query(
-        `UPDATE policy_rule_versions
-         SET status = 'published',
-             definition = $2::jsonb,
-             source_snapshot = $3::jsonb,
-             effective_from = $4::date,
-             effective_to = NULL,
-             published_at = CASE
-               WHEN status <> 'published' THEN now()
-               ELSE published_at
-             END,
-             updated_at = now()
-         WHERE id = $1
-           AND (
-             status IS DISTINCT FROM 'published' OR
-             definition IS DISTINCT FROM $2::jsonb OR
-             source_snapshot IS DISTINCT FROM $3::jsonb OR
-             effective_from IS DISTINCT FROM $4::date OR
-             effective_to IS NOT NULL
-           )`,
-        [
-          versionId,
-          definitionJson,
-          sourceSnapshotJson,
-          "2013-07-01"
-        ]
+      const nextPublished = await client.query<{
+        effective_from: string;
+      }>(
+        `SELECT effective_from::text
+           FROM policy_rule_versions
+          WHERE rule_set_id = $1
+            AND status = 'published'
+            AND version <> 1
+            AND effective_from > DATE '2013-07-01'
+          ORDER BY effective_from, version
+          LIMIT 1
+          FOR UPDATE`,
+        [ruleSetId]
       );
+      if (
+        existingVersion.rows[0].status === "published" &&
+        nextPublished.rows[0]
+      ) {
+        await client.query(
+          `UPDATE policy_rule_versions
+              SET effective_to = $2::date - 1,
+                  updated_at = now()
+            WHERE id = $1
+              AND effective_to IS DISTINCT FROM $2::date - 1`,
+          [versionId, nextPublished.rows[0].effective_from]
+        );
+      } else {
+        await client.query(
+          `UPDATE policy_rule_versions
+           SET status = 'published',
+               definition = $2::jsonb,
+               source_snapshot = $3::jsonb,
+               effective_from = $4::date,
+               effective_to = NULL,
+               published_at = CASE
+                 WHEN status <> 'published' THEN now()
+                 ELSE published_at
+               END,
+               updated_at = now()
+           WHERE id = $1
+             AND (
+               status IS DISTINCT FROM 'published' OR
+               definition IS DISTINCT FROM $2::jsonb OR
+               source_snapshot IS DISTINCT FROM $3::jsonb OR
+               effective_from IS DISTINCT FROM $4::date OR
+               effective_to IS NOT NULL
+             )`,
+          [
+            versionId,
+            definitionJson,
+            sourceSnapshotJson,
+            "2013-07-01"
+          ]
+        );
+      }
     }
 
+    const currentVersion = await client.query<{ id: string }>(
+      `SELECT id
+         FROM policy_rule_versions
+        WHERE rule_set_id = $1
+          AND status = 'published'
+          AND effective_from <= current_date
+          AND (
+            effective_to IS NULL OR
+            effective_to >= current_date
+          )
+        ORDER BY version DESC
+        LIMIT 1
+        FOR SHARE`,
+      [ruleSetId]
+    );
     await client.query(
       `UPDATE policy_rule_sets
        SET active_version_id = $2,
            updated_at = now()
        WHERE id = $1
          AND active_version_id IS DISTINCT FROM $2`,
-      [ruleSetId, versionId]
+      [ruleSetId, currentVersion.rows[0]?.id ?? null]
     );
 
     await client.query(
