@@ -5,6 +5,7 @@ import {
   type APIRequestContext,
   type Page
 } from "@playwright/test";
+import { createHash } from "node:crypto";
 import { Client } from "pg";
 
 const baseUrl = process.env.E2E_BASE_URL;
@@ -224,7 +225,15 @@ const createPolicyFixture = async (
     }
   });
   expect(response.status()).toBe(201);
-  return (await response.json()) as { assessmentId: string };
+  const result = (await response.json()) as {
+    assessmentId: string;
+    accuracy?: string;
+    [key: string]: unknown;
+  };
+  return {
+    ...result,
+    accuracyLevel: result.accuracy || "unsupported"
+  };
 };
 
 test.beforeAll(async () => {
@@ -1030,4 +1039,73 @@ test("结果分享可匿名查看且创建者撤销后立即失效", async ({
   await replacementContext.close();
   await anonymousContext.close();
   assertCleanRuntime();
+});
+
+test("撤销分享会清除历史遗留的全部有效链接", async ({ page }) => {
+  test.skip(
+    !e2eDatabaseUrl,
+    "E2E_DATABASE_URL is required for legacy share fixture"
+  );
+  const result = await createPolicyFixture();
+  const legacyTokens = ["first", "second"].map((suffix) =>
+    createHash("sha256")
+      .update(`${runId}:${result.assessmentId}:${suffix}`)
+      .digest("base64url")
+  );
+  const database = new Client({ connectionString: e2eDatabaseUrl });
+  await database.connect();
+  try {
+    const owner = await database.query<{ user_id: string }>(
+      "SELECT user_id FROM assessments WHERE id = $1",
+      [result.assessmentId]
+    );
+    await database.query(
+      `INSERT INTO policy_result_shares(
+         assessment_id, owner_user_id, token_hash, expires_at
+       )
+       VALUES
+         ($1, $2, $3, now() + interval '7 days'),
+         ($1, $2, $4, now() + interval '7 days')`,
+      [
+        result.assessmentId,
+        owner.rows[0].user_id,
+        createHash("sha256").update(legacyTokens[0]).digest("hex"),
+        createHash("sha256").update(legacyTokens[1]).digest("hex")
+      ]
+    );
+  } finally {
+    await database.end();
+  }
+
+  await loginAs(page, policyUser);
+  await page.evaluate((storedResult) => {
+    window.sessionStorage.setItem(
+      "peileme-latest-policy-result",
+      JSON.stringify(storedResult)
+    );
+  }, result);
+  await page.reload();
+  await expect(
+    page.getByRole("heading", { name: "政策测算结果", exact: true })
+  ).toBeVisible();
+  await expect(page.getByRole("status")).toContainText("已有有效分享");
+  await page.getByRole("button", { name: "撤销分享", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("分享已撤销");
+
+  for (const token of legacyTokens) {
+    const shared = await apiContext.get(
+      `/api/policy/share/${encodeURIComponent(token)}`
+    );
+    expect(shared.status()).toBe(404);
+  }
+  const listed = await apiContext.get(
+    `/api/policy/history/${result.assessmentId}/shares`,
+    { headers: { authorization: `Bearer ${userAccessToken}` } }
+  );
+  expect(listed.status()).toBe(200);
+  expect(
+    ((await listed.json()) as { items: Array<{ status: string }> }).items.filter(
+      (item) => item.status === "active"
+    )
+  ).toEqual([]);
 });

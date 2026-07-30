@@ -1791,6 +1791,114 @@ describe("versioned policy public API", () => {
       .get(`/api/policy/share/${expiring.body.token}`)
       .expect(404);
   });
+
+  it("serializes concurrent share replacement so only the final token remains active", async () => {
+    const calculation = await request(createApp())
+      .post("/api/policy/calculate")
+      .set(authHeader(userToken))
+      .send(calculationBody())
+      .expect(201);
+    const sharePath =
+      `/api/policy/history/${calculation.body.assessmentId}/share`;
+    const oldShare = await request(createApp())
+      .post(sharePath)
+      .set(authHeader(userToken))
+      .send({ expiresInDays: 7 })
+      .expect(201);
+
+    const competing = await Promise.all([
+      request(createApp())
+        .post(sharePath)
+        .set(authHeader(userToken))
+        .send({ expiresInDays: 7 }),
+      request(createApp())
+        .post(sharePath)
+        .set(authHeader(userToken))
+        .send({ expiresInDays: 7 })
+    ]);
+    expect(competing.map((response) => response.status)).toEqual([201, 201]);
+
+    const stored = await query<{
+      id: string;
+      revoked_at: string | null;
+    }>(
+      `SELECT id, revoked_at::text
+         FROM policy_result_shares
+        WHERE assessment_id = $1
+        ORDER BY created_at, id`,
+      [calculation.body.assessmentId]
+    );
+    const active = stored.rows.filter((row) => row.revoked_at === null);
+    expect(active).toHaveLength(1);
+    expect(
+      competing.some((response) => response.body.shareId === active[0].id)
+    ).toBe(true);
+
+    const candidates = [oldShare, ...competing];
+    for (const candidate of candidates) {
+      await request(createApp())
+        .get(`/api/policy/share/${candidate.body.token}`)
+        .expect(candidate.body.shareId === active[0].id ? 200 : 404);
+    }
+
+    const listed = await request(createApp())
+      .get(`/api/policy/history/${calculation.body.assessmentId}/shares`)
+      .set(authHeader(userToken))
+      .expect(200);
+    expect(
+      listed.body.items.filter(
+        (item: { status: string }) => item.status === "active"
+      )
+    ).toHaveLength(1);
+  });
+
+  it("revoking one share revokes every unrevoked legacy share for its assessment", async () => {
+    const calculation = await request(createApp())
+      .post("/api/policy/calculate")
+      .set(authHeader(userToken))
+      .send(calculationBody())
+      .expect(201);
+    const owner = await query<{ user_id: string }>(
+      "SELECT user_id FROM assessments WHERE id = $1",
+      [calculation.body.assessmentId]
+    );
+    const legacyTokens = ["L".repeat(43), "M".repeat(43)];
+    const inserted = await query<{ id: string }>(
+      `INSERT INTO policy_result_shares(
+         assessment_id, owner_user_id, token_hash, expires_at
+       )
+       VALUES
+         ($1, $2, $3, now() + interval '7 days'),
+         ($1, $2, $4, now() + interval '7 days')
+       RETURNING id`,
+      [
+        calculation.body.assessmentId,
+        owner.rows[0].user_id,
+        sha256(legacyTokens[0]),
+        sha256(legacyTokens[1])
+      ]
+    );
+
+    await request(createApp())
+      .delete(`/api/policy/shares/${inserted.rows[0].id}`)
+      .set(authHeader(userToken))
+      .expect(204);
+
+    for (const token of legacyTokens) {
+      await request(createApp())
+        .get(`/api/policy/share/${token}`)
+        .expect(404);
+    }
+    const listed = await request(createApp())
+      .get(`/api/policy/history/${calculation.body.assessmentId}/shares`)
+      .set(authHeader(userToken))
+      .expect(200);
+    expect(
+      listed.body.items.filter(
+        (item: { status: string }) => item.status !== "revoked"
+      )
+    ).toEqual([]);
+  });
 });
 
 describe("policy capability administration", () => {

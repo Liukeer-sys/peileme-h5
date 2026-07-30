@@ -732,32 +732,48 @@ export class PolicyRepository {
   ) {
     const token = crypto.randomBytes(32).toString("base64url");
     const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
-    const result = await query<{
-      id: string;
-      expires_at: string;
-    }>(
-      `INSERT INTO policy_result_shares(
-         assessment_id, owner_user_id, token_hash, expires_at
-       )
-       SELECT a.id, a.user_id, $3,
-              now() + ($4::integer * interval '1 day')
-         FROM assessments a
-         JOIN policy_calculation_snapshots pcs
-           ON pcs.assessment_id = a.id
-        WHERE a.id = $1
-          AND a.user_id = $2
-          AND a.product_channel = 'main'
-       RETURNING id, expires_at::text`,
-      [assessmentId, userId, tokenHash, expiresInDays]
-    );
-    const row = result.rows[0];
-    if (!row) {
-      throw new ApiError(
-        404,
-        "POLICY_HISTORY_NOT_FOUND",
-        "计算记录不存在"
+    const row = await withTransaction(async (client) => {
+      const owned = await client.query<{ id: string; user_id: string }>(
+        `SELECT a.id, a.user_id
+           FROM assessments a
+           JOIN policy_calculation_snapshots pcs
+             ON pcs.assessment_id = a.id
+          WHERE a.id = $1
+            AND a.user_id = $2
+            AND a.product_channel = 'main'
+          FOR UPDATE OF a`,
+        [assessmentId, userId]
       );
-    }
+      if (!owned.rows[0]) {
+        throw new ApiError(
+          404,
+          "POLICY_HISTORY_NOT_FOUND",
+          "计算记录不存在"
+        );
+      }
+      await client.query(
+        `UPDATE policy_result_shares
+            SET revoked_at = now()
+          WHERE assessment_id = $1
+            AND owner_user_id = $2
+            AND revoked_at IS NULL`,
+        [assessmentId, userId]
+      );
+      const inserted = await client.query<{
+        id: string;
+        expires_at: string;
+      }>(
+        `INSERT INTO policy_result_shares(
+           assessment_id, owner_user_id, token_hash, expires_at
+         )
+         VALUES (
+           $1, $2, $3, now() + ($4::integer * interval '1 day')
+         )
+         RETURNING id, expires_at::text`,
+        [assessmentId, userId, tokenHash, expiresInDays]
+      );
+      return inserted.rows[0];
+    });
     return {
       shareId: row.id,
       token,
@@ -810,21 +826,34 @@ export class PolicyRepository {
   }
 
   async revokeShare(userId: string, shareId: string) {
-    const result = await query<{ id: string }>(
-      `UPDATE policy_result_shares
-          SET revoked_at = coalesce(revoked_at, now())
-        WHERE id = $1
-          AND owner_user_id = $2
-       RETURNING id`,
-      [shareId, userId]
-    );
-    if (!result.rows[0]) {
-      throw new ApiError(
-        404,
-        "POLICY_SHARE_NOT_FOUND",
-        "分享链接不存在"
+    await withTransaction(async (client) => {
+      const target = await client.query<{ assessment_id: string }>(
+        `SELECT prs.assessment_id
+           FROM policy_result_shares prs
+           JOIN assessments a ON a.id = prs.assessment_id
+          WHERE prs.id = $1
+            AND prs.owner_user_id = $2
+            AND a.user_id = $2
+            AND a.product_channel = 'main'
+          FOR UPDATE OF a`,
+        [shareId, userId]
       );
-    }
+      if (!target.rows[0]) {
+        throw new ApiError(
+          404,
+          "POLICY_SHARE_NOT_FOUND",
+          "分享链接不存在"
+        );
+      }
+      await client.query(
+        `UPDATE policy_result_shares
+            SET revoked_at = now()
+          WHERE assessment_id = $1
+            AND owner_user_id = $2
+            AND revoked_at IS NULL`,
+        [target.rows[0].assessment_id, userId]
+      );
+    });
   }
 
   async getSharedResult(token: string) {
