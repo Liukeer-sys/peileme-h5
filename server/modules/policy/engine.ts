@@ -6,6 +6,11 @@ import type {
   TerminationScenario
 } from "./types.js";
 
+const PolicyDecimal = Decimal.clone({
+  precision: 40,
+  rounding: Decimal.ROUND_HALF_UP
+});
+
 type CalendarDate = {
   year: number;
   month: number;
@@ -106,7 +111,11 @@ const serviceDuration = (start: string, end: string) => {
 };
 
 const assertNonNegativeMoney = (value: number, error: string) => {
-  if (!Number.isSafeInteger(value) || value < 0) {
+  if (
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    Object.is(value, -0)
+  ) {
     throw new Error(error);
   }
 };
@@ -118,7 +127,7 @@ const assertPositiveMoney = (value: number) => {
 };
 
 const safeMoney = (value: Decimal.Value, error = "COMPUTATION_OVERFLOW") => {
-  const number = new Decimal(value).toNumber();
+  const number = new PolicyDecimal(value).toNumber();
   if (!Number.isSafeInteger(number) || number < 0) {
     throw new Error(error);
   }
@@ -129,15 +138,15 @@ const addMoney = (...values: number[]) =>
   safeMoney(
     values.reduce(
       (total, value) => total.plus(value),
-      new Decimal(0)
+      new PolicyDecimal(0)
     )
   );
 
 const multiplyMoney = (value: number, multiplier: Decimal.Value) =>
   safeMoney(
-    new Decimal(value)
+    new PolicyDecimal(value)
       .mul(multiplier)
-      .toDecimalPlaces(0, Decimal.ROUND_HALF_UP)
+      .toDecimalPlaces(0, PolicyDecimal.ROUND_HALF_UP)
   );
 
 const averageFen = (values: number[]) => {
@@ -149,10 +158,13 @@ const averageFen = (values: number[]) => {
   }
   const total = values.reduce(
     (sum, value) => sum.plus(value),
-    new Decimal(0)
+    new PolicyDecimal(0)
   );
+  const safeTotal = safeMoney(total);
   return safeMoney(
-    total.div(values.length).toDecimalPlaces(0, Decimal.ROUND_HALF_UP)
+    new PolicyDecimal(safeTotal)
+      .div(values.length)
+      .toDecimalPlaces(0, PolicyDecimal.ROUND_HALF_UP)
   );
 };
 
@@ -345,7 +357,9 @@ export const calculatePolicy = (input: PolicyInput): PolicyOutput => {
   }
 
   const differenceFen =
-    payableFen > alreadyPaidFen ? payableFen - alreadyPaidFen : 0;
+    payableFen > alreadyPaidFen
+      ? safeMoney(new PolicyDecimal(payableFen).minus(alreadyPaidFen))
+      : 0;
   const formulaSteps: FormulaStep[] = [
     {
       key: "service",

@@ -1,3 +1,4 @@
+import { Decimal } from "decimal.js";
 import { describe, expect, it } from "vitest";
 import { calculatePolicy } from "../modules/policy/engine.js";
 import type {
@@ -134,6 +135,29 @@ describe("calculatePolicy service time", () => {
 });
 
 describe("calculatePolicy wage basis", () => {
+  it("is unaffected by external Decimal global precision and rounding", () => {
+    const input = {
+      ...baseInput(),
+      startDate: "2024-06-30",
+      endDate: "2024-07-01",
+      monthlyEarnedWagesFen: [100, 101],
+      minimumMonthlyWageFen: 1,
+      employeeAverageMonthlyWageFen: 1_000
+    };
+    const expected = calculatePolicy(input);
+    const priorDecimalConfig = {
+      precision: Decimal.precision,
+      rounding: Decimal.rounding
+    };
+
+    try {
+      Decimal.set({ precision: 1, rounding: Decimal.ROUND_DOWN });
+      expect(calculatePolicy(input)).toEqual(expected);
+    } finally {
+      Decimal.set(priorDecimalConfig);
+    }
+  });
+
   it("uses 1 to 12 earned-wage months and rounds the Decimal average half-up", () => {
     const result = calculatePolicy({
       ...baseInput(),
@@ -224,6 +248,31 @@ describe("calculatePolicy wage basis", () => {
         employeeAverageMonthlyWageFen: largeSafeValue
       })
     ).toThrow("COMPUTATION_OVERFLOW");
+  });
+
+  it("rejects an earned-wage total that overflows before averaging", () => {
+    expect(() =>
+      calculatePolicy({
+        ...baseInput(),
+        monthlyEarnedWagesFen: [
+          Number.MAX_SAFE_INTEGER,
+          Number.MAX_SAFE_INTEGER
+        ]
+      })
+    ).toThrow("COMPUTATION_OVERFLOW");
+  });
+
+  it("rejects negative zero in the earned-wage series", () => {
+    expect(() =>
+      calculatePolicy({
+        ...baseInput(),
+        monthlyEarnedWagesFen: [-0],
+        terminationScenario: {
+          kind: "ARTICLE_40",
+          noticeMethod: "payment_in_lieu"
+        }
+      })
+    ).toThrow("INVALID_WAGE_VALUE");
   });
 });
 
@@ -416,6 +465,12 @@ describe("calculatePolicy payment reconciliation and explanations", () => {
   ])("rejects invalid alreadyPaidFen=%s", (alreadyPaidFen) => {
     expect(() =>
       calculatePolicy({ ...baseInput(), alreadyPaidFen })
+    ).toThrow("INVALID_ALREADY_PAID");
+  });
+
+  it("rejects negative zero already paid", () => {
+    expect(() =>
+      calculatePolicy({ ...baseInput(), alreadyPaidFen: -0 })
     ).toThrow("INVALID_ALREADY_PAID");
   });
 

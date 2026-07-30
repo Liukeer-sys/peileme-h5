@@ -668,7 +668,12 @@ instead of pre-collapsing them into a payout multiplier.
   `max(2N, N + prior-month wage)`. Employee-proposed mutual agreement returns a
   conservative `0..N` review range.
 - Every input and computed fen amount is a non-negative safe integer; regional
-  wage parameters are positive safe integers. Overflow is rejected.
+  wage parameters are positive safe integers. Negative zero and overflow are
+  rejected. The earned-wage total is checked before division, so an unsafe
+  intermediate total cannot be hidden by a safe average.
+- All arithmetic uses a module-private Decimal clone with precision 40 and
+  half-up rounding. External changes to Decimal's global precision or rounding
+  do not affect engine results.
 - Output also includes `serviceRemainderDays` and `noticePayBasisFen`.
   `formulaSteps` explains service, average wage, minimum adjustment,
   three-times cap, legal scenario, notice pay, paid amount, and difference in
@@ -867,6 +872,11 @@ guards, output additions, and Chinese explanations.
 import { Decimal } from "decimal.js";
 import type { PolicyInput, PolicyOutput } from "./types.js";
 
+const PolicyDecimal = Decimal.clone({
+  precision: 40,
+  rounding: Decimal.ROUND_HALF_UP
+});
+
 const monthsBetween = (start: string, end: string) => {
   const startDate = new Date(`${start}T00:00:00Z`);
   const endDate = new Date(`${end}T00:00:00Z`);
@@ -887,9 +897,17 @@ const averageFen = (values: number[]) => {
   if (values.some((value) => !Number.isSafeInteger(value) || value < 0)) {
     throw new Error("INVALID_WAGE_VALUE");
   }
-  return values.reduce((sum, value) => sum.plus(value), new Decimal(0))
+  const total = values.reduce(
+    (sum, value) => sum.plus(value),
+    new PolicyDecimal(0)
+  );
+  if (!total.isInteger() || total.isNegative() ||
+      total.greaterThan(Number.MAX_SAFE_INTEGER)) {
+    throw new Error("COMPUTATION_OVERFLOW");
+  }
+  return total
     .div(values.length)
-    .toDecimalPlaces(0, Decimal.ROUND_HALF_UP)
+    .toDecimalPlaces(0, PolicyDecimal.ROUND_HALF_UP)
     .toNumber();
 };
 
@@ -908,9 +926,9 @@ export const calculatePolicy = (input: PolicyInput): PolicyOutput => {
   const salaryBasisFen = salaryCapped ? highSalaryCapFen : minimumAdjusted;
   const uncappedYears = compensationYears(serviceMonths);
   const compensationMonths = salaryCapped ? Math.min(12, uncappedYears) : uncappedYears;
-  const nFen = new Decimal(salaryBasisFen)
+  const nFen = new PolicyDecimal(salaryBasisFen)
     .mul(compensationMonths)
-    .toDecimalPlaces(0, Decimal.ROUND_HALF_UP)
+    .toDecimalPlaces(0, PolicyDecimal.ROUND_HALF_UP)
     .toNumber();
   const twoNFen = nFen * 2;
   const scenario = input.terminationScenario;
@@ -988,7 +1006,7 @@ Run:
 npm test -- --run server/tests/policy.engine.test.ts
 ```
 
-Expected: all 52 Task 3 engine tests pass.
+Expected: all 56 Task 3 engine tests pass.
 
 - [ ] **Step 7: Commit**
 
