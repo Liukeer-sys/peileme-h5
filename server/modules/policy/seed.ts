@@ -30,19 +30,62 @@ const severanceSourceSnapshot = [
 
 export const seedPolicyFoundation = async () => {
   await withTransaction(async (client) => {
-    const ruleSetResult = await client.query<{ id: string }>(
+    const desiredRuleSet = {
+      code: "cn-severance",
+      name: "中国大陆离职经济补偿规则",
+      productChannel: "main"
+    };
+    const insertedRuleSet = await client.query<{ id: string }>(
       `INSERT INTO policy_rule_sets(code, name, product_channel)
        VALUES ($1, $2, $3)
-       ON CONFLICT (code) DO UPDATE
-       SET name = EXCLUDED.name,
-           product_channel = EXCLUDED.product_channel,
-           updated_at = now()
+       ON CONFLICT (code) DO NOTHING
        RETURNING id`,
-      ["cn-severance", "中国大陆离职经济补偿规则", "main"]
+      [
+        desiredRuleSet.code,
+        desiredRuleSet.name,
+        desiredRuleSet.productChannel
+      ]
     );
-    const ruleSetId = ruleSetResult.rows[0].id;
+    let ruleSetId = insertedRuleSet.rows[0]?.id;
+    if (!ruleSetId) {
+      const existingRuleSet = await client.query<{
+        id: string;
+        name: string;
+        product_channel: string;
+      }>(
+        `SELECT id, name, product_channel
+         FROM policy_rule_sets
+         WHERE code = $1
+         FOR UPDATE`,
+        [desiredRuleSet.code]
+      );
+      const existing = existingRuleSet.rows[0];
+      if (!existing) {
+        throw new Error("Policy rule set disappeared during seed");
+      }
+      ruleSetId = existing.id;
+      if (
+        existing.name !== desiredRuleSet.name ||
+        existing.product_channel !== desiredRuleSet.productChannel
+      ) {
+        await client.query(
+          `UPDATE policy_rule_sets
+           SET name = $2,
+               product_channel = $3,
+               updated_at = now()
+           WHERE id = $1`,
+          [
+            ruleSetId,
+            desiredRuleSet.name,
+            desiredRuleSet.productChannel
+          ]
+        );
+      }
+    }
 
-    const versionResult = await client.query<{ id: string }>(
+    const definitionJson = JSON.stringify(severanceDefinition);
+    const sourceSnapshotJson = JSON.stringify(severanceSourceSnapshot);
+    const insertedVersion = await client.query<{ id: string }>(
       `INSERT INTO policy_rule_versions(
          rule_set_id,
          version,
@@ -53,27 +96,64 @@ export const seedPolicyFoundation = async () => {
          published_at
        )
        VALUES ($1, 1, 'published', $2::jsonb, $3::jsonb, $4::date, now())
-       ON CONFLICT (rule_set_id, version) DO UPDATE
-       SET status = EXCLUDED.status,
-           definition = EXCLUDED.definition,
-           source_snapshot = EXCLUDED.source_snapshot,
-           effective_from = EXCLUDED.effective_from,
-           effective_to = NULL
+       ON CONFLICT (rule_set_id, version) DO NOTHING
        RETURNING id`,
       [
         ruleSetId,
-        JSON.stringify(severanceDefinition),
-        JSON.stringify(severanceSourceSnapshot),
+        definitionJson,
+        sourceSnapshotJson,
         "2013-07-01"
       ]
     );
+    let versionId = insertedVersion.rows[0]?.id;
+    if (!versionId) {
+      const existingVersion = await client.query<{ id: string }>(
+        `SELECT id
+         FROM policy_rule_versions
+         WHERE rule_set_id = $1 AND version = 1
+         FOR UPDATE`,
+        [ruleSetId]
+      );
+      versionId = existingVersion.rows[0]?.id;
+      if (!versionId) {
+        throw new Error("Policy rule version disappeared during seed");
+      }
+      await client.query(
+        `UPDATE policy_rule_versions
+         SET status = 'published',
+             definition = $2::jsonb,
+             source_snapshot = $3::jsonb,
+             effective_from = $4::date,
+             effective_to = NULL,
+             published_at = CASE
+               WHEN status <> 'published' THEN now()
+               ELSE published_at
+             END,
+             updated_at = now()
+         WHERE id = $1
+           AND (
+             status IS DISTINCT FROM 'published' OR
+             definition IS DISTINCT FROM $2::jsonb OR
+             source_snapshot IS DISTINCT FROM $3::jsonb OR
+             effective_from IS DISTINCT FROM $4::date OR
+             effective_to IS NOT NULL
+           )`,
+        [
+          versionId,
+          definitionJson,
+          sourceSnapshotJson,
+          "2013-07-01"
+        ]
+      );
+    }
 
     await client.query(
       `UPDATE policy_rule_sets
        SET active_version_id = $2,
            updated_at = now()
-       WHERE id = $1`,
-      [ruleSetId, versionResult.rows[0].id]
+       WHERE id = $1
+         AND active_version_id IS DISTINCT FROM $2`,
+      [ruleSetId, versionId]
     );
 
     await client.query(

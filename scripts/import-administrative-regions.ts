@@ -110,16 +110,47 @@ export const importAdministrativeRegions = async (csvPath: string) => {
           .map((row) => row.parentCode as string)
       )
     ];
-    const existingParents = parentCodes.length
-      ? await client.query<{ code: string; level: string; status: string }>(
-          `SELECT code, level, status
+    const lockCodes = [
+      ...new Set([...rows.map((row) => row.code), ...parentCodes])
+    ].sort();
+    const lockedRegions = lockCodes.length
+      ? await client.query<{
+          code: string;
+          name: string;
+          level: string;
+          parent_code: string | null;
+          status: string;
+        }>(
+          `SELECT code, name, level, parent_code, status
            FROM administrative_regions
-           WHERE code = ANY($1::text[])`,
-          [parentCodes]
+           WHERE code = ANY($1::text[])
+           ORDER BY code
+           FOR UPDATE`,
+          [lockCodes]
         )
       : { rows: [] };
+    const existingRegions = new Map(
+      lockedRegions.rows.map((row) => [row.code, row])
+    );
+    for (const row of rows) {
+      const existing = existingRegions.get(row.code);
+      if (
+        existing &&
+        (
+          existing.name !== row.name ||
+          existing.level !== row.level ||
+          existing.parent_code !== row.parentCode
+        )
+      ) {
+        throw new Error(
+          `Administrative identity mismatch for ${row.code}; ` +
+            "name, level and parent_code are immutable"
+        );
+      }
+    }
+
     const parentState = new Map(
-      existingParents.rows.map((row) => [
+      lockedRegions.rows.map((row) => [
         row.code,
         { level: row.level, status: row.status }
       ])
@@ -143,22 +174,24 @@ export const importAdministrativeRegions = async (csvPath: string) => {
       }
     }
 
-    for (const row of rows.filter((item) => item.level === "province")) {
-      await client.query(
+    const upsertRegion = async (row: AdministrativeRegionRow) => {
+      const result = await client.query(
         `INSERT INTO administrative_regions(
            code, name, level, parent_code, status,
            source_name, source_url, source_snapshot_date
          )
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8::date)
          ON CONFLICT (code) DO UPDATE
-         SET name = EXCLUDED.name,
-             level = EXCLUDED.level,
-             parent_code = EXCLUDED.parent_code,
-             status = EXCLUDED.status,
+         SET status = EXCLUDED.status,
              source_name = EXCLUDED.source_name,
              source_url = EXCLUDED.source_url,
              source_snapshot_date = EXCLUDED.source_snapshot_date,
-             updated_at = now()`,
+             updated_at = now()
+         WHERE administrative_regions.name = EXCLUDED.name
+           AND administrative_regions.level = EXCLUDED.level
+           AND administrative_regions.parent_code
+             IS NOT DISTINCT FROM EXCLUDED.parent_code
+         RETURNING code`,
         [
           row.code,
           row.name,
@@ -170,34 +203,18 @@ export const importAdministrativeRegions = async (csvPath: string) => {
           row.sourceSnapshotDate
         ]
       );
+      if (result.rowCount !== 1) {
+        throw new Error(
+          `Administrative identity conflict for ${row.code}; import rolled back`
+        );
+      }
+    };
+
+    for (const row of rows.filter((item) => item.level === "province")) {
+      await upsertRegion(row);
     }
     for (const row of rows.filter((item) => item.level === "prefecture")) {
-      await client.query(
-        `INSERT INTO administrative_regions(
-           code, name, level, parent_code, status,
-           source_name, source_url, source_snapshot_date
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::date)
-         ON CONFLICT (code) DO UPDATE
-         SET name = EXCLUDED.name,
-             level = EXCLUDED.level,
-             parent_code = EXCLUDED.parent_code,
-             status = EXCLUDED.status,
-             source_name = EXCLUDED.source_name,
-             source_url = EXCLUDED.source_url,
-             source_snapshot_date = EXCLUDED.source_snapshot_date,
-             updated_at = now()`,
-        [
-          row.code,
-          row.name,
-          row.level,
-          row.parentCode,
-          row.status,
-          row.sourceName,
-          row.sourceUrl,
-          row.sourceSnapshotDate
-        ]
-      );
+      await upsertRegion(row);
     }
   });
   return rows.length;

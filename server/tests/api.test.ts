@@ -246,7 +246,11 @@ describe("policy persistence foundation", () => {
       value.includes("assessments:FOREIGN KEY:FOREIGN KEY (rule_version_id)")
     )).toBe(true);
     expect(definitions.some((value) =>
-      value.includes("policy_rule_sets:FOREIGN KEY:FOREIGN KEY (active_version_id)")
+      value.includes(
+        "policy_rule_sets:FOREIGN KEY:FOREIGN KEY (id, active_version_id) " +
+          "REFERENCES policy_rule_versions(rule_set_id, id) " +
+          "ON DELETE SET NULL (active_version_id)"
+      )
     )).toBe(true);
     expect(definitions.some((value) =>
       value.includes("regional_parameters:FOREIGN KEY:FOREIGN KEY (region_code)")
@@ -260,6 +264,66 @@ describe("policy persistence foundation", () => {
     expect(definitions.some((value) =>
       value.includes("policy_rule_versions:CHECK:CHECK ((version > 0))")
     )).toBe(true);
+  });
+
+  it("keeps an active version inside its owning rule set", async () => {
+    const ruleSets = await query<{ id: string; code: string }>(
+      `INSERT INTO policy_rule_sets(code, name, product_channel)
+       VALUES
+         ('cross-fk-a', '复合外键测试 A', 'main'),
+         ('cross-fk-b', '复合外键测试 B', 'main')
+       RETURNING id, code`
+    );
+    const ruleSetA = ruleSets.rows.find((row) => row.code === "cross-fk-a")!;
+    const ruleSetB = ruleSets.rows.find((row) => row.code === "cross-fk-b")!;
+    const versions = await query<{ id: string; rule_set_id: string }>(
+      `INSERT INTO policy_rule_versions(
+         rule_set_id, version, status, definition, effective_from, published_at
+       )
+       VALUES
+         ($1, 1, 'published', '{}'::jsonb, DATE '2026-01-01', now()),
+         ($2, 1, 'published', '{}'::jsonb, DATE '2026-01-01', now())
+       RETURNING id, rule_set_id`,
+      [ruleSetA.id, ruleSetB.id]
+    );
+    const versionA = versions.rows.find(
+      (row) => row.rule_set_id === ruleSetA.id
+    )!;
+    const versionB = versions.rows.find(
+      (row) => row.rule_set_id === ruleSetB.id
+    )!;
+
+    let crossRuleSetRejected = false;
+    let pointerAfterDelete: string | null = "not-queried";
+    try {
+      try {
+        await query(
+          "UPDATE policy_rule_sets SET active_version_id = $2 WHERE id = $1",
+          [ruleSetA.id, versionB.id]
+        );
+      } catch {
+        crossRuleSetRejected = true;
+      }
+
+      await query(
+        "UPDATE policy_rule_sets SET active_version_id = $2 WHERE id = $1",
+        [ruleSetA.id, versionA.id]
+      );
+      await query("DELETE FROM policy_rule_versions WHERE id = $1", [versionA.id]);
+      const afterDelete = await query<{ active_version_id: string | null }>(
+        "SELECT active_version_id FROM policy_rule_sets WHERE id = $1",
+        [ruleSetA.id]
+      );
+      pointerAfterDelete = afterDelete.rows[0].active_version_id;
+    } finally {
+      await query(
+        "DELETE FROM policy_rule_sets WHERE id = ANY($1::uuid[])",
+        [[ruleSetA.id, ruleSetB.id]]
+      );
+    }
+
+    expect(crossRuleSetRejected).toBe(true);
+    expect(pointerAfterDelete).toBeNull();
   });
 
   it("seeds the published severance baseline idempotently", async () => {
@@ -354,6 +418,60 @@ describe("policy persistence foundation", () => {
     ]);
   });
 
+  it("keeps all baseline timestamps stable when seed data is unchanged", async () => {
+    await seed();
+    const readTimestamps = () =>
+      query<{
+        rule_set_created_at: string;
+        rule_set_updated_at: string;
+        version_created_at: string;
+        version_updated_at: string;
+        published_at: string;
+      }>(
+        `SELECT
+           prs.created_at::text AS rule_set_created_at,
+           prs.updated_at::text AS rule_set_updated_at,
+           prv.created_at::text AS version_created_at,
+           prv.updated_at::text AS version_updated_at,
+           prv.published_at::text AS published_at
+         FROM policy_rule_sets prs
+         JOIN policy_rule_versions prv ON prv.rule_set_id = prs.id
+         WHERE prs.code = 'cn-severance' AND prv.version = 1`
+      );
+    const before = await readTimestamps();
+    await seed();
+    const after = await readTimestamps();
+    expect(after.rows).toEqual(before.rows);
+  });
+
+  it("updates the version timestamp only when baseline content changes", async () => {
+    const changed = await query<{ updated_at: string }>(
+      `UPDATE policy_rule_versions
+       SET definition = '{}'::jsonb
+       WHERE rule_set_id = (
+         SELECT id FROM policy_rule_sets WHERE code = 'cn-severance'
+       )
+         AND version = 1
+       RETURNING updated_at::text`
+    );
+    await seed();
+    const restored = await query<{
+      definition: Record<string, unknown>;
+      updated_at: string;
+    }>(
+      `SELECT definition, updated_at::text
+       FROM policy_rule_versions
+       WHERE rule_set_id = (
+         SELECT id FROM policy_rule_sets WHERE code = 'cn-severance'
+       )
+         AND version = 1`
+    );
+    expect(restored.rows[0].definition).toMatchObject({ schemaVersion: 1 });
+    expect(
+      Date.parse(restored.rows[0].updated_at)
+    ).toBeGreaterThan(Date.parse(changed.rows[0].updated_at));
+  });
+
   it("imports the official administrative-region snapshot idempotently", async () => {
     const csvPath = path.resolve("database/seeds/administrative-regions.csv");
     const first = runImport("scripts/import-administrative-regions.ts", csvPath);
@@ -428,6 +546,130 @@ describe("policy persistence foundation", () => {
     expect(lines).toHaveLength(365);
   });
 
+  it("rejects administrative identity changes and rolls back the batch", async () => {
+    const canonicalPath = path.resolve(
+      "database/seeds/administrative-regions.csv"
+    );
+    const tempDir = await mkdtemp(path.join(tmpdir(), "peileme-region-identity-"));
+    const header =
+      "code,name,level,parent_code,status,source_name,source_url,source_snapshot_date\n";
+    const official =
+      "民政部,https://www.mca.gov.cn/mzsj/xzqh/2025/202401xzqh.html,2024-12-31\n";
+    const mutablePrefix =
+      "120000,天津市,province,,active,篡改来源," +
+      "https://www.mca.gov.cn/example,2026-01-01\n";
+    const renamePath = path.join(tempDir, "rename.csv");
+    const reparentPath = path.join(tempDir, "reparent.csv");
+    await writeFile(
+      renamePath,
+      header +
+        mutablePrefix +
+        `110000,篡改北京市,province,,active,${official}`,
+      "utf8"
+    );
+    await writeFile(
+      reparentPath,
+      header +
+        mutablePrefix +
+        `130100,石家庄市,prefecture,139000,active,${official}`,
+      "utf8"
+    );
+    await query(
+      `INSERT INTO administrative_regions(
+         code, name, level, status, source_name, source_url, source_snapshot_date
+       )
+       VALUES (
+         '139000', '并发身份测试省', 'province', 'active', '测试',
+         'https://www.mca.gov.cn/example', DATE '2024-12-31'
+       )`
+    );
+
+    let renameResult: ReturnType<typeof runImport>;
+    let reparentResult: ReturnType<typeof runImport>;
+    let afterRename: Array<{
+      code: string;
+      name: string;
+      parent_code: string | null;
+      source_name: string;
+    }> = [];
+    let afterReparent: typeof afterRename = [];
+    try {
+      renameResult = runImport(
+        "scripts/import-administrative-regions.ts",
+        renamePath
+      );
+      afterRename = (
+        await query<{
+          code: string;
+          name: string;
+          parent_code: string | null;
+          source_name: string;
+        }>(
+          `SELECT code, name, parent_code, source_name
+           FROM administrative_regions
+           WHERE code = ANY($1::text[])
+           ORDER BY code`,
+          [["110000", "120000"]]
+        )
+      ).rows;
+      runImport("scripts/import-administrative-regions.ts", canonicalPath);
+
+      reparentResult = runImport(
+        "scripts/import-administrative-regions.ts",
+        reparentPath
+      );
+      afterReparent = (
+        await query<{
+          code: string;
+          name: string;
+          parent_code: string | null;
+          source_name: string;
+        }>(
+          `SELECT code, name, parent_code, source_name
+           FROM administrative_regions
+           WHERE code = ANY($1::text[])
+           ORDER BY code`,
+          [["120000", "130100"]]
+        )
+      ).rows;
+    } finally {
+      runImport("scripts/import-administrative-regions.ts", canonicalPath);
+      await query("DELETE FROM administrative_regions WHERE code = '139000'");
+      await rm(tempDir, { recursive: true, force: true });
+    }
+
+    expect(renameResult!.status, renameResult!.stderr).not.toBe(0);
+    expect(reparentResult!.status, reparentResult!.stderr).not.toBe(0);
+    expect(afterRename).toEqual([
+      {
+        code: "110000",
+        name: "北京市",
+        parent_code: null,
+        source_name: "中华人民共和国民政部"
+      },
+      {
+        code: "120000",
+        name: "天津市",
+        parent_code: null,
+        source_name: "中华人民共和国民政部"
+      }
+    ]);
+    expect(afterReparent).toEqual([
+      {
+        code: "120000",
+        name: "天津市",
+        parent_code: null,
+        source_name: "中华人民共和国民政部"
+      },
+      {
+        code: "130100",
+        name: "石家庄市",
+        parent_code: "130000",
+        source_name: "中华人民共和国民政部"
+      }
+    ]);
+  });
+
   it("rejects invalid administrative-region batches without partial writes", async () => {
     const tempDir = await mkdtemp(path.join(tmpdir(), "peileme-region-import-"));
     const header =
@@ -493,7 +735,7 @@ describe("policy persistence foundation", () => {
     );
     expect(coverage.rows[0]).toEqual({
       minimum_count: "31",
-      average_count: "2",
+      average_count: "1",
       invalid_amount_count: "0"
     });
 
@@ -512,7 +754,7 @@ describe("policy persistence foundation", () => {
        FROM regional_parameters
        WHERE region_code = ANY($1::text[])
        ORDER BY region_code, parameter_type`,
-      [["110000", "310000", "420100", "430700", "440000", "540000", "650000"]]
+      [["110000", "310000", "420100", "440000", "540000", "650000"]]
     );
     expect(samples.rows).toEqual([
       expect.objectContaining({
@@ -532,12 +774,6 @@ describe("policy persistence foundation", () => {
         year: 2024,
         parameter_type: "employee_average_monthly_wage",
         amount_fen: "940975"
-      }),
-      expect.objectContaining({
-        region_code: "430700",
-        year: 2024,
-        parameter_type: "employee_average_monthly_wage",
-        amount_fen: "693750"
       }),
       expect.objectContaining({
         region_code: "440000",
@@ -560,12 +796,49 @@ describe("policy persistence foundation", () => {
     ]);
     expect(samples.rows.every((row) => row.status === "verified")).toBe(true);
 
+    const minimumWageProvenance = await query<{
+      count: string;
+      distinct_urls: string;
+      distinct_names: string;
+      distinct_dates: string;
+      exact_url_count: string;
+      canonical_url: string;
+    }>(
+      `SELECT
+         count(*)::text AS count,
+         count(DISTINCT source_url)::text AS distinct_urls,
+         count(DISTINCT source_name)::text AS distinct_names,
+         count(DISTINCT source_published_at)::text AS distinct_dates,
+         min(source_url) AS canonical_url,
+         count(*) FILTER (
+           WHERE source_url =
+             'https://www.mohrss.gov.cn/SYrlzyhshbzb/laodongguanxi_/fwyd/202601/t20260112_565296.html'
+             AND source_name =
+               '人力资源社会保障部劳动关系司：全国各省、自治区、直辖市最低工资标准情况（截至2026年1月1日）'
+             AND source_published_at = DATE '2026-01-12'
+         )::text AS exact_url_count
+       FROM regional_parameters
+       WHERE parameter_type = 'minimum_monthly_wage'`
+    );
+    expect(minimumWageProvenance.rows[0]).toEqual({
+      count: "31",
+      distinct_urls: "1",
+      distinct_names: "1",
+      distinct_dates: "1",
+      exact_url_count: "31",
+      canonical_url:
+        "https://www.mohrss.gov.cn/SYrlzyhshbzb/laodongguanxi_/fwyd/202601/t20260112_565296.html"
+    });
+    expect(
+      new URL(minimumWageProvenance.rows[0].canonical_url).hostname
+    ).toBe("www.mohrss.gov.cn");
+
     const csv = await readFile(csvPath, "utf8");
     const lines = csv.trim().split(/\r?\n/);
     expect(lines[0]).toBe(
       "region_code,region_name,year,parameter_type,amount_fen,source_name,source_url,source_published_at,status"
     );
-    expect(lines).toHaveLength(34);
+    expect(lines).toHaveLength(33);
   });
 
   it("rejects invalid regional-parameter batches without partial writes", async () => {
@@ -612,7 +885,7 @@ describe("policy persistence foundation", () => {
     const count = await query<{ count: string }>(
       "SELECT count(*)::text AS count FROM regional_parameters"
     );
-    expect(count.rows[0].count).toBe("33");
+    expect(count.rows[0].count).toBe("32");
   });
 
   it("re-runs migrations without changing imported policy data", async () => {
@@ -647,7 +920,7 @@ describe("policy persistence foundation", () => {
     );
     expect(preserved.rows[0]).toEqual({
       regions: "364",
-      parameters: "33",
+      parameters: "32",
       rule_versions: "1",
       beijing_wage: "254000"
     });

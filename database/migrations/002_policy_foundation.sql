@@ -20,7 +20,9 @@ CREATE TABLE policy_rule_versions (
   published_by UUID REFERENCES users(id) ON DELETE SET NULL,
   published_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (rule_set_id, version),
+  UNIQUE (rule_set_id, id),
   CHECK (effective_to IS NULL OR effective_to >= effective_from),
   CHECK (
     (status = 'published' AND published_at IS NOT NULL) OR
@@ -30,9 +32,9 @@ CREATE TABLE policy_rule_versions (
 
 ALTER TABLE policy_rule_sets
   ADD CONSTRAINT policy_rule_sets_active_version_fk
-  FOREIGN KEY (active_version_id)
-  REFERENCES policy_rule_versions(id)
-  ON DELETE SET NULL;
+  FOREIGN KEY (id, active_version_id)
+  REFERENCES policy_rule_versions(rule_set_id, id)
+  ON DELETE SET NULL (active_version_id);
 
 CREATE TABLE administrative_regions (
   code TEXT PRIMARY KEY CHECK (code ~ '^[0-9]{6}$'),

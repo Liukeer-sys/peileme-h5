@@ -225,11 +225,20 @@ git commit -m "test: supervise PostgreSQL integration database"
 
 **Files:**
 - Create: `database/migrations/002_policy_foundation.sql`
+- Create: `database/seeds/administrative-regions.csv`
+- Create: `database/seeds/regional-parameters.csv`
+- Create: `scripts/import-administrative-regions.ts`
+- Create: `scripts/import-regional-parameters.ts`
+- Create: `scripts/lib/csv.ts`
+- Create: `scripts/lib/official-source.ts`
 - Create: `server/modules/policy/seed.ts`
+- Create: `tsconfig.scripts.json`
+- Modify: `package.json`
 - Modify: `server/seed.ts`
 - Modify: `server/tests/api.test.ts`
+- Modify: `docs/superpowers/plans/2026-07-30-dual-web-policy-foundation.md`
 
-- [ ] **Step 1: Write the failing migration assertions**
+- [ ] **Step 1: Write the failing schema, provenance and integrity assertions**
 
 Add a test to `server/tests/api.test.ts`:
 
@@ -259,6 +268,14 @@ it("installs versioned policy and channel tables", async () => {
   ]);
 });
 ```
+
+Also reproduce and lock these failures before implementation:
+
+- an active version from rule set B can be assigned to rule set A;
+- an unchanged seed advances persisted timestamps;
+- an ordinary region upsert can change an existing code's name or parent;
+- the wage fixture uses a repost instead of the Ministry primary URL and
+  includes an unsupported Q&A-derived prefecture value.
 
 - [ ] **Step 2: Run the assertion and verify failure**
 
@@ -307,40 +324,24 @@ CREATE TABLE policy_rule_versions (
   published_by UUID REFERENCES users(id) ON DELETE SET NULL,
   published_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (rule_set_id, version)
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (rule_set_id, version),
+  UNIQUE (rule_set_id, id)
 );
 
 ALTER TABLE policy_rule_sets
   ADD CONSTRAINT policy_rule_sets_active_version_fk
-  FOREIGN KEY (active_version_id) REFERENCES policy_rule_versions(id) ON DELETE SET NULL;
+  FOREIGN KEY (id, active_version_id)
+  REFERENCES policy_rule_versions(rule_set_id, id)
+  ON DELETE SET NULL (active_version_id);
 
 ALTER TABLE assessments
   ADD CONSTRAINT assessments_rule_version_fk
   FOREIGN KEY (rule_version_id) REFERENCES policy_rule_versions(id) ON DELETE SET NULL;
 
-CREATE TABLE regional_parameters (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  region_code TEXT NOT NULL,
-  region_name TEXT NOT NULL,
-  year INTEGER NOT NULL CHECK (year BETWEEN 2000 AND 2100),
-  parameter_type TEXT NOT NULL CHECK (
-    parameter_type IN ('minimum_monthly_wage', 'employee_average_monthly_wage')
-  ),
-  amount_fen BIGINT NOT NULL CHECK (amount_fen > 0),
-  source_name TEXT NOT NULL,
-  source_url TEXT NOT NULL,
-  source_published_at DATE,
-  status TEXT NOT NULL CHECK (status IN ('draft', 'verified', 'stale')),
-  reviewed_by UUID REFERENCES users(id) ON DELETE SET NULL,
-  reviewed_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (region_code, year, parameter_type)
-);
-
 CREATE TABLE administrative_regions (
-  code TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
+  code TEXT PRIMARY KEY CHECK (code ~ '^[0-9]{6}$'),
+  name TEXT NOT NULL UNIQUE CHECK (length(btrim(name)) > 0),
   level TEXT NOT NULL CHECK (level IN ('province', 'prefecture')),
   parent_code TEXT REFERENCES administrative_regions(code),
   status TEXT NOT NULL CHECK (status IN ('active', 'retired')),
@@ -348,10 +349,34 @@ CREATE TABLE administrative_regions (
   source_url TEXT NOT NULL,
   source_snapshot_date DATE NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (
+    (level = 'province' AND parent_code IS NULL) OR
+    (level = 'prefecture' AND parent_code IS NOT NULL)
+  )
 );
 CREATE INDEX administrative_regions_parent_idx
   ON administrative_regions(parent_code, status, name);
+
+CREATE TABLE regional_parameters (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  region_code TEXT NOT NULL REFERENCES administrative_regions(code),
+  region_name TEXT NOT NULL,
+  year INTEGER NOT NULL CHECK (year BETWEEN 2000 AND 2100),
+  parameter_type TEXT NOT NULL CHECK (
+    parameter_type IN ('minimum_monthly_wage', 'employee_average_monthly_wage')
+  ),
+  amount_fen BIGINT NOT NULL CHECK (amount_fen > 0),
+  source_name TEXT NOT NULL CHECK (length(btrim(source_name)) > 0),
+  source_url TEXT NOT NULL CHECK (source_url ~ '^https://'),
+  source_published_at DATE NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('draft', 'verified', 'stale')),
+  reviewed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  reviewed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (region_code, year, parameter_type)
+);
 
 CREATE TABLE policy_calculation_snapshots (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -396,62 +421,30 @@ CREATE INDEX policy_rule_versions_status_idx
 
 Create `server/modules/policy/seed.ts`:
 
-```ts
-import { query } from "../../db.js";
+Implement one database transaction with this sequence:
 
-const baselineDefinition = {
-  schemaVersion: 1,
-  terminationModes: {
-    mutual_agreement: "N",
-    employer_notice: "N_PLUS_ONE",
-    unlawful_termination: "TWO_N",
-    employee_resignation: "ZERO",
-    unclear: "REVIEW"
-  },
-  serviceFraction: {
-    lessThanSixMonths: 0.5,
-    atLeastSixMonths: 1
-  },
-  highSalaryCapMultiplier: 3,
-  highSalaryServiceYearCap: 12
-};
+1. insert `cn-severance` using `ON CONFLICT DO NOTHING`;
+2. if it exists, `SELECT ... FOR UPDATE` and update name/channel plus
+   `updated_at` only when those values differ;
+3. insert published version 1 using `ON CONFLICT DO NOTHING`;
+4. if it exists, lock it and conditionally restore status, definition, source,
+   effective dates and version `updated_at`, preserving `published_at` while
+   the version remains published;
+5. update the active pointer and rule-set `updated_at` only when the pointer
+   differs;
+6. insert the four role capabilities using `ON CONFLICT DO NOTHING`.
 
-export const seedPolicyFoundation = async () => {
-  const inserted = await query<{ id: string }>(
-    `INSERT INTO policy_rule_sets(code, name, product_channel)
-     VALUES ('cn-severance', '中国大陆离职经济补偿规则', 'main')
-     ON CONFLICT (code) DO UPDATE SET updated_at = now()
-     RETURNING id`
-  );
-  const ruleSetId = inserted.rows[0].id;
-  const version = await query<{ id: string }>(
-    `INSERT INTO policy_rule_versions
-       (rule_set_id, version, status, definition, source_snapshot, effective_from, published_at)
-     VALUES (
-       $1, 1, 'published', $2,
-       '[{"name":"中华人民共和国劳动合同法","article":"第四十七条"}]'::jsonb,
-       DATE '2013-07-01', now()
-     )
-     ON CONFLICT (rule_set_id, version) DO UPDATE SET definition = EXCLUDED.definition
-     RETURNING id`,
-    [ruleSetId, baselineDefinition]
-  );
-  await query(
-    `UPDATE policy_rule_sets SET active_version_id = $2, updated_at = now() WHERE id = $1`,
-    [ruleSetId, version.rows[0].id]
-  );
-  await query(
-    `INSERT INTO role_capabilities(role, capability) VALUES
-       ('admin', 'policy.read'),
-       ('admin', 'policy.write'),
-       ('admin', 'policy.publish'),
-       ('analyst', 'policy.read')
-     ON CONFLICT DO NOTHING`
-  );
-};
-```
+The baseline definition uses `schemaVersion: 1`, the five termination modes,
+the two service fractions, multiplier 3 and service cap 12. The source snapshot
+is an array containing Labor Contract Law article 47 and its Ministry URL.
 
 Call `seedPolicyFoundation()` from `server/seed.ts` after the existing admin and invite seed logic.
+
+Use transaction-scoped `INSERT ... ON CONFLICT DO NOTHING`, row locking and
+conditional updates. An identical repeated seed preserves rule-set and version
+`created_at`/`updated_at` plus version `published_at`. Content drift updates
+only the changed row and its `updated_at`; assigning the already active pointer
+leaves timestamps untouched.
 
 - [ ] **Step 5: Import current regions and sourced parameters**
 
@@ -461,7 +454,15 @@ Create `scripts/import-administrative-regions.ts` to read:
 code,name,level,parent_code,status,source_name,source_url,source_snapshot_date
 ```
 
-It validates six-digit unique codes, requires every prefecture parent, requires an HTTPS government source and upserts in one transaction. Build `database/seeds/administrative-regions.csv` from the latest available Ministry of Civil Affairs administrative-division snapshot and include all mainland province-level and prefecture-level entries.
+It validates six-digit unique codes, requires every prefecture parent, requires
+an HTTPS government source and upserts in one transaction. Existing
+`code -> name/level/parent_code` identity is immutable during ordinary import:
+lock matching rows in code order, preflight the whole batch, and keep the
+`ON CONFLICT ... WHERE` identity predicate plus affected-row check as the
+concurrency-safe database boundary. Status and source metadata remain mutable.
+Build `database/seeds/administrative-regions.csv` from the latest available
+Ministry of Civil Affairs administrative-division snapshot and include 31
+mainland province-level and 333 prefecture-level entries.
 
 Create `scripts/import-regional-parameters.ts` to read:
 
@@ -469,7 +470,26 @@ Create `scripts/import-regional-parameters.ts` to read:
 region_code,region_name,year,parameter_type,amount_fen,source_name,source_url,source_published_at,status
 ```
 
-It rejects unknown regions, duplicate region/year/type rows, non-positive amounts and non-government source hosts. Populate all published province-level minimum wages and every verified prefecture employee-average-wage parameter that can be sourced. Regions without a published prefecture value remain selectable and use the explicit estimated/manual path.
+It rejects unknown regions, duplicate region/year/type rows, non-positive
+amounts and non-government source hosts. `scripts/lib/csv.ts` supplies bounded,
+strict CSV parsing; `scripts/lib/official-source.ts` enforces HTTPS and a
+label-bound `gov.cn` host suffix.
+
+Populate exactly 31 province-level first-tier monthly minimum wages from the
+Ministry of Human Resources and Social Security primary release:
+
+`https://www.mohrss.gov.cn/SYrlzyhshbzb/laodongguanxi_/fwyd/202601/t20260112_565296.html`
+
+Use source `人力资源社会保障部劳动关系司`, publication date `2026-01-12`,
+and data cutoff `2026-01-01`. Populate one verified prefecture employee
+average: Wuhan 2024 (`112917 / 12 = 9409.75` yuan) from the Wuhan Statistics
+Bureau announcement. Keep the other 332 prefecture values absent so the
+explicit estimated/manual path handles the gap. A government Q&A response is
+insufficient provenance for a verified statistical parameter.
+
+Expose `db:import:regions` and `db:import:parameters` in `package.json`.
+`build:api` must compile the server and run the strict no-emit importer check
+from `tsconfig.scripts.json`.
 
 - [ ] **Step 6: Test region integrity and coverage**
 
@@ -495,22 +515,50 @@ it("loads every active prefecture with a valid province parent", async () => {
 });
 ```
 
+Also assert:
+
+- exactly 31 provinces and 333 prefectures, with zero active orphans;
+- exactly 31 minimum-wage rows and one employee-average row;
+- all minimum-wage rows have the exact Ministry URL, source name, publication
+  date, and hostname `www.mohrss.gov.cn`;
+- cross-rule-set active pointers fail, while deleting an owned active version
+  retains the rule set and nulls only `active_version_id`;
+- unchanged repeated seed timestamps are byte-for-byte stable;
+- same-code rename/reparent batches fail atomically and retain original values.
+
 - [ ] **Step 7: Run migrations and tests**
 
-Run:
+Run the focused suite, then the complete supervised lifecycle:
 
 ```bash
 npm test -- --run server/tests/api.test.ts
+npm run test:api
+npm run test:db:up
+DATABASE_URL=postgresql://peileme_test:peileme_test@127.0.0.1:55432/peileme_test npm run db:migrate
+DATABASE_URL=postgresql://peileme_test:peileme_test@127.0.0.1:55432/peileme_test npm run db:seed
+DATABASE_URL=postgresql://peileme_test:peileme_test@127.0.0.1:55432/peileme_test npm run db:import:regions
+DATABASE_URL=postgresql://peileme_test:peileme_test@127.0.0.1:55432/peileme_test npm run db:import:parameters
 npm run test:db:down
+npm test
+npm run build
 ```
 
-Expected: PASS, including the new table assertion.
+Run migrate, seed and both imports twice in the clean-database acceptance
+sequence, then migrate once more. Expected persisted facts are 2 migrations,
+31 provinces, 333 prefectures, 31 minimum wages, one Wuhan employee average,
+one published baseline version and a valid active pointer. All tests/builds
+pass and Compose, ports, lock files and temporary uploads are removed.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add database/migrations/002_policy_foundation.sql database/seeds scripts/import-administrative-regions.ts scripts/import-regional-parameters.ts server/modules/policy/seed.ts server/seed.ts server/tests/api.test.ts
-git commit -m "feat: add versioned policy persistence"
+git add database/migrations/002_policy_foundation.sql database/seeds \
+  scripts/import-administrative-regions.ts scripts/import-regional-parameters.ts \
+  scripts/lib/csv.ts scripts/lib/official-source.ts \
+  server/modules/policy/seed.ts server/seed.ts server/tests/api.test.ts \
+  tsconfig.scripts.json package.json \
+  docs/superpowers/plans/2026-07-30-dual-web-policy-foundation.md
+git commit -m "fix: harden policy persistence invariants"
 ```
 
 ## Task 3: Implement the deterministic compensation engine
