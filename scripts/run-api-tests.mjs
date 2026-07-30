@@ -32,15 +32,6 @@ class ActiveTestDbLockError extends Error {
   }
 }
 
-const isProcessAlive = (pid) => {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === "EPERM";
-  }
-};
-
 const readLockOwner = async (lockPath) => {
   try {
     const lockStat = await stat(lockPath);
@@ -98,8 +89,7 @@ export const acquireTestDbLock = async ({
   lockPath = TEST_DB_LOCK_PATH,
   lockPort = TEST_DB_LOCK_PORT,
   pid = process.pid,
-  cwd = process.cwd(),
-  isProcessAlive: checkProcessAlive = isProcessAlive
+  cwd = process.cwd()
 } = {}) => {
   let mutex;
   try {
@@ -119,14 +109,6 @@ export const acquireTestDbLock = async ({
   };
 
   try {
-    const previousOwner = await readLockOwner(lockPath);
-    if (
-      previousOwner &&
-      Number.isSafeInteger(previousOwner.pid) &&
-      checkProcessAlive(previousOwner.pid)
-    ) {
-      throw new ActiveTestDbLockError(previousOwner);
-    }
     await persistLockOwner(lockPath, owner);
     return { lockPath, lockPort, owner, mutex };
   } catch (error) {

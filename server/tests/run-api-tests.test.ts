@@ -124,8 +124,7 @@ describe("API test lifecycle wrapper", () => {
       lockPath,
       lockPort,
       pid: 41002,
-      cwd: "/current/worktree",
-      isProcessAlive: () => false
+      cwd: "/current/worktree"
     });
     const persistedOwner = JSON.parse(await readFile(lockPath, "utf8"));
 
@@ -134,6 +133,31 @@ describe("API test lifecycle wrapper", () => {
     expect(persistedOwner).toEqual(reclaimed.owner);
     await releaseTestDbLock(reclaimed);
     await expect(access(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("replaces a stale sidecar when its PID has been reused by a live process", async () => {
+    const { acquireTestDbLock, releaseTestDbLock } = await loadWrapper();
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: process.pid,
+        cwd: "/former/worktree",
+        token: "pid-reuse-token"
+      }),
+      "utf8"
+    );
+
+    const acquired = await acquireTestDbLock({
+      lockPath,
+      lockPort,
+      pid: 41502,
+      cwd: "/new/worktree"
+    });
+    const persistedOwner = JSON.parse(await readFile(lockPath, "utf8"));
+
+    expect(acquired.owner.token).not.toBe("pid-reuse-token");
+    expect(persistedOwner).toEqual(acquired.owner);
+    await releaseTestDbLock(acquired);
   });
 
   it("allows only one synchronized contender to recover the same stale lock", async () => {
@@ -158,8 +182,7 @@ describe("API test lifecycle wrapper", () => {
         lockPath,
         lockPort,
         pid,
-        cwd: `/contender-${pid}`,
-        isProcessAlive: () => false
+        cwd: `/contender-${pid}`
       });
     };
     const attempts = [contend(42001), contend(42002)];

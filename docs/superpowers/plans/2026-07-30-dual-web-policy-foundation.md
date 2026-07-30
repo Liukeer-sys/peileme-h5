@@ -107,6 +107,7 @@ Add focused tests to `server/tests/run-api-tests.test.ts` for:
 - test exit `23` and partial-up exit `19`, with down always executed and the original code preserved;
 - SIGTERM cleanup and exit `143`;
 - a dead owner sidecar replaced by a new owner;
+- an idle mutex replacing a stale sidecar whose PID has been reused by a live, unrelated process;
 - two contenders released from the same barrier against one stale sidecar, with exactly one winner and one fast active-lock failure;
 - active ownership returning nonzero without issuing any Compose command;
 - explicit `--lifecycle-test-exit-code` and `--lifecycle-test-hold-ms` acceptance controls.
@@ -121,7 +122,7 @@ Expected before the wrapper exists: FAIL because the lifecycle and atomic owners
 
 - [ ] **Step 3: Add the failure-safe wrapper and lifecycle scripts**
 
-`scripts/run-api-tests.mjs` must acquire ownership before every Compose command. Bind the exclusive kernel mutex on `127.0.0.1:55431`, then atomically publish `/tmp/peileme-h5-test-db-55432.lock` with `pid`, `cwd`, `token`, and `createdAt`. A dead process releases the kernel mutex automatically; its sidecar is replaced only after the next process owns that mutex. An active mutex returns exit `73`, reports the current owner when available, and returns before the lifecycle `finally`, so the contender never downs the owner's database.
+`scripts/run-api-tests.mjs` must acquire ownership before every Compose command. The exclusive kernel mutex on `127.0.0.1:55431` is the sole active-ownership fact. After binding it successfully, atomically replace any existing `/tmp/peileme-h5-test-db-55432.lock` sidecar with the new `pid`, `cwd`, `token`, and `createdAt`; sidecar PID liveness never blocks the mutex owner because PIDs can be reused. A failed bind reads the sidecar only for diagnostics, returns exit `73`, and returns before the lifecycle `finally`, so the contender never downs the owner's database.
 
 After ownership, execute Compose up and Vitest. A `finally` block must run:
 
@@ -172,7 +173,7 @@ npx vitest run server/tests/run-api-tests.test.ts
 npm run test:api
 ```
 
-Expected: 9 wrapper/lock tests pass; the complete server suite reports 23/23; the lock sidecar, mutex listener, Compose container/network, and port `55432` are removed.
+Expected: 10 wrapper/lock tests pass; the complete server suite reports 24/24; the lock sidecar, mutex listener, Compose container/network, and port `55432` are removed.
 
 Exercise a real nonzero child:
 
