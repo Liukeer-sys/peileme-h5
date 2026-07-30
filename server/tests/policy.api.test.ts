@@ -856,6 +856,30 @@ describe("versioned policy public API", () => {
     );
   });
 
+  it("reports public regional parameter availability for the selected calculation year", async () => {
+    const response = await request(createApp())
+      .get("/api/policy/regions?year=2026")
+      .expect(200);
+    const byCode = new Map(
+      response.body.items.map((item: { code: string }) => [item.code, item])
+    );
+
+    expect(byCode.get("420100")).toMatchObject({
+      code: "420100",
+      parameterAvailability: {
+        minimumMonthlyWage: "fallback",
+        employeeAverageMonthlyWage: "exact"
+      }
+    });
+    expect(byCode.get("310000")).toMatchObject({
+      code: "310000",
+      parameterAvailability: {
+        minimumMonthlyWage: "exact",
+        employeeAverageMonthlyWage: "manual-needed"
+      }
+    });
+  });
+
   it("requires authentication for calculation and history", async () => {
     const app = createApp();
     await request(app)

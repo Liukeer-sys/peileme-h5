@@ -104,10 +104,13 @@ export const createPolicyRouter = (
   router.get("/regions", async (request, response) => {
     const query = z
       .object({
-        level: z.enum(["province", "prefecture"]).optional()
+        level: z.enum(["province", "prefecture"]).optional(),
+        year: z.coerce.number().int().min(2000).max(2100).optional()
       })
       .parse(request.query);
-    response.json({ items: await repository.listRegions(query.level) });
+    response.json({
+      items: await repository.listRegions(query.level, query.year)
+    });
   });
 
   router.post("/calculate", requireAuth, async (request, response, next) => {

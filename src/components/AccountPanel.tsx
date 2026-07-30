@@ -1,14 +1,8 @@
 import { useEffect, useState } from "react";
 import { useAuth, type GrantModule } from "../auth/AuthContext";
 import { api, ApiError, downloadFromApi, track } from "../lib/api";
-
-type AssessmentItem = {
-  id: string;
-  status: string;
-  answers: { city?: string; terminationReason?: string };
-  completed_at: string | null;
-  created_at: string;
-};
+import PolicyHistory from "../main/PolicyHistory";
+import type { PolicyHistoryDetail } from "../types";
 
 type UploadItem = {
   id: string;
@@ -21,6 +15,8 @@ type UploadItem = {
 type AccountPanelProps = {
   open: boolean;
   onClose: () => void;
+  historyRefreshKey?: string;
+  onPolicyRecalculate?: (detail: PolicyHistoryDetail) => Promise<void>;
 };
 
 const moduleNames: Record<GrantModule, string> = {
@@ -28,11 +24,15 @@ const moduleNames: Record<GrantModule, string> = {
   evidencePack: "离职证据包"
 };
 
-export default function AccountPanel({ open, onClose }: AccountPanelProps) {
+export default function AccountPanel({
+  open,
+  onClose,
+  historyRefreshKey,
+  onPolicyRecalculate
+}: AccountPanelProps) {
   const { user, grants, logout, redeemInvite, updateProfile } = useAuth();
   const [invite, setInvite] = useState("");
   const [message, setMessage] = useState("");
-  const [history, setHistory] = useState<AssessmentItem[]>([]);
   const [uploads, setUploads] = useState<UploadItem[]>([]);
   const [displayName, setDisplayName] = useState("");
   const [busy, setBusy] = useState(false);
@@ -40,18 +40,11 @@ export default function AccountPanel({ open, onClose }: AccountPanelProps) {
   useEffect(() => {
     if (!open || !user) return;
     setDisplayName(user.displayName || "");
-    void Promise.all([
-      api<{ items: AssessmentItem[] }>("/api/assessments/mine?pageSize=6", {
-        auth: true
-      }),
-      api<{ files: UploadItem[] }>("/api/uploads/mine", { auth: true })
-    ])
-      .then(([assessments, savedUploads]) => {
-        setHistory(assessments.items);
+    void api<{ files: UploadItem[] }>("/api/uploads/mine", { auth: true })
+      .then((savedUploads) => {
         setUploads(savedUploads.files);
       })
       .catch(() => {
-        setHistory([]);
         setUploads([]);
       });
   }, [open, user]);
@@ -144,19 +137,13 @@ export default function AccountPanel({ open, onClose }: AccountPanelProps) {
         </div>
 
         <div className="account-panel-section">
-          <strong>最近测算</strong>
-          <div className="history-list">
-            {history.length ? (
-              history.map((item) => (
-                <article key={item.id}>
-                  <b>{item.answers.city || "未填写城市"} · {item.status === "completed" ? "已完成" : "进行中"}</b>
-                  <span>{new Date(item.completed_at || item.created_at).toLocaleString("zh-CN")}</span>
-                </article>
-              ))
-            ) : (
-              <p>完成一次测算后，记录会出现在这里。</p>
-            )}
-          </div>
+          <PolicyHistory
+            refreshKey={historyRefreshKey}
+            onRecalculate={async (detail) => {
+              if (onPolicyRecalculate) await onPolicyRecalculate(detail);
+              onClose();
+            }}
+          />
         </div>
 
         <div className="account-panel-section">

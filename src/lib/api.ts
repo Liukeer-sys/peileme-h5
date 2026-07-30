@@ -1,3 +1,11 @@
+import type {
+  PolicyApiResult,
+  PolicyCalculateRequest,
+  PolicyHistoryDetail,
+  PolicyHistoryItem,
+  PolicyRegion
+} from "../types";
+
 const VISITOR_KEY = "peileme-visitor-id";
 const SESSION_KEY = "peileme-session-id";
 
@@ -36,11 +44,13 @@ const csrfHeader = (): Record<string, string> => {
 export class ApiError extends Error {
   status: number;
   code: string;
+  details?: unknown;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(status: number, code: string, message: string, details?: unknown) {
     super(message);
     this.status = status;
     this.code = code;
+    this.details = details;
   }
 }
 
@@ -117,17 +127,64 @@ export async function api<T>(path: string, options: ApiOptions = {}): Promise<T>
     const error = (await response.json().catch(() => ({}))) as {
       error?: string;
       message?: string;
+      details?: unknown;
     };
     throw new ApiError(
       response.status,
       error.error || "REQUEST_FAILED",
-      error.message || "请求失败，请稍后重试"
+      error.message || "请求失败，请稍后重试",
+      error.details
     );
   }
 
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
 }
+
+type PolicyApiWireResult = Omit<PolicyApiResult, "accuracyLevel"> & {
+  accuracy?: PolicyApiResult["accuracyLevel"];
+  accuracyLevel?: PolicyApiResult["accuracyLevel"];
+};
+
+export const listPolicyRegions = async (year: number) =>
+  (
+    await api<{ items: PolicyRegion[] }>(
+      `/api/policy/regions?year=${encodeURIComponent(String(year))}`
+    )
+  ).items;
+
+export const calculatePolicy = async (
+  body: PolicyCalculateRequest
+): Promise<PolicyApiResult> => {
+  const response = await api<PolicyApiWireResult>("/api/policy/calculate", {
+    method: "POST",
+    auth: true,
+    body
+  });
+  return {
+    ...response,
+    accuracyLevel:
+      response.accuracyLevel || response.accuracy || "unsupported"
+  };
+};
+
+export const listPolicyHistory = (
+  page = 1,
+  pageSize = 20
+) =>
+  api<{
+    items: PolicyHistoryItem[];
+    pagination: { page: number; pageSize: number; total: number };
+  }>(
+    `/api/policy/history?page=${encodeURIComponent(String(page))}&pageSize=${encodeURIComponent(String(pageSize))}`,
+    { auth: true }
+  );
+
+export const getPolicyHistory = (id: string) =>
+  api<PolicyHistoryDetail>(
+    `/api/policy/history/${encodeURIComponent(id)}`,
+    { auth: true }
+  );
 
 export async function downloadFromApi(path: string, fallbackName: string) {
   if (!accessToken) await refreshSession();

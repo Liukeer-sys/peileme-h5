@@ -14,6 +14,10 @@ export type PolicyRegion = {
   name: string;
   level: "province" | "prefecture";
   parentCode: string | null;
+  parameterAvailability?: {
+    minimumMonthlyWage: "exact" | "fallback" | "manual-needed";
+    employeeAverageMonthlyWage: "exact" | "manual-needed";
+  };
 };
 
 export const policyDefinitionSchema = z
@@ -222,7 +226,8 @@ const sourceLabel = (snapshot: unknown) => {
 
 export class PolicyRepository {
   async listRegions(
-    level?: PolicyRegion["level"]
+    level?: PolicyRegion["level"],
+    year?: number
   ): Promise<PolicyRegion[]> {
     const result = await query<{
       code: string;
@@ -248,12 +253,28 @@ export class PolicyRepository {
           child.code`,
       [level ?? null]
     );
-    return result.rows.map((row) => ({
+    const regions: PolicyRegion[] = result.rows.map((row) => ({
       code: row.code,
       name: row.name,
       level: row.level,
       parentCode: row.parent_code
     }));
+    if (year === undefined) return regions;
+    const availability = new Map(
+      (await this.coverage(year)).map((item) => [item.regionCode, item])
+    );
+    return regions.map((region) => {
+      const item = availability.get(region.code);
+      return item
+        ? {
+            ...region,
+            parameterAvailability: {
+              minimumMonthlyWage: item.minimumMonthlyWage,
+              employeeAverageMonthlyWage: item.employeeAverageMonthlyWage
+            }
+          }
+        : region;
+    });
   }
 
   async calculateAndPersist({
