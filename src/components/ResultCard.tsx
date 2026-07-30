@@ -217,16 +217,7 @@ const paletteMap: Record<string, string[]> = {
   health: ["#FFF5F6", "#E9D6E8", "#C7A9C9", "#65546A"]
 };
 
-export const generatedIconMap: Record<string, string> = {
-  "luckin-99": "coffee.png",
-  huangmenji: "huangmenji.png",
-  "bar-cocktail": "cocktail.png",
-  "office-chair-pro": "chair.png",
-  "health-check": "check.png",
-  "island-trip": "island.png",
-  "gold-50g": "go;d.png",
-  "byd-seagull-basic": "byd.png"
-};
+export const generatedIconMap: Record<string, string> = {};
 
 export const getGeneratedIconSrc = (id: string) => {
   const generatedIcon = generatedIconMap[id];
@@ -500,7 +491,6 @@ export default function ResultCard({ result, onSticker, postExitWish, onReselect
     </section>
   );
 }
-
 
 
 

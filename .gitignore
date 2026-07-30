@@ -6,6 +6,9 @@ dist/
 server-dist/
 coverage/
 data/
+playwright-report/
+test-results/
+.playwright-mcp/
 
 # Environment variables
 .env
