@@ -150,27 +150,138 @@ export const releaseTestDbLock = async (lock) => {
   }
 };
 
-const createLifecycleUploadOwnership = async () => {
-  const directory = path.resolve(await mkdtemp(TEST_UPLOAD_PATH_PREFIX));
-  const token = crypto.randomUUID();
-  const markerPath = path.join(directory, TEST_UPLOAD_OWNER_FILENAME);
-  const markerContents = `${JSON.stringify({ token })}\n`;
+const isLifecycleUploadPath = (directory) =>
+  path.dirname(directory) === path.resolve(tmpdir()) &&
+  path.basename(directory).startsWith(TEST_UPLOAD_BASENAME_PREFIX);
+
+const validateLifecycleUploadCreationIdentity = async ({
+  directory,
+  initialIdentity,
+  initialRealDirectory,
+  inspectPath,
+  resolvePath
+}) => {
+  if (!isLifecycleUploadPath(directory)) {
+    throw new Error(`Refusing to remove unowned upload directory: ${directory}`);
+  }
+  if (!initialIdentity) {
+    throw new Error("initial upload directory identity is unavailable");
+  }
+
+  const currentStat = await inspectPath(directory);
+  if (!currentStat.isDirectory() || currentStat.isSymbolicLink()) {
+    throw new Error("upload path is not the created directory");
+  }
+  if (
+    currentStat.dev !== initialIdentity.device ||
+    currentStat.ino !== initialIdentity.inode
+  ) {
+    throw new Error("upload directory identity changed");
+  }
+
+  if (initialRealDirectory !== null) {
+    const currentRealDirectory = await resolvePath(directory);
+    if (currentRealDirectory !== initialRealDirectory) {
+      throw new Error("upload directory realpath changed");
+    }
+  }
+};
+
+export const createLifecycleUploadOwnership = async ({
+  makeTempDir = mkdtemp,
+  inspectPath = lstat,
+  resolvePath = realpath,
+  writeMarker = writeFile,
+  removePath = rm
+} = {}) => {
+  let directory = null;
+  let initialIdentity = null;
+  let initialRealDirectory = null;
+
   try {
+    directory = path.resolve(await makeTempDir(TEST_UPLOAD_PATH_PREFIX));
+    if (!isLifecycleUploadPath(directory)) {
+      throw new Error(
+        `Lifecycle upload directory is outside the safe temp prefix: ${directory}`
+      );
+    }
+
+    const initialStat = await inspectPath(directory);
+    if (!initialStat.isDirectory() || initialStat.isSymbolicLink()) {
+      throw new Error("created upload path is not a directory");
+    }
+    initialIdentity = {
+      device: initialStat.dev,
+      inode: initialStat.ino
+    };
+    initialRealDirectory = await resolvePath(directory);
+
+    const token = crypto.randomUUID();
+    const markerPath = path.join(directory, TEST_UPLOAD_OWNER_FILENAME);
+    const markerContents = `${JSON.stringify({ token })}\n`;
     const ownership = {
       directory,
       markerContents,
       markerPath,
-      realDirectory: await realpath(directory),
+      realDirectory: initialRealDirectory,
       token
     };
-    await writeFile(
+    await writeMarker(
       ownership.markerPath,
       ownership.markerContents,
       { encoding: "utf8", flag: "wx" }
     );
     return ownership;
   } catch (error) {
-    await rm(ownership.directory, { recursive: true, force: true });
+    let cleanupError = null;
+    if (directory !== null) {
+      try {
+        await validateLifecycleUploadCreationIdentity({
+          directory,
+          initialIdentity,
+          initialRealDirectory,
+          inspectPath,
+          resolvePath
+        });
+        // Node has no directory-handle recursive removal; revalidate immediately
+        // before rm to narrow the remaining same-user replacement race.
+        await validateLifecycleUploadCreationIdentity({
+          directory,
+          initialIdentity,
+          initialRealDirectory,
+          inspectPath,
+          resolvePath
+        });
+        await removePath(directory, { recursive: true, force: true });
+      } catch (currentCleanupError) {
+        cleanupError = currentCleanupError;
+      }
+    }
+
+    if (cleanupError) {
+      let failure = error;
+      if (
+        (typeof failure !== "object" || failure === null) &&
+        typeof failure !== "function"
+      ) {
+        failure = new Error(String(error), { cause: error });
+      }
+      try {
+        Object.defineProperty(failure, "uploadCleanupError", {
+          configurable: true,
+          value: cleanupError
+        });
+      } catch {
+        failure = Object.assign(
+          new Error(
+            error instanceof Error ? error.message : String(error),
+            { cause: error }
+          ),
+          { uploadCleanupError: cleanupError }
+        );
+      }
+      throw failure;
+    }
     throw error;
   }
 };
@@ -222,10 +333,7 @@ const validateLifecycleUploadOwnership = async (ownership) => {
 const cleanupLifecycleUploadOwnership = async (ownership) => {
   if (!ownership) return false;
   const directory = path.resolve(ownership.directory);
-  if (
-    path.dirname(directory) !== path.resolve(tmpdir()) ||
-    !path.basename(directory).startsWith(TEST_UPLOAD_BASENAME_PREFIX)
-  ) {
+  if (!isLifecycleUploadPath(directory)) {
     throw new Error(`Refusing to remove unowned upload directory: ${directory}`);
   }
   await validateLifecycleUploadOwnership(ownership);
@@ -374,6 +482,7 @@ export const runApiTestLifecycle = async ({
   lifecycleArgs = [],
   runCommand = spawnCommand,
   releaseLock = releaseTestDbLock,
+  uploadOwnershipOptions,
   signalSource = process,
   signalGraceMs = 2_000,
   logError = (message) => console.error(message)
@@ -399,13 +508,24 @@ export const runApiTestLifecycle = async ({
 
   let uploadOwnership;
   try {
-    uploadOwnership = await createLifecycleUploadOwnership();
+    uploadOwnership = await createLifecycleUploadOwnership(
+      uploadOwnershipOptions
+    );
   } catch (error) {
     logError(
       `Failed to create lifecycle upload directory: ${
         error instanceof Error ? error.message : String(error)
       }`
     );
+    if (error?.uploadCleanupError) {
+      logError(
+        `Upload creation cleanup failed: ${
+          error.uploadCleanupError instanceof Error
+            ? error.uploadCleanupError.message
+            : String(error.uploadCleanupError)
+        }`
+      );
+    }
     try {
       await releaseLock(lock);
     } catch (releaseError) {

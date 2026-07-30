@@ -6,6 +6,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  rename,
   rm,
   symlink,
   writeFile
@@ -409,6 +410,7 @@ describe("API test lifecycle wrapper", () => {
     expect(wrapper.runApiTestLifecycle).toBeTypeOf("function");
     expect(wrapper.acquireTestDbLock).toBeTypeOf("function");
     expect(wrapper.releaseTestDbLock).toBeTypeOf("function");
+    expect(wrapper.createLifecycleUploadOwnership).toBeTypeOf("function");
   });
 
   it("runs up, tests, and down on success", async () => {
@@ -485,6 +487,122 @@ describe("API test lifecycle wrapper", () => {
 
     expect(result).toEqual({ exitCode: 1, signal: null });
     expect(errors.join("\n")).toContain("release failed");
+  });
+
+  it("preserves a marker creation error, removes the original upload directory, and releases the mutex", async () => {
+    const {
+      acquireTestDbLock,
+      releaseTestDbLock,
+      runApiTestLifecycle
+    } = await loadWrapper();
+    const runCommand = vi.fn();
+    const errors: string[] = [];
+    let createdUploadDir = "";
+    let reacquired: any;
+
+    try {
+      const result = await runApiTestLifecycle({
+        lockPath,
+        lockPort,
+        runCommand,
+        logError: (message: string) => errors.push(message),
+        uploadOwnershipOptions: {
+          makeTempDir: async (prefix: string) => {
+            createdUploadDir = await mkdtemp(prefix);
+            return createdUploadDir;
+          },
+          writeMarker: async () => {
+            throw new Error("marker write failed");
+          }
+        }
+      });
+
+      expect(result).toEqual({ exitCode: 1, signal: null });
+      expect(errors.join("\n")).toContain("marker write failed");
+      expect(errors.join("\n")).not.toContain("ownership is not defined");
+      await expect(access(createdUploadDir)).rejects.toMatchObject({
+        code: "ENOENT"
+      });
+      expect(runCommand).not.toHaveBeenCalled();
+
+      reacquired = await acquireTestDbLock({
+        lockPath,
+        lockPort,
+        pid: 51001,
+        cwd: "/reacquired-after-upload-failure"
+      });
+    } finally {
+      if (reacquired) await releaseTestDbLock(reacquired);
+      if (createdUploadDir) {
+        await rm(createdUploadDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("preserves a same-path replacement when marker creation fails", async () => {
+    const {
+      acquireTestDbLock,
+      releaseTestDbLock,
+      runApiTestLifecycle
+    } = await loadWrapper();
+    const runCommand = vi.fn();
+    const errors: string[] = [];
+    let createdUploadDir = "";
+    let displacedUploadDir = "";
+    let replacementSentinel = "";
+    let reacquired: any;
+
+    try {
+      const result = await runApiTestLifecycle({
+        lockPath,
+        lockPort,
+        runCommand,
+        logError: (message: string) => errors.push(message),
+        uploadOwnershipOptions: {
+          makeTempDir: async (prefix: string) => {
+            createdUploadDir = await mkdtemp(prefix);
+            return createdUploadDir;
+          },
+          writeMarker: async (markerPath: string) => {
+            displacedUploadDir = `${path.dirname(markerPath)}-displaced`;
+            await rename(path.dirname(markerPath), displacedUploadDir);
+            await mkdir(path.dirname(markerPath));
+            replacementSentinel = path.join(
+              path.dirname(markerPath),
+              "sentinel.txt"
+            );
+            await writeFile(replacementSentinel, "keep", "utf8");
+            throw new Error("marker write failed after replacement");
+          }
+        }
+      });
+
+      expect(result).toEqual({ exitCode: 1, signal: null });
+      expect(errors.join("\n")).toContain(
+        "marker write failed after replacement"
+      );
+      expect(errors.join("\n")).toContain(
+        "Upload creation cleanup failed"
+      );
+      await expect(access(createdUploadDir)).resolves.toBeUndefined();
+      await expect(access(replacementSentinel)).resolves.toBeUndefined();
+      expect(runCommand).not.toHaveBeenCalled();
+
+      reacquired = await acquireTestDbLock({
+        lockPath,
+        lockPort,
+        pid: 51002,
+        cwd: "/reacquired-after-upload-replacement"
+      });
+    } finally {
+      if (reacquired) await releaseTestDbLock(reacquired);
+      if (createdUploadDir) {
+        await rm(createdUploadDir, { recursive: true, force: true });
+      }
+      if (displacedUploadDir) {
+        await rm(displacedUploadDir, { recursive: true, force: true });
+      }
+    }
   });
 
   it("preserves a test failure when down also fails", async () => {
