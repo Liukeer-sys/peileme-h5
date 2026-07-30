@@ -115,7 +115,9 @@ Add focused tests to `server/tests/run-api-tests.test.ts` for:
 - two contenders released from the same barrier against one stale sidecar, with exactly one winner and one fast active-lock failure;
 - active ownership returning nonzero without issuing any Compose command, with separate diagnostics for a known sidecar owner and an occupied mutex with no sidecar;
 - cleanup and lock-release failures preserving an earlier up/test failure, while a release failure after success returns `1`;
+- a down child terminated by a signal contributing its mapped cleanup exit code while preserving an earlier up/test failure and leaving the requested-signal field empty;
 - marker-creation failure preserving its original error, safely removing the unchanged directory, releasing the mutex before Compose, and preserving a same-path replacement with a separate cleanup diagnostic;
+- SIGINT/SIGTERM received during wrapper upload cleanup remaining handled until cleanup completes, with the upload directory, mutex, and listeners all released;
 - wrapper upload cleanup refusing same-path replacements with a missing/wrong ownership marker and refusing symlink replacements, while preserving an earlier test/signal exit;
 - explicit `--lifecycle-test-exit-code`, `--lifecycle-test-hold-ms`, and `--lifecycle-test-stubborn-ms` acceptance controls; the stubborn control is signal-acceptance-only and exits `97` when its timeout is reached without the expected signal.
 
@@ -137,7 +139,7 @@ After ownership, execute Compose up and Vitest. A `finally` block must run:
 docker compose -f docker-compose.test.yml down --volumes --remove-orphans
 ```
 
-Preserve the up or test exit code through cleanup and lock-release failures. On the first SIGINT/SIGTERM, forward that signal to the active child process group where supported, save the detached process-group ID independently from the direct child, start a two-second grace timer, and escalate the saved group to `SIGKILL` when any member remains alive. A second signal escalates immediately, including after the group leader has exited. When the direct child exits from a signal before the wrapper receives one, record that signal before updating process-group state, terminate the remaining group through the same escalation path, and use the signal's `128 + signal number` exit status. Confirm the saved group no longer exists before entering down; clear its timer and ID only after that check. Platforms or permissions without process-group control fall back to signalling the direct child. Then run cleanup, release ownership, and terminate with the original signal status.
+Preserve the up or test exit code through cleanup and lock-release failures. On the first SIGINT/SIGTERM, forward that signal to the active child process group where supported, save the detached process-group ID independently from the direct child, start a two-second grace timer, and escalate the saved group to `SIGKILL` when any member remains alive. A second signal escalates immediately, including after the group leader has exited. When an up/test child exits from a signal before the wrapper receives one, record that signal before updating process-group state, terminate the remaining group through the same escalation path, and use the signal's `128 + signal number` exit status. A down child signal contributes its mapped numeric exit code only to cleanup precedence: an earlier up/test failure remains primary, and an otherwise successful lifecycle returns the mapped code with an empty requested-signal field. Confirm the saved group no longer exists before entering down; clear its timer and ID only after that check. Platforms or permissions without process-group control fall back to signalling the direct child. Keep SIGINT/SIGTERM listeners installed through database cleanup, lock release, and wrapper upload cleanup; remove them in the outermost cleanup `finally`, then map any requested signal after safe cleanup completes and terminate with the original signal status.
 
 Merge these scripts into `package.json`:
 
@@ -180,7 +182,7 @@ npx vitest run server/tests/run-api-tests.test.ts
 npm run test:api
 ```
 
-Expected: 27 wrapper/lock tests pass; the complete server suite reports 43/43; the wrapper-owned upload directory, lock sidecar, mutex listener, Compose container/network, and port `55432` are removed.
+Expected: 30 wrapper/lock tests pass; the complete server suite reports 46/46; the wrapper-owned upload directory, lock sidecar, mutex listener, Compose container/network, and port `55432` are removed.
 
 Exercise a real nonzero child:
 

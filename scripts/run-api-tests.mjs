@@ -482,6 +482,7 @@ export const runApiTestLifecycle = async ({
   lifecycleArgs = [],
   runCommand = spawnCommand,
   releaseLock = releaseTestDbLock,
+  cleanupUploadOwnership = cleanupLifecycleUploadOwnership,
   uploadOwnershipOptions,
   signalSource = process,
   signalGraceMs = 2_000,
@@ -676,7 +677,9 @@ export const runApiTestLifecycle = async ({
         if (requestedSignal) forwardFirstSignal();
       }
     });
-    const childOriginatedSignal = Boolean(result.signal && !requestedSignal);
+    const childOriginatedSignal = Boolean(
+      nextPhase !== "down" && result.signal && !requestedSignal
+    );
     if (childOriginatedSignal) requestedSignal = result.signal;
     activeChild = null;
     if (childOriginatedSignal && activeProcessGroupId !== null) {
@@ -739,10 +742,6 @@ export const runApiTestLifecycle = async ({
       primaryExitCode = resultExitCode(test);
     }
 
-    if (requestedSignal) {
-      primaryExitCode =
-        signalExitCode(requestedSignal) ?? (primaryExitCode || 1);
-    }
   } finally {
     try {
       await waitForTrackedTreeExit();
@@ -778,14 +777,11 @@ export const runApiTestLifecycle = async ({
             }`
           );
           if (primaryExitCode === 0) primaryExitCode = 1;
-        } finally {
-          signalSource.off("SIGINT", onSigint);
-          signalSource.off("SIGTERM", onSigterm);
         }
       }
     } finally {
       try {
-        await cleanupLifecycleUploadOwnership(uploadOwnership);
+        await cleanupUploadOwnership(uploadOwnership);
       } catch (error) {
         logError(
           `Test upload cleanup failed: ${
@@ -793,10 +789,17 @@ export const runApiTestLifecycle = async ({
           }`
         );
         if (primaryExitCode === 0) primaryExitCode = 1;
+      } finally {
+        signalSource.off("SIGINT", onSigint);
+        signalSource.off("SIGTERM", onSigterm);
       }
     }
   }
 
+  if (requestedSignal) {
+    primaryExitCode =
+      signalExitCode(requestedSignal) ?? (primaryExitCode || 1);
+  }
   return { exitCode: primaryExitCode, signal: requestedSignal };
 };
 

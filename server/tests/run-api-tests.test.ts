@@ -622,6 +622,40 @@ describe("API test lifecycle wrapper", () => {
     expect(errors.join("\n")).toContain("cleanup failed with exit code 29");
   });
 
+  it("preserves a test failure when down exits from SIGTERM", async () => {
+    const { runApiTestLifecycle } = await loadWrapper();
+    const errors: string[] = [];
+
+    const result = await runApiTestLifecycle({
+      lockPath,
+      lockPort,
+      runCommand: async ({ phase }: { phase: string }) => {
+        if (phase === "test") return { exitCode: 23, signal: null };
+        if (phase === "down") return { exitCode: null, signal: "SIGTERM" };
+        return { exitCode: 0, signal: null };
+      },
+      logError: (message: string) => errors.push(message)
+    });
+
+    expect(result).toEqual({ exitCode: 23, signal: null });
+    expect(errors.join("\n")).toContain("cleanup failed with exit code 143");
+  });
+
+  it("returns exit 143 without a requested signal when down exits from SIGTERM", async () => {
+    const { runApiTestLifecycle } = await loadWrapper();
+
+    const result = await runApiTestLifecycle({
+      lockPath,
+      lockPort,
+      runCommand: async ({ phase }: { phase: string }) =>
+        phase === "down"
+          ? { exitCode: null, signal: "SIGTERM" }
+          : { exitCode: 0, signal: null }
+    });
+
+    expect(result).toEqual({ exitCode: 143, signal: null });
+  });
+
   it("preserves a test failure when down and release also fail", async () => {
     const { releaseTestDbLock, runApiTestLifecycle } = await loadWrapper();
     const errors: string[] = [];
@@ -881,6 +915,54 @@ describe("API test lifecycle wrapper", () => {
     expect(result).toEqual({ exitCode: 143, signal: "SIGTERM" });
     expect(kill).toHaveBeenCalledWith("SIGTERM");
     expect(phases).toEqual(["up", "test", "down"]);
+  });
+
+  it("keeps signal handling active until upload cleanup completes", async () => {
+    const { runApiTestLifecycle } = await loadWrapper();
+    const signalSource = new EventEmitter();
+    let wrapperUploadDir = "";
+    let cleanupStarted = false;
+    let cleanupFinished = false;
+
+    const result = await runApiTestLifecycle({
+      lockPath,
+      lockPort,
+      signalSource,
+      runCommand: async ({
+        phase,
+        env
+      }: {
+        phase: string;
+        env?: NodeJS.ProcessEnv;
+      }) => {
+        if (phase === "test") {
+          wrapperUploadDir = env?.TEST_WRAPPER_UPLOAD_DIR ?? "";
+        }
+        return { exitCode: 0, signal: null };
+      },
+      cleanupUploadOwnership: async (ownership: { directory: string }) => {
+        cleanupStarted = true;
+        expect(signalSource.listenerCount("SIGTERM")).toBe(1);
+        await new Promise<void>((resolve) => {
+          setImmediate(() => {
+            signalSource.emit("SIGTERM");
+            resolve();
+          });
+        });
+        await rm(ownership.directory, { recursive: true, force: true });
+        cleanupFinished = true;
+      }
+    });
+
+    expect(result).toEqual({ exitCode: 143, signal: "SIGTERM" });
+    expect(cleanupStarted).toBe(true);
+    expect(cleanupFinished).toBe(true);
+    expect(signalSource.listenerCount("SIGINT")).toBe(0);
+    expect(signalSource.listenerCount("SIGTERM")).toBe(0);
+    await expect(access(wrapperUploadDir)).rejects.toMatchObject({
+      code: "ENOENT"
+    });
+    await expect(access(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("escalates a first signal after the grace period and still cleans up", async () => {
