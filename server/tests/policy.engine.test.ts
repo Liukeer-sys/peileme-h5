@@ -2,8 +2,10 @@ import { spawnSync } from "node:child_process";
 import { Decimal } from "decimal.js";
 import { describe, expect, it } from "vitest";
 import { calculatePolicy } from "../modules/policy/engine.js";
+import { PolicyEngineError } from "../modules/policy/types.js";
 import type {
   PolicyInput,
+  PolicyEngineErrorCode,
   PolicyOutput,
   TerminationScenario
 } from "../modules/policy/types.js";
@@ -41,9 +43,28 @@ const monetaryValues = (output: PolicyOutput) => [
   output.payableFen,
   output.alreadyPaidFen,
   output.differenceFen,
+  output.differenceRangeFen.low,
+  output.differenceRangeFen.high,
   output.rangeFen.low,
   output.rangeFen.high
 ];
+
+const expectPolicyEngineError = (
+  callback: () => unknown,
+  code: PolicyEngineErrorCode
+) => {
+  let thrown: unknown;
+  try {
+    callback();
+  } catch (error) {
+    thrown = error;
+  }
+
+  expect(thrown).toBeInstanceOf(PolicyEngineError);
+  expect((thrown as PolicyEngineError).name).toBe("PolicyEngineError");
+  expect((thrown as PolicyEngineError).code).toBe(code);
+  expect((thrown as PolicyEngineError).message).toBe(code);
+};
 
 const decimalConfig = () => ({
   precision: Decimal.precision,
@@ -54,6 +75,72 @@ const decimalConfig = () => ({
   minE: Decimal.minE,
   modulo: Decimal.modulo,
   crypto: Decimal.crypto
+});
+
+describe("PolicyEngineError", () => {
+  it("exposes a stable name and closed business error code", () => {
+    const error = new PolicyEngineError("INVALID_POLICY_INPUT");
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error.name).toBe("PolicyEngineError");
+    expect(error.code).toBe("INVALID_POLICY_INPUT");
+    expect(error.message).toBe("INVALID_POLICY_INPUT");
+  });
+});
+
+describe("calculatePolicy runtime boundary", () => {
+  it.each([
+    ["null input", null, "INVALID_POLICY_INPUT"],
+    ["array input", [], "INVALID_POLICY_INPUT"],
+    ["empty object", {}, "INVALID_POLICY_INPUT"],
+    [
+      "non-six-digit region code",
+      { ...baseInput(), regionCode: "abc" },
+      "INVALID_REGION"
+    ],
+    [
+      "empty region name",
+      { ...baseInput(), regionName: "   " },
+      "INVALID_REGION"
+    ],
+    [
+      "non-string start date",
+      { ...baseInput(), startDate: 20200101 },
+      "INVALID_EMPLOYMENT_DATE"
+    ],
+    [
+      "non-array wages",
+      { ...baseInput(), monthlyEarnedWagesFen: "1500000" },
+      "WAGE_MONTHS_OUT_OF_RANGE"
+    ],
+    [
+      "null scenario",
+      { ...baseInput(), terminationScenario: null },
+      "INVALID_TERMINATION_SCENARIO"
+    ],
+    [
+      "wrong unlawful scenario boolean",
+      {
+        ...baseInput(),
+        terminationScenario: {
+          kind: "UNLAWFUL_TERMINATION",
+          continuedPerformanceRequested: "yes",
+          continuedPerformancePossible: true
+        }
+      },
+      "INVALID_TERMINATION_SCENARIO"
+    ],
+    [
+      "null already paid",
+      { ...baseInput(), alreadyPaidFen: null },
+      "INVALID_ALREADY_PAID"
+    ]
+  ] as const)("rejects %s with a domain error", (_name, input, code) => {
+    expectPolicyEngineError(
+      () => calculatePolicy(input),
+      code
+    );
+  });
 });
 
 describe("calculatePolicy service time", () => {
@@ -140,9 +227,10 @@ describe("calculatePolicy service time", () => {
     ["2024-2-01", "2026-07-01", "INVALID_EMPLOYMENT_DATE"],
     ["not-a-date", "2026-07-01", "INVALID_EMPLOYMENT_DATE"]
   ])("rejects invalid employment dates %s to %s", (startDate, endDate, error) => {
-    expect(() =>
-      calculatePolicy({ ...baseInput(), startDate, endDate })
-    ).toThrow(error);
+    expectPolicyEngineError(
+      () => calculatePolicy({ ...baseInput(), startDate, endDate }),
+      error as PolicyEngineErrorCode
+    );
   });
 });
 
@@ -305,9 +393,10 @@ describe("calculatePolicy wage basis", () => {
     [[1.5], "INVALID_WAGE_VALUE"],
     [[Number.MAX_SAFE_INTEGER + 1], "INVALID_WAGE_VALUE"]
   ])("rejects an invalid earned-wage series %#", (monthlyEarnedWagesFen, error) => {
-    expect(() =>
-      calculatePolicy({ ...baseInput(), monthlyEarnedWagesFen })
-    ).toThrow(error);
+    expectPolicyEngineError(
+      () => calculatePolicy({ ...baseInput(), monthlyEarnedWagesFen }),
+      error as PolicyEngineErrorCode
+    );
   });
 
   it.each([
@@ -320,7 +409,8 @@ describe("calculatePolicy wage basis", () => {
     ["employeeAverageMonthlyWageFen", 1.5],
     ["employeeAverageMonthlyWageFen", Number.MAX_SAFE_INTEGER + 1]
   ] as const)("rejects invalid positive regional parameter %s=%s", (key, value) => {
-    expect(() => calculatePolicy({ ...baseInput(), [key]: value })).toThrow(
+    expectPolicyEngineError(
+      () => calculatePolicy({ ...baseInput(), [key]: value }),
       "INVALID_REGIONAL_PARAMETER"
     );
   });
@@ -328,40 +418,43 @@ describe("calculatePolicy wage basis", () => {
   it("rejects computed money outside the safe-integer range", () => {
     const largeSafeValue = Math.floor(Number.MAX_SAFE_INTEGER / 3);
 
-    expect(() =>
-      calculatePolicy({
+    expectPolicyEngineError(
+      () => calculatePolicy({
         ...baseInput(),
         startDate: "2000-01-01",
         monthlyEarnedWagesFen: [largeSafeValue],
         minimumMonthlyWageFen: 1,
         employeeAverageMonthlyWageFen: largeSafeValue
-      })
-    ).toThrow("COMPUTATION_OVERFLOW");
+      }),
+      "COMPUTATION_OVERFLOW"
+    );
   });
 
   it("rejects an earned-wage total that overflows before averaging", () => {
-    expect(() =>
-      calculatePolicy({
+    expectPolicyEngineError(
+      () => calculatePolicy({
         ...baseInput(),
         monthlyEarnedWagesFen: [
           Number.MAX_SAFE_INTEGER,
           Number.MAX_SAFE_INTEGER
         ]
-      })
-    ).toThrow("COMPUTATION_OVERFLOW");
+      }),
+      "COMPUTATION_OVERFLOW"
+    );
   });
 
   it("rejects negative zero in the earned-wage series", () => {
-    expect(() =>
-      calculatePolicy({
+    expectPolicyEngineError(
+      () => calculatePolicy({
         ...baseInput(),
         monthlyEarnedWagesFen: [-0],
         terminationScenario: {
           kind: "ARTICLE_40",
           noticeMethod: "payment_in_lieu"
         }
-      })
-    ).toThrow("INVALID_WAGE_VALUE");
+      }),
+      "INVALID_WAGE_VALUE"
+    );
   });
 });
 
@@ -474,6 +567,7 @@ describe("calculatePolicy legal scenario matrix", () => {
   it("gives employee-proposed mutual agreement a conservative review range", () => {
     const result = calculatePolicy({
       ...baseInput(),
+      alreadyPaidFen: 500_000,
       terminationScenario: {
         kind: "MUTUAL_AGREEMENT",
         proposedBy: "employee"
@@ -485,7 +579,20 @@ describe("calculatePolicy legal scenario matrix", () => {
       low: 0,
       high: result.baseCompensationFen
     });
+    expect(result.payableDetermined).toBe(false);
+    expect(result.differenceRangeFen).toEqual({
+      low: 0,
+      high: 10_000_000
+    });
     expect(result.reviewRequired).toBe(true);
+    expect(
+      result.formulaSteps.find((step) => step.key === "payment")
+    ).toEqual({
+      key: "payment",
+      label: "待复核金额",
+      value:
+        "待复核金额区间 0–10500000 分；已支付 500000 分；剩余金额区间 0–10000000 分，待事实复核"
+    });
   });
 
   it("does not add notice pay after 30 days' written notice", () => {
@@ -544,6 +651,58 @@ describe("calculatePolicy legal scenario matrix", () => {
     expect(result.rangeFen).toEqual({ low: 0, high: 1_249 });
     expect(result.reviewRequired).toBe(true);
   });
+
+  it("reports the paid-adjusted remaining range for an unclear scenario", () => {
+    const result = calculatePolicy({
+      ...baseInput(),
+      alreadyPaidFen: 500_000,
+      terminationScenario: { kind: "UNCLEAR" }
+    });
+
+    expect(result.payableDetermined).toBe(false);
+    expect(result.rangeFen).toEqual({ low: 0, high: 21_000_000 });
+    expect(result.differenceRangeFen).toEqual({
+      low: 0,
+      high: 20_500_000
+    });
+    expect(
+      result.formulaSteps.find((step) => step.key === "payment")
+    ).toEqual({
+      key: "payment",
+      label: "待复核金额",
+      value:
+        "待复核金额区间 0–21000000 分；已支付 500000 分；剩余金额区间 0–20500000 分，待事实复核"
+    });
+    const explanation = result.formulaSteps
+      .map(({ label, value }) => `${label}：${value}`)
+      .join("\n");
+    expect(explanation).not.toContain("应付0");
+    expect(explanation).not.toContain("剩余应付0");
+  });
+
+  it("uses a dedicated continued-performance explanation", () => {
+    const result = calculatePolicy({
+      ...baseInput(),
+      terminationScenario: {
+        kind: "UNLAWFUL_TERMINATION",
+        continuedPerformanceRequested: true,
+        continuedPerformancePossible: true
+      }
+    });
+
+    expect(result.payableDetermined).toBe(true);
+    expect(result.differenceRangeFen).toEqual({ low: 0, high: 0 });
+    expect(
+      result.formulaSteps.find((step) => step.key === "payment")
+    ).toEqual({
+      key: "payment",
+      label: "继续履行优先",
+      value: "继续履行劳动合同优先；当前现金金额为0分；已支付0分"
+    });
+    expect(
+      result.formulaSteps.some((step) => step.value.includes("待事实复核"))
+    ).toBe(false);
+  });
 });
 
 describe("calculatePolicy payment reconciliation and explanations", () => {
@@ -552,15 +711,17 @@ describe("calculatePolicy payment reconciliation and explanations", () => {
     [1.5],
     [Number.MAX_SAFE_INTEGER + 1]
   ])("rejects invalid alreadyPaidFen=%s", (alreadyPaidFen) => {
-    expect(() =>
-      calculatePolicy({ ...baseInput(), alreadyPaidFen })
-    ).toThrow("INVALID_ALREADY_PAID");
+    expectPolicyEngineError(
+      () => calculatePolicy({ ...baseInput(), alreadyPaidFen }),
+      "INVALID_ALREADY_PAID"
+    );
   });
 
   it("rejects negative zero already paid", () => {
-    expect(() =>
-      calculatePolicy({ ...baseInput(), alreadyPaidFen: -0 })
-    ).toThrow("INVALID_ALREADY_PAID");
+    expectPolicyEngineError(
+      () => calculatePolicy({ ...baseInput(), alreadyPaidFen: -0 }),
+      "INVALID_ALREADY_PAID"
+    );
   });
 
   it("returns zero remaining payment when the paid amount exceeds payable", () => {
@@ -571,6 +732,8 @@ describe("calculatePolicy payment reconciliation and explanations", () => {
 
     expect(result.alreadyPaidFen).toBe(20_000_000);
     expect(result.differenceFen).toBe(0);
+    expect(result.payableDetermined).toBe(true);
+    expect(result.differenceRangeFen).toEqual({ low: 0, high: 0 });
   });
 
   it("returns Chinese formula steps for every required decision", () => {

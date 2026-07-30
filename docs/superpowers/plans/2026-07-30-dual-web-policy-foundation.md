@@ -679,6 +679,14 @@ instead of pre-collapsing them into a payout multiplier.
   `formulaSteps` explains service, average wage, minimum adjustment,
   three-times cap, legal scenario, notice pay, paid amount, and difference in
   Chinese.
+- `calculatePolicy` accepts an `unknown` runtime boundary and validates the
+  complete shape before calculation. Expected validation and calculation
+  failures use `PolicyEngineError` with a closed `code` union; optional details
+  contain field identifiers only.
+- Output includes `payableDetermined` and `differenceRangeFen`. Review-required
+  scenarios present the gross and paid-adjusted ranges as the primary result
+  and never describe placeholder zero values as a determined payable or
+  difference. Continued performance has its own priority explanation.
 - The engine is pure and deterministic: it reads no database, clock, or
   environment state and does not mutate input.
 
@@ -850,9 +858,11 @@ export type PolicyOutput = {
   baseCompensationFen: number;
   noticePayBasisFen: number;
   noticePayFen: number;
+  payableDetermined: boolean;
   payableFen: number;
   alreadyPaidFen: number;
   differenceFen: number;
+  differenceRangeFen: { low: number; high: number };
   rangeFen: { low: number; high: number };
   reviewRequired: boolean;
   continuedPerformanceRequired: boolean;
@@ -871,6 +881,7 @@ guards, output additions, and Chinese explanations.
 
 ```ts
 import { Decimal } from "decimal.js";
+import { PolicyEngineError } from "./types.js";
 import type { PolicyInput, PolicyOutput } from "./types.js";
 
 const PolicyDecimal = Decimal.clone({
@@ -883,9 +894,11 @@ const monthsBetween = (start: string, end: string) => {
   const startDate = new Date(`${start}T00:00:00Z`);
   const endDate = new Date(`${end}T00:00:00Z`);
   if (!Number.isFinite(startDate.getTime()) || !Number.isFinite(endDate.getTime())) {
-    throw new Error("INVALID_EMPLOYMENT_DATE");
+    throw new PolicyEngineError("INVALID_EMPLOYMENT_DATE");
   }
-  if (endDate <= startDate) throw new Error("END_DATE_MUST_FOLLOW_START_DATE");
+  if (endDate <= startDate) {
+    throw new PolicyEngineError("END_DATE_MUST_FOLLOW_START_DATE");
+  }
   let months =
     (endDate.getUTCFullYear() - startDate.getUTCFullYear()) * 12 +
     endDate.getUTCMonth() -
@@ -895,9 +908,11 @@ const monthsBetween = (start: string, end: string) => {
 };
 
 const averageFen = (values: number[]) => {
-  if (values.length < 1 || values.length > 12) throw new Error("WAGE_MONTHS_OUT_OF_RANGE");
+  if (values.length < 1 || values.length > 12) {
+    throw new PolicyEngineError("WAGE_MONTHS_OUT_OF_RANGE");
+  }
   if (values.some((value) => !Number.isSafeInteger(value) || value < 0)) {
-    throw new Error("INVALID_WAGE_VALUE");
+    throw new PolicyEngineError("INVALID_WAGE_VALUE");
   }
   const total = values.reduce(
     (sum, value) => sum.plus(value),
@@ -905,7 +920,7 @@ const averageFen = (values: number[]) => {
   );
   if (!total.isInteger() || total.isNegative() ||
       total.greaterThan(Number.MAX_SAFE_INTEGER)) {
-    throw new Error("COMPUTATION_OVERFLOW");
+    throw new PolicyEngineError("COMPUTATION_OVERFLOW");
   }
   return total
     .div(values.length)
@@ -919,7 +934,8 @@ const compensationYears = (serviceMonths: number) => {
   return fullYears + (remainder >= 6 ? 1 : remainder > 0 ? 0.5 : 0);
 };
 
-export const calculatePolicy = (input: PolicyInput): PolicyOutput => {
+export const calculatePolicy = (value: unknown): PolicyOutput => {
+  const input = parsePolicyInput(value);
   const serviceMonths = monthsBetween(input.startDate, input.endDate);
   const rawAverageWageFen = averageFen(input.monthlyEarnedWagesFen);
   const minimumAdjusted = Math.max(rawAverageWageFen, input.minimumMonthlyWageFen);
@@ -1008,7 +1024,7 @@ Run:
 npm test -- --run server/tests/policy.engine.test.ts
 ```
 
-Expected: all 57 Task 3 engine tests pass.
+Expected: all 70 Task 3 engine tests pass.
 
 - [ ] **Step 7: Commit**
 
@@ -1020,6 +1036,12 @@ git commit -m "feat: calculate severance with deterministic rules"
 ```
 
 ## Task 4: Add versioned policy API and admin publishing
+
+The policy route treats `PolicyEngineError` as the engine's expected boundary:
+`INVALID_POLICY_INPUT` maps to HTTP 400, and the remaining closed engine codes
+map to HTTP 422 with the stable code in the response. Unknown errors are passed
+to the central error handler and return HTTP 500; they are never relabeled as
+client validation failures.
 
 **Files:**
 - Create: `server/audit.ts`

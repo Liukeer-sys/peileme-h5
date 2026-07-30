@@ -1,6 +1,9 @@
 import { Decimal } from "decimal.js";
+import { PolicyEngineError } from "./types.js";
 import type {
   FormulaStep,
+  PolicyEngineErrorCode,
+  PolicyEngineErrorDetails,
   PolicyInput,
   PolicyOutput,
   TerminationScenario
@@ -20,6 +23,21 @@ type CalendarDate = {
 
 const ISO_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const MILLISECONDS_PER_DAY = 86_400_000;
+
+function fail(
+  code: PolicyEngineErrorCode,
+  details?: PolicyEngineErrorDetails
+): never {
+  throw new PolicyEngineError(code, details);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value)
+  );
+}
 
 const isLeapYear = (year: number) =>
   year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
@@ -45,7 +63,7 @@ const daysInMonth = (year: number, month: number) => {
 const parseDate = (value: string): CalendarDate => {
   const match = ISO_DATE.exec(value);
   if (!match) {
-    throw new Error("INVALID_EMPLOYMENT_DATE");
+    fail("INVALID_EMPLOYMENT_DATE");
   }
   const year = Number(match[1]);
   const month = Number(match[2]);
@@ -57,7 +75,7 @@ const parseDate = (value: string): CalendarDate => {
     day < 1 ||
     day > daysInMonth(year, month)
   ) {
-    throw new Error("INVALID_EMPLOYMENT_DATE");
+    fail("INVALID_EMPLOYMENT_DATE");
   }
   return { year, month, day };
 };
@@ -92,7 +110,7 @@ const serviceDuration = (start: string, end: string) => {
   const startDate = parseDate(start);
   const endDate = parseDate(end);
   if (compareDates(endDate, startDate) <= 0) {
-    throw new Error("END_DATE_MUST_FOLLOW_START_DATE");
+    fail("END_DATE_MUST_FOLLOW_START_DATE");
   }
 
   let serviceMonths =
@@ -111,26 +129,41 @@ const serviceDuration = (start: string, end: string) => {
   return { serviceMonths, serviceRemainderDays };
 };
 
-const assertNonNegativeMoney = (value: number, error: string) => {
+function assertNonNegativeMoney(
+  value: unknown,
+  error: PolicyEngineErrorCode,
+  details?: PolicyEngineErrorDetails
+): asserts value is number {
   if (
+    typeof value !== "number" ||
     !Number.isSafeInteger(value) ||
     value < 0 ||
     Object.is(value, -0)
   ) {
-    throw new Error(error);
+    fail(error, details);
   }
-};
+}
 
-const assertPositiveMoney = (value: number) => {
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new Error("INVALID_REGIONAL_PARAMETER");
+function assertPositiveMoney(
+  value: unknown,
+  details?: PolicyEngineErrorDetails
+): asserts value is number {
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value <= 0
+  ) {
+    fail("INVALID_REGIONAL_PARAMETER", details);
   }
-};
+}
 
-const safeMoney = (value: Decimal.Value, error = "COMPUTATION_OVERFLOW") => {
+const safeMoney = (
+  value: Decimal.Value,
+  error: PolicyEngineErrorCode = "COMPUTATION_OVERFLOW"
+) => {
   const number = new PolicyDecimal(value).toNumber();
   if (!Number.isSafeInteger(number) || number < 0) {
-    throw new Error(error);
+    fail(error);
   }
   return number === 0 ? 0 : number;
 };
@@ -152,7 +185,9 @@ const multiplyMoney = (value: number, multiplier: Decimal.Value) =>
 
 const averageFen = (values: number[]) => {
   if (!Array.isArray(values) || values.length < 1 || values.length > 12) {
-    throw new Error("WAGE_MONTHS_OUT_OF_RANGE");
+    fail("WAGE_MONTHS_OUT_OF_RANGE", {
+      field: "monthlyEarnedWagesFen"
+    });
   }
   for (const value of values) {
     assertNonNegativeMoney(value, "INVALID_WAGE_VALUE");
@@ -185,39 +220,133 @@ const compensationYears = (
 };
 
 const assertScenario = (
-  scenario: TerminationScenario
+  scenario: unknown
 ): TerminationScenario => {
-  if (!scenario || typeof scenario !== "object") {
-    throw new Error("INVALID_TERMINATION_SCENARIO");
+  if (!isRecord(scenario)) {
+    fail("INVALID_TERMINATION_SCENARIO", {
+      field: "terminationScenario"
+    });
   }
   if (
     scenario.kind === "MUTUAL_AGREEMENT" &&
     (scenario.proposedBy === "employer" || scenario.proposedBy === "employee")
   ) {
-    return scenario;
+    return {
+      kind: "MUTUAL_AGREEMENT",
+      proposedBy: scenario.proposedBy
+    };
   }
   if (
     scenario.kind === "ARTICLE_40" &&
     (scenario.noticeMethod === "notice_30_days" ||
       scenario.noticeMethod === "payment_in_lieu")
   ) {
-    return scenario;
+    return {
+      kind: "ARTICLE_40",
+      noticeMethod: scenario.noticeMethod
+    };
   }
   if (
     scenario.kind === "ARTICLE_38_EMPLOYEE_TERMINATION" ||
     scenario.kind === "VOLUNTARY_RESIGNATION" ||
     scenario.kind === "UNCLEAR"
   ) {
-    return scenario;
+    return { kind: scenario.kind };
   }
   if (
     scenario.kind === "UNLAWFUL_TERMINATION" &&
     typeof scenario.continuedPerformanceRequested === "boolean" &&
     typeof scenario.continuedPerformancePossible === "boolean"
   ) {
-    return scenario;
+    return {
+      kind: "UNLAWFUL_TERMINATION",
+      continuedPerformanceRequested:
+        scenario.continuedPerformanceRequested,
+      continuedPerformancePossible:
+        scenario.continuedPerformancePossible
+    };
   }
-  throw new Error("INVALID_TERMINATION_SCENARIO");
+  fail("INVALID_TERMINATION_SCENARIO", {
+    field: "terminationScenario"
+  });
+};
+
+const parsePolicyInput = (value: unknown): PolicyInput => {
+  if (!isRecord(value) || Object.keys(value).length === 0) {
+    fail("INVALID_POLICY_INPUT", { field: "input" });
+  }
+  if (
+    typeof value.regionCode !== "string" ||
+    !/^\d{6}$/.test(value.regionCode) ||
+    typeof value.regionName !== "string" ||
+    !value.regionName.trim()
+  ) {
+    fail("INVALID_REGION", {
+      field:
+        typeof value.regionCode !== "string" ||
+        !/^\d{6}$/.test(value.regionCode)
+          ? "regionCode"
+          : "regionName"
+    });
+  }
+  if (
+    typeof value.startDate !== "string" ||
+    typeof value.endDate !== "string"
+  ) {
+    fail("INVALID_EMPLOYMENT_DATE", {
+      field:
+        typeof value.startDate !== "string" ? "startDate" : "endDate"
+    });
+  }
+
+  const terminationScenario = assertScenario(value.terminationScenario);
+  if (
+    !Array.isArray(value.monthlyEarnedWagesFen) ||
+    value.monthlyEarnedWagesFen.length < 1 ||
+    value.monthlyEarnedWagesFen.length > 12
+  ) {
+    fail("WAGE_MONTHS_OUT_OF_RANGE", {
+      field: "monthlyEarnedWagesFen"
+    });
+  }
+  const monthlyEarnedWagesFen = value.monthlyEarnedWagesFen.map(
+    (wage) => {
+      assertNonNegativeMoney(wage, "INVALID_WAGE_VALUE", {
+        field: "monthlyEarnedWagesFen"
+      });
+      return wage;
+    }
+  );
+
+  assertPositiveMoney(value.minimumMonthlyWageFen, {
+    field: "minimumMonthlyWageFen"
+  });
+  assertPositiveMoney(value.employeeAverageMonthlyWageFen, {
+    field: "employeeAverageMonthlyWageFen"
+  });
+
+  let alreadyPaidFen: number | undefined;
+  if (value.alreadyPaidFen !== undefined) {
+    assertNonNegativeMoney(
+      value.alreadyPaidFen,
+      "INVALID_ALREADY_PAID",
+      { field: "alreadyPaidFen" }
+    );
+    alreadyPaidFen = value.alreadyPaidFen;
+  }
+
+  return {
+    regionCode: value.regionCode,
+    regionName: value.regionName,
+    startDate: value.startDate,
+    endDate: value.endDate,
+    terminationScenario,
+    monthlyEarnedWagesFen,
+    minimumMonthlyWageFen: value.minimumMonthlyWageFen,
+    employeeAverageMonthlyWageFen:
+      value.employeeAverageMonthlyWageFen,
+    alreadyPaidFen
+  };
 };
 
 const describeScenario = (
@@ -228,7 +357,7 @@ const describeScenario = (
     case "MUTUAL_AGREEMENT":
       return scenario.proposedBy === "employer"
         ? "用人单位提出协商解除，按N计算经济补偿"
-        : "劳动者提出协商解除，法定经济补偿需结合协议及事实复核，暂按0分保守展示";
+        : "劳动者提出协商解除，法定经济补偿需结合协议及事实复核，以待复核区间展示";
     case "ARTICLE_40":
       return scenario.noticeMethod === "notice_30_days"
         ? "用人单位依据第四十条解除并已提前三十日书面通知"
@@ -239,7 +368,7 @@ const describeScenario = (
       return "劳动者自愿辞职，法定经济补偿按0分计算";
     case "UNLAWFUL_TERMINATION":
       return continuedPerformanceRequired
-        ? "违法解除，继续履行劳动合同优先，现金金额暂按0分展示"
+        ? "违法解除，继续履行劳动合同优先"
         : "违法解除，按二倍经济补偿计算赔偿金";
     case "UNCLEAR":
       return "解除情形尚不明确，现金结果按支持情形的保守范围展示并需复核";
@@ -260,24 +389,14 @@ const noticePayExplanation = (
   return `按解除前一个完整工资月${noticePayBasisFen}分计算，代通知金为${noticePayFen}分`;
 };
 
-export const calculatePolicy = (input: PolicyInput): PolicyOutput => {
-  if (
-    typeof input.regionCode !== "string" ||
-    !input.regionCode.trim() ||
-    typeof input.regionName !== "string" ||
-    !input.regionName.trim()
-  ) {
-    throw new Error("INVALID_REGION");
-  }
-  const scenario = assertScenario(input.terminationScenario);
+export const calculatePolicy = (value: unknown): PolicyOutput => {
+  const input = parsePolicyInput(value);
+  const scenario = input.terminationScenario;
   const { serviceMonths, serviceRemainderDays } = serviceDuration(
     input.startDate,
     input.endDate
   );
-  assertPositiveMoney(input.minimumMonthlyWageFen);
-  assertPositiveMoney(input.employeeAverageMonthlyWageFen);
   const alreadyPaidFen = input.alreadyPaidFen ?? 0;
-  assertNonNegativeMoney(alreadyPaidFen, "INVALID_ALREADY_PAID");
 
   const rawAverageWageFen = averageFen(input.monthlyEarnedWagesFen);
   const noticePayBasisFen =
@@ -357,10 +476,18 @@ export const calculatePolicy = (input: PolicyInput): PolicyOutput => {
     }
   }
 
-  const differenceFen =
-    payableFen > alreadyPaidFen
-      ? safeMoney(new PolicyDecimal(payableFen).minus(alreadyPaidFen))
+  const remainingAfterPaid = (amountFen: number) =>
+    amountFen > alreadyPaidFen
+      ? safeMoney(
+          new PolicyDecimal(amountFen).minus(alreadyPaidFen)
+        )
       : 0;
+  const payableDetermined = !reviewRequired;
+  const differenceFen = remainingAfterPaid(payableFen);
+  const differenceRangeFen = {
+    low: remainingAfterPaid(rangeFen.low),
+    high: remainingAfterPaid(rangeFen.high)
+  };
   const formulaSteps: FormulaStep[] = [
     {
       key: "service",
@@ -405,18 +532,30 @@ export const calculatePolicy = (input: PolicyInput): PolicyOutput => {
         noticePayBasisFen,
         noticePayFen
       )
-    },
-    {
-      key: "payment",
-      label: "已支付与剩余应付",
-      value: `应付${payableFen}分，已支付${alreadyPaidFen}分，剩余应付${differenceFen}分`
     }
   ];
   if (reviewRequired) {
     formulaSteps.push({
-      key: "review",
-      label: "复核范围",
-      value: `当前保守范围为${rangeFen.low}分至${rangeFen.high}分，需补充解除事实后确认`
+      key: "payment",
+      label: "待复核金额",
+      value:
+        `待复核金额区间 ${rangeFen.low}–${rangeFen.high} 分；` +
+        `已支付 ${alreadyPaidFen} 分；` +
+        `剩余金额区间 ${differenceRangeFen.low}–${differenceRangeFen.high} 分，待事实复核`
+    });
+  } else if (continuedPerformanceRequired) {
+    formulaSteps.push({
+      key: "payment",
+      label: "继续履行优先",
+      value:
+        "继续履行劳动合同优先；" +
+        `当前现金金额为${payableFen}分；已支付${alreadyPaidFen}分`
+    });
+  } else {
+    formulaSteps.push({
+      key: "payment",
+      label: "已支付与剩余应付",
+      value: `应付${payableFen}分，已支付${alreadyPaidFen}分，剩余应付${differenceFen}分`
     });
   }
 
@@ -430,9 +569,11 @@ export const calculatePolicy = (input: PolicyInput): PolicyOutput => {
     baseCompensationFen,
     noticePayBasisFen,
     noticePayFen,
+    payableDetermined,
     payableFen,
     alreadyPaidFen,
     differenceFen,
+    differenceRangeFen,
     rangeFen,
     reviewRequired,
     continuedPerformanceRequired,
