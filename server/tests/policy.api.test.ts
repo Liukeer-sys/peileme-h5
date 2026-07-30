@@ -9,16 +9,45 @@ import {
   it
 } from "vitest";
 import { createApp } from "../app.js";
+import { getConfig, resetConfigForTests } from "../config.js";
 import { closePool, getPool, query } from "../db.js";
 import { runMigrations } from "../migrate.js";
 import { seedPolicyFoundation } from "../modules/policy/seed.js";
-import { signAccessToken, type AuthUser } from "../security.js";
+import { sha256, signAccessToken, type AuthUser } from "../security.js";
 import { importAdministrativeRegions } from "../../scripts/import-administrative-regions.js";
 import { importRegionalParameters } from "../../scripts/import-regional-parameters.js";
 
 const authHeader = (token: string) => ({
   authorization: `Bearer ${token}`
 });
+
+const firstSetCookie = (response: request.Response) => {
+  const value = response.headers["set-cookie"];
+  if (!Array.isArray(value) || !value[0]) {
+    throw new Error("Expected a Set-Cookie response header");
+  }
+  return value[0];
+};
+
+const cookieHeader = (response: request.Response) =>
+  firstSetCookie(response).split(";", 1)[0];
+
+const allCookieHeaders = (response: request.Response) => {
+  const value = response.headers["set-cookie"];
+  if (!Array.isArray(value)) {
+    throw new Error("Expected Set-Cookie response headers");
+  }
+  return value.map((cookie) => cookie.split(";", 1)[0]).join("; ");
+};
+
+const csrfToken = (response: request.Response) => {
+  const value = response.headers["set-cookie"];
+  const cookie = Array.isArray(value)
+    ? value.find((item) => item.startsWith("peileme_csrf="))
+    : undefined;
+  if (!cookie) throw new Error("Expected a CSRF cookie");
+  return decodeURIComponent(cookie.slice("peileme_csrf=".length).split(";", 1)[0]);
+};
 
 const waitUntil = async (
   predicate: () => Promise<boolean>,
@@ -148,6 +177,372 @@ beforeEach(async () => {
 
 afterAll(async () => {
   await closePool();
+});
+
+describe("shared authentication sessions", () => {
+  const login = (
+    origin: string,
+    identifier = "policy-user@peileme.test",
+    userAgent = "Peileme Test Browser"
+  ) =>
+    request(createApp())
+      .post("/api/auth/login")
+      .set("origin", origin)
+      .set("user-agent", userAgent)
+      .send({ identifier, password: "PolicyPass123" });
+
+  it("requires a production CSRF secret distinct from the development default", () => {
+    const original = {
+      NODE_ENV: process.env.NODE_ENV,
+      JWT_SECRET: process.env.JWT_SECRET,
+      OTP_SECRET: process.env.OTP_SECRET,
+      CSRF_SECRET: process.env.CSRF_SECRET
+    };
+    try {
+      process.env.NODE_ENV = "production";
+      process.env.JWT_SECRET =
+        "production-jwt-secret-that-is-longer-than-thirty-two-characters";
+      process.env.OTP_SECRET =
+        "production-otp-secret-that-is-longer-than-thirty-two-characters";
+      process.env.CSRF_SECRET = "development-only-csrf-secret-change-me";
+      resetConfigForTests();
+
+      expect(() => getConfig()).toThrow(
+        "CSRF_SECRET must be configured in production"
+      );
+    } finally {
+      Object.entries(original).forEach(([key, value]) => {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      });
+      resetConfigForTests();
+    }
+  });
+
+  it("sets and clears a shared secure refresh cookie with consistent scope", async () => {
+    const original = {
+      NODE_ENV: process.env.NODE_ENV,
+      APP_ORIGIN: process.env.APP_ORIGIN,
+      COOKIE_DOMAIN: process.env.COOKIE_DOMAIN,
+      JWT_SECRET: process.env.JWT_SECRET,
+      OTP_SECRET: process.env.OTP_SECRET,
+      CSRF_SECRET: process.env.CSRF_SECRET
+    };
+    try {
+      process.env.NODE_ENV = "production";
+      process.env.APP_ORIGIN =
+        "https://peileme.art,https://www.peileme.art,https://ai.peileme.art";
+      process.env.COOKIE_DOMAIN = ".peileme.art";
+      process.env.JWT_SECRET =
+        "production-jwt-secret-that-is-longer-than-thirty-two-characters";
+      process.env.OTP_SECRET =
+        "production-otp-secret-that-is-longer-than-thirty-two-characters";
+      process.env.CSRF_SECRET =
+        "production-csrf-secret-that-is-longer-than-thirty-two-characters";
+      resetConfigForTests();
+
+      const loginResponse = await request(createApp())
+        .post("/api/auth/login")
+        .set("origin", "https://peileme.art")
+        .send({
+          identifier: "policy-user@peileme.test",
+          password: "PolicyPass123"
+        })
+        .expect(200);
+      const issued = firstSetCookie(loginResponse);
+      expect(issued).toContain("Domain=.peileme.art");
+      expect(issued).toContain("Path=/api/auth");
+      expect(issued).toContain("HttpOnly");
+      expect(issued).toContain("Secure");
+      expect(issued).toContain("SameSite=Lax");
+
+      const logoutResponse = await request(createApp())
+        .post("/api/auth/logout")
+        .set("origin", "https://ai.peileme.art")
+        .set("cookie", allCookieHeaders(loginResponse))
+        .set("x-csrf-token", csrfToken(loginResponse))
+        .expect(204);
+      const cleared = firstSetCookie(logoutResponse);
+      expect(cleared).toContain("peileme_refresh=;");
+      expect(cleared).toContain("Domain=.peileme.art");
+      expect(cleared).toContain("Path=/api/auth");
+      expect(cleared).toContain("HttpOnly");
+      expect(cleared).toContain("Secure");
+      expect(cleared).toContain("SameSite=Lax");
+      expect(cleared).toContain("Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+    } finally {
+      Object.entries(original).forEach(([key, value]) => {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      });
+      resetConfigForTests();
+    }
+  });
+
+  it.each([
+    "http://localhost:5173",
+    "http://ai.localhost:5174"
+  ])("allows login and refresh from configured Origin %s", async (origin) => {
+    const loggedIn = await login(origin).expect(200);
+    expect(loggedIn.headers["access-control-allow-origin"]).toBe(origin);
+
+    const refreshed = await request(createApp())
+      .post("/api/auth/refresh")
+      .set("origin", origin)
+      .set("cookie", allCookieHeaders(loggedIn))
+      .set("x-csrf-token", csrfToken(loggedIn))
+      .expect(200);
+    expect(refreshed.headers["access-control-allow-origin"]).toBe(origin);
+    expect(refreshed.body.accessToken).toBeTruthy();
+    expect(firstSetCookie(refreshed)).toContain("peileme_refresh=");
+  });
+
+  it("rejects cookie-auth requests from an unknown Origin", async () => {
+    const loggedIn = await login("http://localhost:5173").expect(200);
+
+    const response = await request(createApp())
+      .post("/api/auth/refresh")
+      .set("origin", "https://attacker.example")
+      .set("cookie", allCookieHeaders(loggedIn))
+      .set("x-csrf-token", csrfToken(loggedIn))
+      .expect(403);
+
+    expect(response.body).toMatchObject({
+      error: "ORIGIN_FORBIDDEN",
+      message: "请求来源未获授权"
+    });
+  });
+
+  it("requires a matching signed CSRF token for refresh mutations", async () => {
+    const loggedIn = await login("http://localhost:5173").expect(200);
+    expect(() => csrfToken(loggedIn)).not.toThrow();
+
+    await request(createApp())
+      .post("/api/auth/refresh")
+      .set("origin", "http://localhost:5173")
+      .set("cookie", allCookieHeaders(loggedIn))
+      .expect(403)
+      .expect({
+        error: "CSRF_INVALID",
+        message: "安全校验失败，请刷新页面后重试"
+      });
+
+    await request(createApp())
+      .post("/api/auth/refresh")
+      .set("origin", "http://localhost:5173")
+      .set("cookie", allCookieHeaders(loggedIn))
+      .set("x-csrf-token", "forged-token")
+      .expect(403);
+
+    await request(createApp())
+      .post("/api/auth/refresh")
+      .set("origin", "http://localhost:5173")
+      .set("cookie", allCookieHeaders(loggedIn))
+      .set("x-csrf-token", csrfToken(loggedIn))
+      .expect(200);
+  });
+
+  it("lists only the authenticated user's active device sessions", async () => {
+    const first = await login(
+      "http://localhost:5173",
+      "policy-user@peileme.test",
+      "Peileme Desktop"
+    ).expect(200);
+    const current = await login(
+      "http://ai.localhost:5174",
+      "policy-user@peileme.test",
+      "Peileme Mobile"
+    ).expect(200);
+    await login(
+      "http://localhost:5173",
+      "other-policy-user@peileme.test",
+      "Foreign Device"
+    ).expect(200);
+
+    const response = await request(createApp())
+      .get("/api/auth/sessions")
+      .set(authHeader(current.body.accessToken))
+      .set("cookie", cookieHeader(current))
+      .expect(200);
+
+    expect(response.body.items).toHaveLength(2);
+    expect(
+      response.body.items.map((item: { userAgent: string }) => item.userAgent)
+    ).toEqual(expect.arrayContaining(["Peileme Desktop", "Peileme Mobile"]));
+    expect(
+      response.body.items.filter((item: { isCurrent: boolean }) => item.isCurrent)
+    ).toHaveLength(1);
+    expect(
+      response.body.items.find((item: { isCurrent: boolean }) => item.isCurrent)
+        .userAgent
+    ).toBe("Peileme Mobile");
+    expect(cookieHeader(first)).not.toBe(cookieHeader(current));
+  });
+
+  it("does not reveal or revoke another user's session", async () => {
+    const owner = await login("http://localhost:5173").expect(200);
+    const foreign = await login(
+      "http://ai.localhost:5174",
+      "other-policy-user@peileme.test"
+    ).expect(200);
+    const foreignToken = decodeURIComponent(
+      cookieHeader(foreign).replace("peileme_refresh=", "")
+    );
+    const foreignRow = await query<{ id: string }>(
+      "SELECT id FROM refresh_sessions WHERE token_hash = $1",
+      [sha256(foreignToken)]
+    );
+
+    const response = await request(createApp())
+      .delete(`/api/auth/sessions/${foreignRow.rows[0].id}`)
+      .set("origin", "http://localhost:5173")
+      .set(authHeader(owner.body.accessToken))
+      .set("cookie", allCookieHeaders(owner))
+      .set("x-csrf-token", csrfToken(owner))
+      .expect(404);
+    expect(response.body).toEqual({
+      error: "SESSION_NOT_FOUND",
+      message: "设备会话不存在"
+    });
+
+    const unchanged = await query<{ revoked_at: Date | null }>(
+      "SELECT revoked_at FROM refresh_sessions WHERE id = $1",
+      [foreignRow.rows[0].id]
+    );
+    expect(unchanged.rows[0].revoked_at).toBeNull();
+  });
+
+  it("revokes another owned session without clearing the current cookie", async () => {
+    const oldSession = await login(
+      "http://localhost:5173",
+      "policy-user@peileme.test",
+      "Old Browser"
+    ).expect(200);
+    const current = await login(
+      "http://ai.localhost:5174",
+      "policy-user@peileme.test",
+      "Current Browser"
+    ).expect(200);
+    const sessions = await request(createApp())
+      .get("/api/auth/sessions")
+      .set(authHeader(current.body.accessToken))
+      .set("cookie", cookieHeader(current))
+      .expect(200);
+    const oldId = sessions.body.items.find(
+      (item: { userAgent: string }) => item.userAgent === "Old Browser"
+    ).id;
+
+    const revoked = await request(createApp())
+      .delete(`/api/auth/sessions/${oldId}`)
+      .set("origin", "http://ai.localhost:5174")
+      .set(authHeader(current.body.accessToken))
+      .set("cookie", allCookieHeaders(current))
+      .set("x-csrf-token", csrfToken(current))
+      .expect(204);
+    expect(revoked.headers["set-cookie"]).toBeUndefined();
+
+    await request(createApp())
+      .post("/api/auth/refresh")
+      .set("origin", "http://localhost:5173")
+      .set("cookie", allCookieHeaders(oldSession))
+      .set("x-csrf-token", csrfToken(oldSession))
+      .expect(401);
+    await request(createApp())
+      .post("/api/auth/refresh")
+      .set("origin", "http://ai.localhost:5174")
+      .set("cookie", allCookieHeaders(current))
+      .set("x-csrf-token", csrfToken(current))
+      .expect(200);
+  });
+
+  it("revokes the current owned session and clears its refresh cookie", async () => {
+    const current = await login("http://localhost:5173").expect(200);
+    const sessions = await request(createApp())
+      .get("/api/auth/sessions")
+      .set(authHeader(current.body.accessToken))
+      .set("cookie", cookieHeader(current))
+      .expect(200);
+    const currentId = sessions.body.items.find(
+      (item: { isCurrent: boolean }) => item.isCurrent
+    ).id;
+
+    const revoked = await request(createApp())
+      .delete(`/api/auth/sessions/${currentId}`)
+      .set("origin", "http://localhost:5173")
+      .set(authHeader(current.body.accessToken))
+      .set("cookie", allCookieHeaders(current))
+      .set("x-csrf-token", csrfToken(current))
+      .expect(204);
+    const cleared = firstSetCookie(revoked);
+    expect(cleared).toContain("peileme_refresh=;");
+    expect(cleared).toContain("Path=/api/auth");
+
+    await request(createApp())
+      .post("/api/auth/refresh")
+      .set("origin", "http://localhost:5173")
+      .set("cookie", allCookieHeaders(current))
+      .set("x-csrf-token", csrfToken(current))
+      .expect(401);
+  });
+
+  it("revokes all other owned sessions while retaining the current session", async () => {
+    await login(
+      "http://localhost:5173",
+      "policy-user@peileme.test",
+      "First Browser"
+    ).expect(200);
+    await login(
+      "http://localhost:5173",
+      "policy-user@peileme.test",
+      "Second Browser"
+    ).expect(200);
+    const current = await login(
+      "http://ai.localhost:5174",
+      "policy-user@peileme.test",
+      "Current Browser"
+    ).expect(200);
+
+    const revoked = await request(createApp())
+      .post("/api/auth/sessions/revoke-others")
+      .set("origin", "http://ai.localhost:5174")
+      .set(authHeader(current.body.accessToken))
+      .set("cookie", allCookieHeaders(current))
+      .set("x-csrf-token", csrfToken(current))
+      .expect(200);
+    expect(revoked.body.revoked).toBe(2);
+
+    const remaining = await request(createApp())
+      .get("/api/auth/sessions")
+      .set(authHeader(current.body.accessToken))
+      .set("cookie", cookieHeader(current))
+      .expect(200);
+    expect(remaining.body.items).toHaveLength(1);
+    expect(remaining.body.items[0]).toMatchObject({
+      userAgent: "Current Browser",
+      isCurrent: true
+    });
+
+    await request(createApp())
+      .post("/api/auth/refresh")
+      .set("origin", "http://ai.localhost:5174")
+      .set("cookie", allCookieHeaders(current))
+      .set("x-csrf-token", csrfToken(current))
+      .expect(200);
+  });
+
+  it("requires an owned active refresh cookie to preserve a current session", async () => {
+    const current = await login("http://localhost:5173").expect(200);
+
+    await request(createApp())
+      .post("/api/auth/sessions/revoke-others")
+      .set("origin", "http://localhost:5173")
+      .set(authHeader(current.body.accessToken))
+      .expect(400)
+      .expect({
+        error: "SESSION_CONTEXT_REQUIRED",
+        message: "当前设备会话不可用，请重新登录"
+      });
+  });
 });
 
 describe("versioned policy public API", () => {

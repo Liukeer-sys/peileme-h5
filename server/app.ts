@@ -26,11 +26,15 @@ import {
   clearRefreshCookie,
   consumeOtp,
   issueSession,
+  listOwnedSessions,
   normalizeTarget,
   redeemInvite,
   registerUser,
+  revokeOtherSessions,
+  revokeOwnedSession,
   sendOtp,
   validateInvite,
+  verifyCsrfRequest,
   verifyCodeLogin,
   verifyPasswordLogin,
   type OtpPurpose
@@ -55,6 +59,24 @@ const passwordSchema = z
   .regex(/[A-Za-z]/, "密码需包含字母")
   .regex(/\d/, "密码需包含数字");
 const uuidSchema = z.string().uuid();
+
+const refreshTokenFrom = (request: Request) =>
+  String(request.cookies?.peileme_refresh || "");
+
+const requireValidCsrf = (
+  request: Request,
+  response: Response,
+  next: NextFunction
+) => {
+  if (!refreshTokenFrom(request) || verifyCsrfRequest(request)) {
+    next();
+    return;
+  }
+  response.status(403).json({
+    error: "CSRF_INVALID",
+    message: "安全校验失败，请刷新页面后重试"
+  });
+};
 
 const otpRateLimiter = rateLimit({
   windowMs: 10 * 60_000,
@@ -216,6 +238,26 @@ export const createApp = (
     });
   });
 
+  const allowedOrigins = new Set(
+    config.APP_ORIGIN.split(",")
+      .map((origin) => origin.trim())
+      .filter(Boolean)
+  );
+  app.use(
+    "/api/auth",
+    (request: Request, response: Response, next: NextFunction) => {
+      const origin = request.header("origin");
+      if (origin && !allowedOrigins.has(origin)) {
+        response.status(403).json({
+          error: "ORIGIN_FORBIDDEN",
+          message: "请求来源未获授权"
+        });
+        return;
+      }
+      next();
+    }
+  );
+
   app.post("/api/auth/send-code", otpRateLimiter, async (request, response) => {
     const body = z
       .object({
@@ -288,8 +330,8 @@ export const createApp = (
     response.json({ reset: true, channel: normalized.channel });
   });
 
-  app.post("/api/auth/refresh", async (request, response) => {
-    const refreshToken = String(request.cookies?.peileme_refresh || "");
+  app.post("/api/auth/refresh", requireValidCsrf, async (request, response) => {
+    const refreshToken = refreshTokenFrom(request);
     if (!refreshToken) {
       response.status(204).end();
       return;
@@ -332,8 +374,8 @@ export const createApp = (
     response.json(await issueSession(user, request, response));
   });
 
-  app.post("/api/auth/logout", async (request, response) => {
-    const refreshToken = String(request.cookies?.peileme_refresh || "");
+  app.post("/api/auth/logout", requireValidCsrf, async (request, response) => {
+    const refreshToken = refreshTokenFrom(request);
     if (refreshToken) {
       await query(
         "UPDATE refresh_sessions SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL",
@@ -347,6 +389,43 @@ export const createApp = (
   app.get("/api/auth/me", requireAuth, (request, response) => {
     response.json({ user: publicUser(request.authUser!) });
   });
+
+  app.get("/api/auth/sessions", requireAuth, async (request, response) => {
+    const items = await listOwnedSessions(
+      request.authUser!.id,
+      refreshTokenFrom(request)
+    );
+    response.json({ items });
+  });
+
+  app.delete(
+    "/api/auth/sessions/:id",
+    requireAuth,
+    requireValidCsrf,
+    async (request, response) => {
+      const id = uuidSchema.parse(request.params.id);
+      const revoked = await revokeOwnedSession(
+        request.authUser!.id,
+        id,
+        refreshTokenFrom(request)
+      );
+      if (revoked.isCurrent) clearRefreshCookie(response);
+      response.status(204).end();
+    }
+  );
+
+  app.post(
+    "/api/auth/sessions/revoke-others",
+    requireAuth,
+    requireValidCsrf,
+    async (request, response) => {
+      const revoked = await revokeOtherSessions(
+        request.authUser!.id,
+        refreshTokenFrom(request)
+      );
+      response.json({ revoked });
+    }
+  );
 
   app.patch("/api/auth/me", requireAuth, async (request, response) => {
     const body = z

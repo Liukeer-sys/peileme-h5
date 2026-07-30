@@ -28,9 +28,20 @@ type SessionResponse = {
   user: User;
 };
 
+export type DeviceSession = {
+  id: string;
+  userAgent: string | null;
+  ip: string | null;
+  expiresAt: string;
+  lastUsedAt: string | null;
+  createdAt: string;
+  isCurrent: boolean;
+};
+
 type AuthContextValue = {
   user: User | null;
   grants: Grant[];
+  sessions: DeviceSession[];
   ready: boolean;
   sendCode: (target: string, purpose: "register" | "login" | "reset_password") => Promise<{ debugCode?: string }>;
   login: (identifier: string, credential: { password?: string; code?: string }) => Promise<void>;
@@ -44,8 +55,11 @@ type AuthContextValue = {
   resetPassword: (target: string, code: string, password: string) => Promise<void>;
   updateProfile: (displayName: string) => Promise<void>;
   logout: () => Promise<void>;
+  revokeSession: (id: string) => Promise<void>;
+  revokeOtherSessions: () => Promise<number>;
   redeemInvite: (code: string) => Promise<string[]>;
   reloadGrants: () => Promise<void>;
+  reloadSessions: () => Promise<void>;
 };
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -53,6 +67,7 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [grants, setGrants] = useState<Grant[]>([]);
+  const [sessions, setSessions] = useState<DeviceSession[]>([]);
   const [ready, setReady] = useState(false);
 
   const reloadGrants = useCallback(async () => {
@@ -64,16 +79,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const reloadSessions = useCallback(async () => {
+    try {
+      const result = await api<{ items: DeviceSession[] }>("/api/auth/sessions", {
+        auth: true
+      });
+      setSessions(result.items);
+    } catch {
+      setSessions([]);
+    }
+  }, []);
+
   const acceptSession = useCallback(
     async (session: SessionResponse) => {
       setAccessToken(session.accessToken);
       setUser(session.user);
       await Promise.all([
         reloadGrants(),
+        reloadSessions(),
         api("/api/assessments/claim", { method: "POST", auth: true }).catch(() => undefined)
       ]);
     },
-    [reloadGrants]
+    [reloadGrants, reloadSessions]
   );
 
   useEffect(() => {
@@ -85,7 +112,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           const me = await api<{ user: User }>("/api/auth/me", { auth: true });
           if (active) {
             setUser(me.user);
-            await reloadGrants();
+            await Promise.all([reloadGrants(), reloadSessions()]);
           }
         } catch {
           setAccessToken(null);
@@ -96,12 +123,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => {
       active = false;
     };
-  }, [reloadGrants]);
+  }, [reloadGrants, reloadSessions]);
 
   const value = useMemo<AuthContextValue>(
     () => ({
       user,
       grants,
+      sessions,
       ready,
       sendCode: (target, purpose) =>
         api("/api/auth/send-code", {
@@ -147,7 +175,36 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setAccessToken(null);
         setUser(null);
         setGrants([]);
+        setSessions([]);
         track("auth_logged_out");
+      },
+      revokeSession: async (id) => {
+        const revokedCurrent = sessions.some(
+          (session) => session.id === id && session.isCurrent
+        );
+        await api(`/api/auth/sessions/${id}`, {
+          method: "DELETE",
+          auth: true
+        });
+        if (revokedCurrent) {
+          setAccessToken(null);
+          setUser(null);
+          setGrants([]);
+          setSessions([]);
+          track("auth_session_revoked", { current: true });
+          return;
+        }
+        await reloadSessions();
+        track("auth_session_revoked", { current: false });
+      },
+      revokeOtherSessions: async () => {
+        const result = await api<{ revoked: number }>(
+          "/api/auth/sessions/revoke-others",
+          { method: "POST", auth: true }
+        );
+        await reloadSessions();
+        track("auth_other_sessions_revoked", { count: result.revoked });
+        return result.revoked;
       },
       redeemInvite: async (code) => {
         const result = await api<{ grants: string[] }>("/api/invites/redeem", {
@@ -159,9 +216,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         track("invite_redeemed", { modules: result.grants });
         return result.grants;
       },
-      reloadGrants
+      reloadGrants,
+      reloadSessions
     }),
-    [acceptSession, grants, ready, reloadGrants, user]
+    [
+      acceptSession,
+      grants,
+      ready,
+      reloadGrants,
+      reloadSessions,
+      sessions,
+      user
+    ]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

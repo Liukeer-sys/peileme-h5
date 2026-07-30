@@ -19,6 +19,15 @@ export const sessionId = persistentId(SESSION_KEY, "session", window.sessionStor
 let accessToken: string | null = null;
 let refreshPromise: Promise<boolean> | null = null;
 
+const csrfHeader = (): Record<string, string> => {
+  const token = document.cookie
+    .split(";")
+    .map((item) => item.trim())
+    .find((item) => item.startsWith("peileme_csrf="))
+    ?.slice("peileme_csrf=".length);
+  return token ? { "x-csrf-token": decodeURIComponent(token) } : {};
+};
+
 export class ApiError extends Error {
   status: number;
   code: string;
@@ -41,7 +50,8 @@ const refreshSession = async () => {
       credentials: "include",
       headers: {
         "x-visitor-id": visitorId,
-        "x-session-id": sessionId
+        "x-session-id": sessionId,
+        ...csrfHeader()
       }
     })
       .then(async (response) => {
@@ -83,6 +93,7 @@ export async function api<T>(path: string, options: ApiOptions = {}): Promise<T>
       "x-visitor-id": visitorId,
       "x-session-id": sessionId,
       ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+      ...csrfHeader(),
       ...headers
     },
     body:
@@ -121,7 +132,8 @@ export async function downloadFromApi(path: string, fallbackName: string) {
       headers: {
         "x-visitor-id": visitorId,
         "x-session-id": sessionId,
-        ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {})
+        ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+        ...csrfHeader()
       }
     });
   let response = await makeRequest();
@@ -201,7 +213,8 @@ window.addEventListener("pagehide", () => {
       "content-type": "application/json",
       "x-visitor-id": visitorId,
       "x-session-id": sessionId,
-      ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {})
+      ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+      ...csrfHeader()
     },
     body: payload
   });

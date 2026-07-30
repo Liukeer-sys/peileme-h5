@@ -10,9 +10,11 @@ const envSchema = z.object({
   PORT: z.coerce.number().int().positive().default(3001),
   DATABASE_URL: z.string().min(1).default("postgresql://peileme:peileme@127.0.0.1:5432/peileme"),
   APP_ORIGIN: z.string().default("http://localhost:5173"),
+  COOKIE_DOMAIN: z.string().optional(),
   TRUST_PROXY: z.coerce.number().int().min(0).default(1),
   JWT_SECRET: z.string().min(32).default("development-only-jwt-secret-change-me"),
   OTP_SECRET: z.string().min(32).default("development-only-otp-secret-change-me"),
+  CSRF_SECRET: z.string().min(32).default("development-only-csrf-secret-change-me"),
   ACCESS_TOKEN_TTL_MINUTES: z.coerce.number().int().positive().default(15),
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(30),
   OTP_TTL_MINUTES: z.coerce.number().int().positive().max(30).default(10),
@@ -48,6 +50,9 @@ export const getConfig = () => {
       }
       if (cachedConfig.OTP_SECRET.startsWith("development-only")) {
         throw new Error("OTP_SECRET must be configured in production");
+      }
+      if (cachedConfig.CSRF_SECRET.startsWith("development-only")) {
+        throw new Error("CSRF_SECRET must be configured in production");
       }
     }
   }

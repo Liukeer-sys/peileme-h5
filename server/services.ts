@@ -1,5 +1,6 @@
+import crypto from "node:crypto";
 import type pg from "pg";
-import type { Request, Response } from "express";
+import type { CookieOptions, Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import { getConfig } from "./config.js";
 import { query, withTransaction } from "./db.js";
@@ -201,24 +202,176 @@ export const redeemInvite = async (
   return { code: invite.code, grants };
 };
 
-const setRefreshCookie = (response: Response, token: string) => {
-  response.cookie("peileme_refresh", token, {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: getConfig().NODE_ENV === "production",
-    path: "/api/auth",
-    maxAge: getConfig().REFRESH_TOKEN_TTL_DAYS * 86_400_000
-  });
+const sharedCookieOptions = (path: string): CookieOptions => ({
+  sameSite: "lax",
+  secure: getConfig().NODE_ENV === "production",
+  domain: getConfig().COOKIE_DOMAIN || undefined,
+  path
+});
+
+const refreshCookieOptions = (): CookieOptions => ({
+  ...sharedCookieOptions("/api/auth"),
+  httpOnly: true,
+  maxAge: getConfig().REFRESH_TOKEN_TTL_DAYS * 86_400_000
+});
+
+const csrfCookieOptions = (): CookieOptions => ({
+  ...sharedCookieOptions("/"),
+  httpOnly: false,
+  maxAge: getConfig().REFRESH_TOKEN_TTL_DAYS * 86_400_000
+});
+
+const csrfSignature = (nonce: string) =>
+  crypto
+    .createHmac("sha256", getConfig().CSRF_SECRET)
+    .update(nonce)
+    .digest("base64url");
+
+const createCsrfToken = () => {
+  const nonce = createOpaqueToken();
+  return `${nonce}.${csrfSignature(nonce)}`;
+};
+
+const safeEqual = (left: string, right: string) => {
+  const leftBuffer = Buffer.from(left);
+  const rightBuffer = Buffer.from(right);
+  return leftBuffer.length === rightBuffer.length &&
+    crypto.timingSafeEqual(leftBuffer, rightBuffer);
+};
+
+export const verifyCsrfRequest = (request: Request) => {
+  const cookieToken = String(request.cookies?.peileme_csrf || "");
+  const headerToken = String(request.header("x-csrf-token") || "");
+  if (!cookieToken || !headerToken || !safeEqual(cookieToken, headerToken)) {
+    return false;
+  }
+  const separator = cookieToken.lastIndexOf(".");
+  if (separator < 1) return false;
+  const nonce = cookieToken.slice(0, separator);
+  const signature = cookieToken.slice(separator + 1);
+  return Boolean(signature) && safeEqual(signature, csrfSignature(nonce));
+};
+
+const setSessionCookies = (response: Response, refreshToken: string) => {
+  response.cookie("peileme_refresh", refreshToken, refreshCookieOptions());
+  response.cookie("peileme_csrf", createCsrfToken(), csrfCookieOptions());
 };
 
 export const clearRefreshCookie = (response: Response) => {
-  response.clearCookie("peileme_refresh", {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: getConfig().NODE_ENV === "production",
-    path: "/api/auth"
-  });
+  const { maxAge: _refreshMaxAge, ...refreshOptions } = refreshCookieOptions();
+  const { maxAge: _csrfMaxAge, ...csrfOptions } = csrfCookieOptions();
+  response.clearCookie("peileme_refresh", refreshOptions);
+  response.clearCookie("peileme_csrf", csrfOptions);
 };
+
+export type DeviceSession = {
+  id: string;
+  userAgent: string | null;
+  ip: string | null;
+  expiresAt: Date;
+  lastUsedAt: Date | null;
+  createdAt: Date;
+  isCurrent: boolean;
+};
+
+export const listOwnedSessions = async (
+  userId: string,
+  refreshToken: string
+): Promise<DeviceSession[]> => {
+  const currentTokenHash = refreshToken ? sha256(refreshToken) : "";
+  const result = await query<{
+    id: string;
+    user_agent: string | null;
+    ip: string | null;
+    expires_at: Date;
+    last_used_at: Date | null;
+    created_at: Date;
+    is_current: boolean;
+  }>(
+    `SELECT id, user_agent, ip::text, expires_at, last_used_at, created_at,
+            token_hash = $2 AS is_current
+       FROM refresh_sessions
+      WHERE user_id = $1
+        AND revoked_at IS NULL
+        AND expires_at > now()
+      ORDER BY created_at DESC`,
+    [userId, currentTokenHash]
+  );
+  return result.rows.map((row) => ({
+    id: row.id,
+    userAgent: row.user_agent,
+    ip: row.ip,
+    expiresAt: row.expires_at,
+    lastUsedAt: row.last_used_at,
+    createdAt: row.created_at,
+    isCurrent: row.is_current
+  }));
+};
+
+export const revokeOwnedSession = async (
+  userId: string,
+  sessionId: string,
+  refreshToken: string
+) => {
+  const result = await query<{ token_hash: string }>(
+    `UPDATE refresh_sessions
+        SET revoked_at = now()
+      WHERE id = $1
+        AND user_id = $2
+        AND revoked_at IS NULL
+      RETURNING token_hash`,
+    [sessionId, userId]
+  );
+  const session = result.rows[0];
+  if (!session) {
+    throw new ApiError(404, "SESSION_NOT_FOUND", "设备会话不存在");
+  }
+  return {
+    isCurrent:
+      Boolean(refreshToken) && safeEqual(session.token_hash, sha256(refreshToken))
+  };
+};
+
+export const revokeOtherSessions = async (
+  userId: string,
+  refreshToken: string
+) =>
+  withTransaction(async (client) => {
+    if (!refreshToken) {
+      throw new ApiError(
+        400,
+        "SESSION_CONTEXT_REQUIRED",
+        "当前设备会话不可用，请重新登录"
+      );
+    }
+    const current = await client.query<{ id: string }>(
+      `SELECT id
+         FROM refresh_sessions
+        WHERE user_id = $1
+          AND token_hash = $2
+          AND revoked_at IS NULL
+          AND expires_at > now()
+        LIMIT 1
+        FOR UPDATE`,
+      [userId, sha256(refreshToken)]
+    );
+    if (!current.rows[0]) {
+      throw new ApiError(
+        400,
+        "SESSION_CONTEXT_REQUIRED",
+        "当前设备会话不可用，请重新登录"
+      );
+    }
+    const revoked = await client.query(
+      `UPDATE refresh_sessions
+          SET revoked_at = now()
+        WHERE user_id = $1
+          AND id <> $2
+          AND revoked_at IS NULL`,
+      [userId, current.rows[0].id]
+    );
+    return revoked.rowCount || 0;
+  });
 
 export const issueSession = async (
   user: AuthUser,
@@ -238,7 +391,7 @@ export const issueSession = async (
       getConfig().REFRESH_TOKEN_TTL_DAYS
     ]
   );
-  setRefreshCookie(response, refreshToken);
+  setSessionCookies(response, refreshToken);
   return {
     accessToken: await signAccessToken(user),
     expiresInSeconds: getConfig().ACCESS_TOKEN_TTL_MINUTES * 60,
