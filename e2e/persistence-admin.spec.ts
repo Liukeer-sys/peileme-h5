@@ -84,6 +84,7 @@ test("生产持久化、私有下载与管理后台回查", async ({ page, brows
   });
   const adminPage = await adminContext.newPage();
   const adminErrors: string[] = [];
+  const adminServerErrors: string[] = [];
   adminPage.on("console", (message) => {
     if (
       message.type() === "error" &&
@@ -93,6 +94,11 @@ test("生产持久化、私有下载与管理后台回查", async ({ page, brows
     }
   });
   adminPage.on("pageerror", (error) => adminErrors.push(error.message));
+  adminPage.on("response", (response) => {
+    if (response.status() >= 500) {
+      adminServerErrors.push(`${response.status()} ${response.url()}`);
+    }
+  });
   await adminPage.goto("/admin");
   await adminPage.getByRole("button", { name: "管理员登录" }).click();
   await adminPage.getByRole("button", { name: "密码登录" }).click();
@@ -138,5 +144,6 @@ test("生产持久化、私有下载与管理后台回查", async ({ page, brows
   expect(browserErrors, browserErrors.join("\n")).toEqual([]);
   expect(serverErrors, serverErrors.join("\n")).toEqual([]);
   expect(adminErrors, adminErrors.join("\n")).toEqual([]);
+  expect(adminServerErrors, adminServerErrors.join("\n")).toEqual([]);
   await adminContext.close();
 });
