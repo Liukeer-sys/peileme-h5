@@ -198,7 +198,7 @@ const renderHighlightedEquivalentLead = (lead: string, count: number) => {
 const getIconGroup = (category: string) => {
   if (["咖啡", "奶茶", "加班续命", "酒精疗愈"].includes(category)) return "drink";
   if (["午饭", "外卖", "早餐", "城市美食"].includes(category)) return "food";
-  if (["数码", "会员", "办公装备"].includes(category)) return "tech";
+  if (["数码", "AI会员", "会员", "办公装备"].includes(category)) return "tech";
   if (category === "新能源车") return "car";
   if (["租房", "生活成本", "家电", "家具"].includes(category)) return "home";
   if (["旅行", "学习提升"].includes(category)) return "travel";
@@ -491,7 +491,6 @@ export default function ResultCard({ result, onSticker, postExitWish, onReselect
     </section>
   );
 }
-
 
 
 

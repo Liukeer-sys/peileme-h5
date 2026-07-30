@@ -33,11 +33,12 @@ describe("compile-time product channel", () => {
 
 describe("independent web artifact contracts", () => {
   it("uses separate static roots without cross-channel imports", async () => {
-    const [mainEntry, aiEntry, indexHtml, aiHtml] = await Promise.all([
+    const [mainEntry, aiEntry, indexHtml, aiHtml, aiStyles] = await Promise.all([
       readProjectFile("src/main-entry.tsx"),
       readProjectFile("src/ai-entry.tsx"),
       readProjectFile("index.html"),
-      readProjectFile("ai.html")
+      readProjectFile("ai.html"),
+      readProjectFile("src/ai/ai.css")
     ]);
 
     expect(mainEntry).toContain('import MainApp from "./main/MainApp"');
@@ -47,6 +48,9 @@ describe("independent web artifact contracts", () => {
     expect(indexHtml).toContain('src="/src/main-entry.tsx"');
     expect(indexHtml).not.toMatch(/AI|文件签署|文件审查/);
     expect(aiHtml).toContain('src="/src/ai-entry.tsx"');
+    expect(aiEntry).toContain('import "./ai/ai.css"');
+    expect(mainEntry).not.toContain("ai.css");
+    expect(aiStyles).toContain(".ai-intro");
   });
 
   it("pins channels and output directories in dedicated Vite configs", async () => {
@@ -61,6 +65,27 @@ describe("independent web artifact contracts", () => {
     expect(aiConfig).toContain('outDir: "dist-ai"');
     expect(aiConfig).toContain('input: "ai.html"');
     expect(aiConfig).toContain('bundle["index.html"]');
+    expect(mainConfig).toContain("createProductBoundaryPlugin(\"main\")");
+    expect(aiConfig).toContain("createProductBoundaryPlugin(\"ai\")");
+    expect(aiConfig).toContain('publicDir: "public-ai"');
+    expect(aiConfig).not.toContain("transformIndexHtml");
+    expect(aiConfig).not.toContain(".replace(");
+    expect(aiConfig).not.toContain('motion: ["motion"]');
+  });
+
+  it("keeps the independent AI template stable when main metadata changes", async () => {
+    const [indexHtml, aiHtml] = await Promise.all([
+      readProjectFile("index.html"),
+      readProjectFile("ai.html")
+    ]);
+    const changedMain = indexHtml
+      .replace("牛马身价预评估", "主站元数据变更")
+      .replace("政策测算", "主站政策试算");
+
+    expect(changedMain).toContain("主站元数据变更");
+    expect(aiHtml).toContain("赔了么 AI - 离职补偿深度分析");
+    expect(aiHtml).not.toContain("主站元数据变更");
+    expect(aiHtml).not.toContain("主站政策试算");
   });
 
   it("uses a channel-aware Vite config for local development and previews", async () => {
@@ -90,21 +115,34 @@ describe("independent web artifact contracts", () => {
     expect(aiDockerfile).toContain("/app/dist-ai");
     expect(aiDockerfile).toContain("deploy/nginx-ai.conf");
     expect(aiDockerfile).not.toContain("/app/dist-main");
+    expect(aiDockerfile).toContain("COPY public-ai ./public-ai");
+    expect(aiDockerfile).not.toContain("COPY public ./public");
     expect(legacyDockerfile).toContain("npm run build:web:main");
     expect(legacyDockerfile).toContain("/app/dist-main");
+    expect(legacyDockerfile).toContain("deploy/nginx-main.conf");
+    expect(legacyDockerfile).not.toContain("deploy/nginx.conf");
 
     for (const config of [mainNginx, aiNginx]) {
       expect(config).toContain("listen 80;");
       expect(config).toContain("set $api_upstream http://api:3001;");
       expect(config).toContain("proxy_pass $api_upstream;");
       expect(config).toContain("try_files $uri $uri/ /index.html;");
+      expect(config).toContain('add_header Content-Security-Policy');
+      expect(config).toContain('add_header Permissions-Policy');
+      expect(config).not.toContain('add_header Cache-Control "public, immutable"');
+      expect(config).not.toContain('add_header Cache-Control "no-cache"');
     }
   });
 
   it("styles the AI landing shell for the existing mobile frame", async () => {
-    const styles = await readProjectFile("src/styles.css");
+    const [styles, aiStyles] = await Promise.all([
+      readProjectFile("src/styles.css"),
+      readProjectFile("src/ai/ai.css")
+    ]);
 
-    expect(styles).toContain(".ai-intro");
-    expect(styles).toContain(".status-pill");
+    expect(styles).not.toContain(".ai-intro");
+    expect(styles).not.toContain(".status-pill");
+    expect(aiStyles).toContain(".ai-intro");
+    expect(aiStyles).toContain(".status-pill");
   });
 });

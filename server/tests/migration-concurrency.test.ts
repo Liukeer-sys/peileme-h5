@@ -198,6 +198,141 @@ describe("migration concurrency", () => {
   );
 
   it(
+    "removes legacy document grants and enforces the controlled module set",
+    async () => {
+      const baseUrl = new URL(process.env.DATABASE_URL!);
+      const databaseName =
+        `peileme_grants_${randomUUID().replaceAll("-", "")}`;
+      const adminUrl = new URL(baseUrl);
+      adminUrl.pathname = "/postgres";
+      const databaseUrl = new URL(baseUrl);
+      databaseUrl.pathname = `/${databaseName}`;
+      const admin = new Client({ connectionString: adminUrl.toString() });
+      let databaseCreated = false;
+      try {
+        await admin.connect();
+        await admin.query(`CREATE DATABASE "${databaseName}"`);
+        databaseCreated = true;
+
+        const setup = new Client({ connectionString: databaseUrl.toString() });
+        await setup.connect();
+        try {
+          for (const version of [
+            "001_initial.sql",
+            "002_policy_foundation.sql",
+            "003_policy_parameter_provenance.sql",
+            "004_refresh_session_rotation.sql"
+          ]) {
+            const sql = await readFile(
+              path.resolve("database/migrations", version),
+              "utf8"
+            );
+            await setup.query(sql);
+            await setup.query(
+              `INSERT INTO schema_migrations(version)
+               VALUES ($1)
+               ON CONFLICT DO NOTHING`,
+              [version]
+            );
+          }
+          const user = await setup.query<{ id: string }>(
+            `INSERT INTO users(email)
+             VALUES ('legacy-grants@peileme.test')
+             RETURNING id`
+          );
+          await setup.query(
+            `INSERT INTO invite_codes(code, grants)
+             VALUES
+               (
+                 'LEGACY-GRANTS',
+                 '["documentReview","caseLawPack","unknown-module"]'::jsonb
+               ),
+               ('MALFORMED-GRANTS', '{"legacy":true}'::jsonb)`
+          );
+          await setup.query(
+            `INSERT INTO access_grants(user_id, module, source)
+             VALUES
+               ($1, 'documentReview', 'legacy'),
+               ($1, 'unknown-module', 'legacy'),
+               ($1, 'evidencePack', 'legacy')`,
+            [user.rows[0].id]
+          );
+        } finally {
+          await setup.end();
+        }
+
+        const migrated = await runMigrationProcess(databaseUrl.toString());
+        expect(migrated.status, `${migrated.stdout}\n${migrated.stderr}`).toBe(
+          0
+        );
+
+        const verify = new Client({ connectionString: databaseUrl.toString() });
+        await verify.connect();
+        try {
+          const invite = await verify.query<{ grants: string[] }>(
+            "SELECT grants FROM invite_codes WHERE code = 'LEGACY-GRANTS'"
+          );
+          expect(invite.rows[0].grants).toEqual(["caseLawPack"]);
+          const malformedInvite = await verify.query<{ grants: string[] }>(
+            "SELECT grants FROM invite_codes WHERE code = 'MALFORMED-GRANTS'"
+          );
+          expect(malformedInvite.rows[0].grants).toEqual([]);
+
+          const access = await verify.query<{ module: string }>(
+            "SELECT module FROM access_grants ORDER BY module"
+          );
+          expect(access.rows).toEqual([{ module: "evidencePack" }]);
+
+          const defaultInvite = await verify.query<{ grants: string[] }>(
+            `INSERT INTO invite_codes(code)
+             VALUES ('CONTROLLED-DEFAULT')
+             RETURNING grants`
+          );
+          expect(defaultInvite.rows[0].grants).toEqual([
+            "caseLawPack",
+            "evidencePack"
+          ]);
+
+          await expect(
+            verify.query(
+              `UPDATE invite_codes
+                  SET grants = '["documentReview"]'::jsonb
+                WHERE code = 'LEGACY-GRANTS'`
+            )
+          ).rejects.toMatchObject({
+            constraint: "invite_codes_grants_controlled"
+          });
+          await expect(
+            verify.query(
+              `INSERT INTO access_grants(user_id, module, source)
+               SELECT id, 'documentReview', 'invalid'
+                 FROM users
+                WHERE email = 'legacy-grants@peileme.test'`
+            )
+          ).rejects.toMatchObject({
+            constraint: "access_grants_module_controlled"
+          });
+        } finally {
+          await verify.end();
+        }
+      } finally {
+        if (databaseCreated) {
+          await admin.query(
+            `SELECT pg_terminate_backend(pid)
+               FROM pg_stat_activity
+              WHERE datname = $1
+                AND pid <> pg_backend_pid()`,
+            [databaseName]
+          );
+          await admin.query(`DROP DATABASE IF EXISTS "${databaseName}"`);
+        }
+        await admin.end();
+      }
+    },
+    15_000
+  );
+
+  it(
     "serializes two migration processes against one clean database",
     async () => {
       const baseUrl = new URL(process.env.DATABASE_URL!);
@@ -256,7 +391,8 @@ describe("migration concurrency", () => {
             { version: "001_initial.sql" },
             { version: "002_policy_foundation.sql" },
             { version: "003_policy_parameter_provenance.sql" },
-            { version: "004_refresh_session_rotation.sql" }
+            { version: "004_refresh_session_rotation.sql" },
+            { version: "005_remove_document_review_grants.sql" }
           ]);
           const tables = await verify.query<{ count: string }>(
             `SELECT count(*)::text AS count

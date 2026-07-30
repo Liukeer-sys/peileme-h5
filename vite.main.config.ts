@@ -1,8 +1,9 @@
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
+import { createProductBoundaryPlugin } from "./vite.product-boundary";
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), createProductBoundaryPlugin("main")],
   define: {
     "import.meta.env.VITE_PRODUCT_CHANNEL": JSON.stringify("main")
   },

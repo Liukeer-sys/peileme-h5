@@ -23,6 +23,7 @@ import {
 } from "./modules/policy/routes.js";
 import { type PolicyOutput } from "./modules/policy/types.js";
 import {
+  ACCESS_GRANT_MODULES,
   clearRefreshCookie,
   consumeOtp,
   issueSession,
@@ -34,6 +35,7 @@ import {
   revokeOwnedSession,
   revokeSessionByRefreshToken,
   rotateRefreshSession,
+  sanitizeGrantModules,
   sendOtp,
   validateInvite,
   verifyCsrfRequest,
@@ -443,7 +445,7 @@ export const createApp = (
   app.post("/api/invites/validate", async (request, response) => {
     const body = z.object({ code: z.string().trim().min(4).max(80) }).parse(request.body);
     const invite = await withTransaction((client) => validateInvite(client, body.code));
-    response.json({ valid: true, grants: invite.grants });
+    response.json({ valid: true, grants: sanitizeGrantModules(invite.grants) });
   });
 
   app.post("/api/invites/redeem", requireAuth, async (request, response) => {
@@ -459,9 +461,10 @@ export const createApp = (
       `SELECT DISTINCT module, expires_at
          FROM access_grants
         WHERE user_id = $1
+          AND module = ANY($2::text[])
           AND (expires_at IS NULL OR expires_at > now())
         ORDER BY module`,
-      [request.authUser!.id]
+      [request.authUser!.id, ACCESS_GRANT_MODULES]
     );
     response.json({ grants: result.rows });
   });
@@ -869,7 +872,12 @@ export const createApp = (
         ORDER BY i.created_at DESC
         LIMIT 500`
     );
-    response.json({ items: result.rows });
+    response.json({
+      items: result.rows.map((item) => ({
+        ...item,
+        grants: sanitizeGrantModules(item.grants)
+      }))
+    });
   });
 
   app.post("/api/admin/invites", requireSuperAdmin, async (request, response) => {
@@ -880,9 +888,9 @@ export const createApp = (
         maxUses: z.coerce.number().int().positive().max(100_000).default(1),
         expiresAt: z.string().datetime().nullable().optional(),
         grants: z
-          .array(z.enum(["caseLawPack", "evidencePack", "documentReview"]))
+          .array(z.enum(ACCESS_GRANT_MODULES))
           .min(1)
-          .default(["caseLawPack", "evidencePack", "documentReview"])
+          .default([...ACCESS_GRANT_MODULES])
       })
       .parse(request.body);
     const code = (body.code || `PLM-${nanoid(5)}-${nanoid(5)}`).toUpperCase();

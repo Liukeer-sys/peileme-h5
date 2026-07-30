@@ -18,10 +18,30 @@ export type User = {
   status: "active" | "disabled";
 };
 
+export const grantModules = ["caseLawPack", "evidencePack"] as const;
+export type GrantModule = (typeof grantModules)[number];
+
 type Grant = {
-  module: string;
+  module: GrantModule;
   expires_at: string | null;
 };
+
+const isGrantModule = (value: unknown): value is GrantModule =>
+  typeof value === "string" &&
+  (grantModules as readonly string[]).includes(value);
+
+const sanitizeGrants = (value: unknown): Grant[] => {
+  if (!Array.isArray(value)) return [];
+  return value.filter(
+    (grant): grant is Grant =>
+      typeof grant === "object" &&
+      grant !== null &&
+      isGrantModule((grant as { module?: unknown }).module)
+  );
+};
+
+const sanitizeGrantModules = (value: unknown): GrantModule[] =>
+  Array.isArray(value) ? value.filter(isGrantModule) : [];
 
 type SessionResponse = {
   accessToken: string;
@@ -57,7 +77,7 @@ type AuthContextValue = {
   logout: () => Promise<void>;
   revokeSession: (id: string) => Promise<void>;
   revokeOtherSessions: () => Promise<number>;
-  redeemInvite: (code: string) => Promise<string[]>;
+  redeemInvite: (code: string) => Promise<GrantModule[]>;
   reloadGrants: () => Promise<void>;
   reloadSessions: () => Promise<void>;
 };
@@ -100,8 +120,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const reloadGrants = useCallback(async () => {
     try {
-      const result = await api<{ grants: Grant[] }>("/api/access/me", { auth: true });
-      setGrants(result.grants);
+      const result = await api<{ grants: unknown }>("/api/access/me", { auth: true });
+      setGrants(sanitizeGrants(result.grants));
     } catch {
       setGrants([]);
     }
@@ -239,14 +259,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return result.revoked;
       },
       redeemInvite: async (code) => {
-        const result = await api<{ grants: string[] }>("/api/invites/redeem", {
+        const result = await api<{ grants: unknown }>("/api/invites/redeem", {
           method: "POST",
           auth: true,
           body: { code }
         });
         await reloadGrants();
-        track("invite_redeemed", { modules: result.grants });
-        return result.grants;
+        const modules = sanitizeGrantModules(result.grants);
+        track("invite_redeemed", { modules });
+        return modules;
       },
       reloadGrants,
       reloadSessions

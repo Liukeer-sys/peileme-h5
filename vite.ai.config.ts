@@ -1,17 +1,20 @@
 import react from "@vitejs/plugin-react";
 import { defineConfig, type Plugin } from "vite";
+import { createProductBoundaryPlugin } from "./vite.product-boundary";
 
 const serveAiAtRoot = (): Plugin => ({
   name: "peileme-serve-ai-at-root",
   apply: "serve",
-  transformIndexHtml(html) {
-    return html
-      .replace("/src/main-entry.tsx", "/src/ai-entry.tsx")
-      .replace(
-        "赔了么：离职补偿政策测算、计算过程、法规依据与证据清单。",
-        "赔了么 AI：离职补偿深度分析与劳动文件审查。"
-      )
-      .replace("赔了么 - 牛马身价预评估", "赔了么 AI - 离职补偿深度分析");
+  configureServer(server) {
+    server.middlewares.use((request, response, next) => {
+      if (request.url === "/") {
+        response.statusCode = 302;
+        response.setHeader("Location", "/ai.html");
+        response.end();
+        return;
+      }
+      next();
+    });
   }
 });
 
@@ -30,7 +33,13 @@ const normalizeAiHtmlName = (): Plugin => ({
 });
 
 export default defineConfig({
-  plugins: [serveAiAtRoot(), react(), normalizeAiHtmlName()],
+  plugins: [
+    serveAiAtRoot(),
+    react(),
+    normalizeAiHtmlName(),
+    createProductBoundaryPlugin("ai")
+  ],
+  publicDir: "public-ai",
   define: {
     "import.meta.env.VITE_PRODUCT_CHANNEL": JSON.stringify("ai")
   },
@@ -42,8 +51,7 @@ export default defineConfig({
       output: {
         entryFileNames: "assets/index-[hash].js",
         manualChunks: {
-          react: ["react", "react-dom", "react-dom/client"],
-          motion: ["motion"]
+          react: ["react", "react-dom", "react-dom/client"]
         }
       }
     }

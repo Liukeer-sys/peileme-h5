@@ -19,6 +19,19 @@ import {
 } from "./security.js";
 
 export type OtpPurpose = "register" | "login" | "bind" | "reset_password";
+export const ACCESS_GRANT_MODULES = ["caseLawPack", "evidencePack"] as const;
+export type AccessGrantModule = (typeof ACCESS_GRANT_MODULES)[number];
+
+const isAccessGrantModule = (value: unknown): value is AccessGrantModule =>
+  typeof value === "string" &&
+  (ACCESS_GRANT_MODULES as readonly string[]).includes(value);
+
+export const sanitizeGrantModules = (modules: unknown): AccessGrantModule[] => {
+  if (!Array.isArray(modules)) return [];
+  return ACCESS_GRANT_MODULES.filter((moduleName) =>
+    modules.some((value) => isAccessGrantModule(value) && value === moduleName)
+  );
+};
 
 export const normalizeTarget = (rawTarget: string) => {
   const value = rawTarget.trim();
@@ -144,7 +157,7 @@ type InviteRecord = {
   code: string;
   max_uses: number;
   used_count: number;
-  grants: string[];
+  grants: unknown;
 };
 
 export const validateInvite = async (
@@ -190,13 +203,13 @@ export const redeemInvite = async (
     "UPDATE invite_codes SET used_count = used_count + 1, updated_at = now() WHERE id = $1",
     [invite.id]
   );
-  const grants = Array.isArray(invite.grants) ? invite.grants : [];
+  const grants = sanitizeGrantModules(invite.grants);
   for (const moduleName of grants) {
     await client.query(
       `INSERT INTO access_grants(user_id, module, source, source_id)
        VALUES ($1, $2, 'invite', $3)
        ON CONFLICT DO NOTHING`,
-      [userId, String(moduleName), invite.id]
+      [userId, moduleName, invite.id]
     );
   }
   return { code: invite.code, grants };

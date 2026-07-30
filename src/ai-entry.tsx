@@ -5,6 +5,7 @@ import { AuthProvider } from "./auth/AuthContext";
 import { productChannel } from "./product-channel";
 import "./styles.css";
 import "./admin/admin.css";
+import "./ai/ai.css";
 
 const AdminDashboard = lazy(() => import("./admin/AdminDashboard"));
 

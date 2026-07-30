@@ -42,7 +42,6 @@ describe("built web artifact verifier", () => {
     "documentReview",
     "AiShell",
     "AI 深度分析",
-    "AI会员",
     "providerChain"
   ])(
     "rejects %s in the main artifact",
@@ -66,6 +65,20 @@ describe("built web artifact verifier", () => {
 
     await expect(verifyWebArtifacts(directories)).rejects.toThrow(
       "AI artifact is missing marker: AI 深度分析版"
+    );
+  });
+
+  it("rejects persona image payloads copied into the AI artifact", async () => {
+    const directories = await makeArtifacts(
+      "<title>赔了么政策测算</title>",
+      "<span>AI 深度分析版</span>"
+    );
+    const personaDir = path.join(directories.aiDir, "persona_images");
+    await mkdir(personaDir);
+    await writeFile(path.join(personaDir, "unused.png"), Buffer.alloc(1024));
+
+    await expect(verifyWebArtifacts(directories)).rejects.toThrow(
+      "AI artifact contains main-only static payload: persona_images/unused.png"
     );
   });
 });

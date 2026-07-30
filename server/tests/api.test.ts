@@ -1745,7 +1745,8 @@ describe("policy persistence foundation", () => {
       { version: "001_initial.sql" },
       { version: "002_policy_foundation.sql" },
       { version: "003_policy_parameter_provenance.sql" },
-      { version: "004_refresh_session_rotation.sql" }
+      { version: "004_refresh_session_rotation.sql" },
+      { version: "005_remove_document_review_grants.sql" }
     ]);
 
     const preserved = await query<{
@@ -1843,6 +1844,17 @@ describe("health and authentication", () => {
 });
 
 describe("invites and access grants", () => {
+  it("rejects the removed document review grant", async () => {
+    await request(createApp())
+      .post("/api/admin/invites")
+      .set("authorization", `Bearer ${adminToken}`)
+      .send({
+        maxUses: 1,
+        grants: ["documentReview"]
+      })
+      .expect(400);
+  });
+
   it("creates and redeems a scoped invite", async () => {
     const app = createApp();
     const created = await request(app)

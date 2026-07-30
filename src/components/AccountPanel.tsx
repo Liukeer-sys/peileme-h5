@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useAuth } from "../auth/AuthContext";
+import { useAuth, type GrantModule } from "../auth/AuthContext";
 import { api, ApiError, downloadFromApi, track } from "../lib/api";
 
 type AssessmentItem = {
@@ -23,7 +23,7 @@ type AccountPanelProps = {
   onClose: () => void;
 };
 
-const moduleNames: Record<string, string> = {
+const moduleNames: Record<GrantModule, string> = {
   caseLawPack: "案例法条包",
   evidencePack: "离职证据包"
 };
@@ -63,7 +63,7 @@ export default function AccountPanel({ open, onClose }: AccountPanelProps) {
     setMessage("");
     try {
       const modules = await redeemInvite(invite);
-      setMessage(`已解锁：${modules.map((item) => moduleNames[item] || item).join("、")}`);
+      setMessage(`已解锁：${modules.map((item) => moduleNames[item]).join("、")}`);
       setInvite("");
     } catch (error) {
       setMessage(error instanceof ApiError ? error.message : "兑换失败，请稍后重试");
@@ -135,7 +135,7 @@ export default function AccountPanel({ open, onClose }: AccountPanelProps) {
           <div className="grant-list">
             {grants.length ? (
               grants.map((grant) => (
-                <span key={grant.module}>✓ {moduleNames[grant.module] || grant.module}</span>
+                <span key={grant.module}>✓ {moduleNames[grant.module]}</span>
               ))
             ) : (
               <p>当前没有已解锁的增值内容。</p>

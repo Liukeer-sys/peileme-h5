@@ -4,7 +4,7 @@ ARG VITE_SHARE_URL
 ENV VITE_SHARE_URL=$VITE_SHARE_URL
 COPY package.json package-lock.json ./
 RUN npm ci
-COPY index.html tsconfig.json vite.main.config.ts ./
+COPY index.html tsconfig.json vite.main.config.ts vite.product-boundary.ts ./
 COPY public ./public
 COPY src ./src
 RUN npm run build:web:main

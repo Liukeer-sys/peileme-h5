@@ -11,7 +11,6 @@ const forbiddenMainMarkers = [
   "documentReview",
   "AiShell",
   "AI 深度分析",
-  "AI会员",
   "providerChain",
   "providerConfig",
   "LLM_PROVIDER",
@@ -21,13 +20,13 @@ const forbiddenMainMarkers = [
 ];
 const requiredAiMarker = "AI 深度分析版";
 
-const listTextFiles = async (root: string): Promise<string[]> => {
+const listFiles = async (root: string): Promise<string[]> => {
   const entries = await readdir(root, { withFileTypes: true });
   const nested = await Promise.all(
     entries.map(async (entry) => {
       const absolutePath = path.join(root, entry.name);
-      if (entry.isDirectory()) return listTextFiles(absolutePath);
-      return textExtensions.has(path.extname(entry.name)) ? [absolutePath] : [];
+      if (entry.isDirectory()) return listFiles(absolutePath);
+      return [absolutePath];
     })
   );
   return nested.flat();
@@ -40,10 +39,24 @@ export const verifyWebArtifacts = async ({
   mainDir,
   aiDir
 }: VerifyWebArtifactsOptions) => {
-  const [mainFiles, aiFiles] = await Promise.all([
-    listTextFiles(mainDir),
-    listTextFiles(aiDir)
+  const [mainAllFiles, aiAllFiles] = await Promise.all([
+    listFiles(mainDir),
+    listFiles(aiDir)
   ]);
+  const mainFiles = mainAllFiles.filter((file) =>
+    textExtensions.has(path.extname(file))
+  );
+  const aiFiles = aiAllFiles.filter((file) =>
+    textExtensions.has(path.extname(file))
+  );
+  const mainOnlyAiFile = aiAllFiles
+    .map((file) => path.relative(aiDir, file).replaceAll("\\", "/"))
+    .find((file) => file.startsWith("persona_images/"));
+  if (mainOnlyAiFile) {
+    throw new Error(
+      `AI artifact contains main-only static payload: ${mainOnlyAiFile}`
+    );
+  }
   const [mainArtifact, aiArtifact] = await Promise.all([
     readArtifact(mainFiles),
     readArtifact(aiFiles)
