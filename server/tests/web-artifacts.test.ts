@@ -121,6 +121,7 @@ describe("independent web artifact contracts", () => {
     expect(legacyDockerfile).toContain("/app/dist-main");
     expect(legacyDockerfile).toContain("deploy/nginx-main.conf");
     expect(legacyDockerfile).not.toContain("deploy/nginx.conf");
+    expect(legacyDockerfile).toBe(mainDockerfile);
 
     for (const config of [mainNginx, aiNginx]) {
       expect(config).toContain("listen 80;");
