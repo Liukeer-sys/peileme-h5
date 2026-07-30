@@ -7,6 +7,7 @@ import {
 } from "@playwright/test";
 import { createHash } from "node:crypto";
 import { Client } from "pg";
+import bcrypt from "bcryptjs";
 
 const baseUrl = process.env.E2E_BASE_URL;
 const apiBaseUrl = process.env.E2E_API_URL || baseUrl;
@@ -21,12 +22,22 @@ const otherUser = {
   email: `other-${runId}@peileme.test`,
   displayName: "其他用户"
 };
+const policyAdmin = {
+  email: `policy-admin-${runId}@peileme.test`,
+  displayName: "政策管理员"
+};
+const policyAnalyst = {
+  email: `policy-analyst-${runId}@peileme.test`,
+  displayName: "政策分析员"
+};
 
 let apiContext: APIRequestContext;
 let userAccessToken = "";
 let otherAccessToken = "";
+let adminAccessToken = "";
+let analystAccessToken = "";
 
-test.describe.configure({ timeout: 30_000 });
+test.describe.configure({ timeout: 60_000 });
 
 const requireUrls = () => {
   if (!baseUrl) {
@@ -112,7 +123,10 @@ const loginAs = async (
     .getByRole("button", { name: "登录", exact: true })
     .click();
   await expect(
-    page.getByRole("button", { name: account.displayName, exact: true })
+    page.getByRole("button", {
+      name: account.displayName.slice(0, 4),
+      exact: true
+    })
   ).toBeVisible();
 };
 
@@ -250,6 +264,75 @@ test.beforeAll(async () => {
   expect(health.status()).toBe(200);
   userAccessToken = (await ensureUser(apiContext, policyUser)).accessToken;
   otherAccessToken = (await ensureUser(apiContext, otherUser)).accessToken;
+  if (!e2eDatabaseUrl) {
+    throw new Error(
+      "E2E_DATABASE_URL is required for Task 8 policy administration acceptance"
+    );
+  }
+  const database = new Client({ connectionString: e2eDatabaseUrl });
+  await database.connect();
+  try {
+    const passwordHash = await bcrypt.hash(password, 4);
+    await database.query(
+      `INSERT INTO users(
+         email, display_name, password_hash, role, status, email_verified_at
+       )
+       VALUES
+         ($1, $2, $3, 'admin', 'active', now()),
+         ($4, $5, $3, 'analyst', 'active', now())
+       ON CONFLICT (lower(email)) WHERE email IS NOT NULL
+       DO UPDATE SET
+         display_name = EXCLUDED.display_name,
+         password_hash = EXCLUDED.password_hash,
+         role = EXCLUDED.role,
+         status = 'active',
+         email_verified_at = coalesce(users.email_verified_at, now()),
+         updated_at = now()`,
+      [
+        policyAdmin.email,
+        policyAdmin.displayName,
+        passwordHash,
+        policyAnalyst.email,
+        policyAnalyst.displayName
+      ]
+    );
+    await database.query(
+      `INSERT INTO administrative_regions(
+         code, name, level, parent_code, status,
+         source_name, source_url, source_snapshot_date
+       )
+       VALUES (
+         '429998', '测试无参数市', 'prefecture', '420000', 'active',
+         'Task 8 E2E fixture', 'https://www.mca.gov.cn/task8/e2e',
+         current_date
+       )
+       ON CONFLICT (code) DO UPDATE
+       SET name = EXCLUDED.name,
+           parent_code = EXCLUDED.parent_code,
+           status = 'active'`
+    );
+    await database.query(
+      `DELETE FROM regional_parameters WHERE region_code = '429998'`
+    );
+  } finally {
+    await database.end();
+  }
+  adminAccessToken = (
+    await apiContext.post("/api/auth/login", {
+      data: { identifier: policyAdmin.email, password }
+    }).then(async (response) => {
+      expect(response.status()).toBe(200);
+      return response.json() as Promise<{ accessToken: string }>;
+    })
+  ).accessToken;
+  analystAccessToken = (
+    await apiContext.post("/api/auth/login", {
+      data: { identifier: policyAnalyst.email, password }
+    }).then(async (response) => {
+      expect(response.status()).toBe(200);
+      return response.json() as Promise<{ accessToken: string }>;
+    })
+  ).accessToken;
 });
 
 test.afterAll(async () => {
@@ -631,7 +714,7 @@ test("工资月明细支持1个月并在无效时阻止提交", async ({ page })
     .click();
 
   await expect(page.getByRole("alert")).toContainText(
-    "请检查近1至12个月的应发工资"
+    "工资金额应大于或等于 0"
   );
   expect(calculateRequests).toBe(0);
   await expect(
@@ -1108,4 +1191,256 @@ test("撤销分享会清除历史遗留的全部有效链接", async ({ page }) 
       (item) => item.status === "active"
     )
   ).toEqual([]);
+});
+
+test("主站阻止非法工资并解释所选城市缺少区域参数", async ({ page }) => {
+  const assertCleanRuntime = watchRuntime(page);
+  await loginAs(page, policyUser);
+  await completeQuestionnaire(page, {
+    searchCity: "测试无参数市"
+  });
+  const firstWage = page.getByLabel(
+    "第1个月税前应发工资（含奖金、津贴、补贴，元，最早）"
+  );
+  await firstWage.fill("-1");
+  await page
+    .getByRole("checkbox", { name: /我已按工资条或流水逐月核对/ })
+    .check();
+  await page
+    .getByRole("button", { name: "生成政策测算", exact: true })
+    .click();
+  await expect(page.getByRole("alert")).toContainText(
+    "工资金额应大于或等于 0"
+  );
+
+  await firstWage.fill("12000");
+  await page
+    .getByRole("checkbox", { name: /我已按工资条或流水逐月核对/ })
+    .check();
+  await expect(
+    page.getByLabel("当地上年度职工月平均工资（元）")
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "生成政策测算", exact: true })
+    .click();
+  await expect(page.getByRole("alert")).toContainText(
+    "请补充缺失的当地参数后再提交"
+  );
+  assertCleanRuntime();
+});
+
+test("管理员校验草稿后发布并创建可追踪回滚版本", async ({ page }) => {
+  const existing = await apiContext.get(
+    "/api/admin/policy/rule-sets/cn-severance/versions",
+    { headers: { authorization: `Bearer ${adminAccessToken}` } }
+  );
+  expect(existing.status()).toBe(200);
+  const existingYears = (
+    (await existing.json()) as {
+      items: Array<{ effectiveFrom: string }>;
+    }
+  ).items.map((item) => Number(item.effectiveFrom.slice(0, 4)));
+  const publishYear = Math.max(2198, ...existingYears) + 1;
+  const rollbackYear = publishYear + 1;
+  const publishDate = `${publishYear}-01-01`;
+  const rollbackDate = `${rollbackYear}-01-01`;
+
+  await loginAs(page, policyAdmin);
+  await page.goto("/admin");
+  await page.getByRole("button", { name: /政策规则/ }).click();
+  await expect(page.getByRole("heading", { name: "规则版本" })).toBeVisible();
+  await expect(page.getByText(/当前生效 v\d+/)).toBeVisible();
+  await expect(page.getByText("回归校验通过").first()).toBeVisible();
+
+  await page.getByRole("button", { name: "新建规则草稿" }).click();
+  const editor = page.getByRole("region", { name: "规则草稿编辑器" });
+  await editor.getByLabel("生效日期").fill(publishDate);
+  const definition = editor.getByLabel("规则定义 JSON");
+  await definition.fill(
+    (await definition.inputValue()).replace(
+      '"schemaVersion": 2',
+      '"schemaVersion": 99'
+    )
+  );
+  await editor.getByRole("button", { name: "保存草稿" }).click();
+  await expect(page.getByRole("alert")).toContainText(
+    "Invalid input: expected 2"
+  );
+
+  const assertCleanRuntime = watchRuntime(page);
+  await definition.fill(
+    (await definition.inputValue()).replace(
+      '"schemaVersion": 99',
+      '"schemaVersion": 2'
+    )
+  );
+  await editor.getByRole("button", { name: "保存草稿" }).click();
+  await expect(page.getByRole("status")).toContainText("草稿已创建");
+  const draft = page
+    .getByRole("article", { name: /规则版本 v\d+/ })
+    .filter({ hasText: publishDate });
+  await expect(draft).toContainText("与当前版本");
+  page.once("dialog", (dialog) => dialog.accept());
+  await draft.getByRole("button", { name: "发布版本" }).click();
+  await expect(page.getByRole("status")).toContainText("版本已发布");
+
+  const rollback = page.getByRole("region", { name: "版本回滚" });
+  await rollback.getByLabel("回滚目标版本").selectOption("1");
+  await rollback.getByLabel("回滚生效日期").fill(rollbackDate);
+  page.once("dialog", (dialog) => dialog.accept());
+  await rollback.getByRole("button", { name: "创建回滚版本" }).click();
+  await expect(page.getByRole("status")).toContainText("回滚版本已创建");
+  await expect(
+    page.getByRole("article", { name: /规则版本 v\d+/ }).first()
+  ).toContainText(rollbackDate);
+  assertCleanRuntime();
+});
+
+test("管理员筛选编辑区域参数并覆盖严格 CSV 成功与失败", async ({ page }) => {
+  const assertCleanRuntime = watchRuntime(page);
+  const restored = await apiContext.put(
+    "/api/admin/policy/regional-parameters",
+    {
+      headers: { authorization: `Bearer ${adminAccessToken}` },
+      data: {
+        regionCode: "420100",
+        year: 2024,
+        parameterType: "employee_average_monthly_wage",
+        amountFen: 940975,
+        sourceName: "武汉市统计局：关于2024年劳动工资统计数据的公告",
+        sourceUrl:
+          "https://tjj.wuhan.gov.cn/xwzx/tzgg/202506/t20250620_2598379.shtml",
+        sourcePublishedAt: "2025-06-20",
+        status: "verified"
+      }
+    }
+  );
+  expect(restored.status()).toBe(200);
+  await loginAs(page, policyAdmin);
+  await page.goto("/admin");
+  await page.getByRole("button", { name: /区域参数/ }).click();
+  await page.getByLabel("省份").selectOption("420000");
+  await page.getByLabel("城市").selectOption("420100");
+  await page.getByLabel("年份").fill("2024");
+  await page
+    .getByLabel("参数类型")
+    .selectOption("employee_average_monthly_wage");
+  await page.getByLabel("审核状态").selectOption("verified");
+  await page.getByRole("button", { name: "应用筛选" }).click();
+  const row = page.getByRole("row", { name: /武汉市.*2024.*职工月平均工资/ });
+  await expect(row).toBeVisible();
+  await row.getByRole("button", { name: /编辑/ }).click();
+  const editor = page.getByRole("region", { name: "编辑区域参数" });
+  await editor.getByLabel("参数金额（元）").fill("9500");
+  await editor.getByLabel("参数状态").selectOption("stale");
+  await editor.getByRole("button", { name: "保存参数" }).click();
+  await expect(page.getByRole("status")).toContainText("参数已保存");
+  await expect(page.getByRole("row", { name: /武汉市.*2024/ })).toContainText(
+    "已过期"
+  );
+
+  const csvInput = page.getByLabel("区域参数 CSV 文件");
+  const header =
+    "region_code,region_name,year,parameter_type,amount_fen,source_name,source_url,source_published_at,status";
+  await csvInput.setInputFiles({
+    name: "regional-parameters.csv",
+    mimeType: "text/csv",
+    buffer: Buffer.from(
+      `${header}\n150100,呼和浩特市,2025,employee_average_monthly_wage,1010000,呼和浩特市统计局,https://tjj.huhhot.gov.cn/task8/e2e.html,2026-06-01,verified`
+    )
+  });
+  await page.getByRole("button", { name: "导入 CSV" }).click();
+  await expect(page.getByRole("status")).toContainText("已导入 1 条参数");
+  assertCleanRuntime();
+
+  await csvInput.setInputFiles({
+    name: "invalid.csv",
+    mimeType: "text/csv",
+    buffer: Buffer.from("region_code,amount_fen\n150100,1010000")
+  });
+  await page.getByRole("button", { name: "导入 CSV" }).click();
+  await expect(page.getByRole("alert")).toContainText(
+    "CSV header must be exactly"
+  );
+});
+
+test("管理员完成公告草稿发布归档与草稿删除", async ({ page }) => {
+  await loginAs(page, policyAdmin);
+  await page.goto("/admin");
+  await page.getByRole("button", { name: /公告设置/ }).click();
+  await page.getByRole("button", { name: "新建公告" }).click();
+  const editor = page.getByRole("region", { name: "公告编辑器" });
+  await editor.getByRole("button", { name: "保存公告" }).click();
+  await expect(page.getByRole("alert")).toContainText("请填写公告标题和正文");
+  await editor.getByLabel("公告标题").fill(`Task8 维护公告 ${runId}`);
+  await editor.getByLabel("公告正文").fill("区域政策参数将在凌晨维护。");
+  await editor.getByLabel("投放位置").selectOption("main");
+  await editor.getByLabel("公告状态").selectOption("draft");
+  await editor.getByRole("button", { name: "保存公告" }).click();
+  await expect(page.getByRole("status")).toContainText("公告已创建");
+
+  const announcement = page.getByRole("article", {
+    name: `公告 Task8 维护公告 ${runId}`
+  });
+  await announcement.getByRole("button", { name: "编辑公告" }).click();
+  await editor.getByLabel("公告状态").selectOption("published");
+  await editor.getByRole("button", { name: "保存公告" }).click();
+  await expect(page.getByRole("status")).toContainText("公告已更新");
+  await announcement.getByRole("button", { name: "编辑公告" }).click();
+  await editor.getByLabel("公告状态").selectOption("archived");
+  await editor.getByRole("button", { name: "保存公告" }).click();
+  await expect(announcement).toContainText("已归档");
+
+  await page.getByRole("button", { name: "新建公告" }).click();
+  await editor.getByLabel("公告标题").fill(`Task8 待删除 ${runId}`);
+  await editor.getByLabel("公告正文").fill("仅用于删除链路验收。");
+  await editor.getByLabel("公告状态").selectOption("draft");
+  await editor.getByRole("button", { name: "保存公告" }).click();
+  const deletable = page.getByRole("article", {
+    name: `公告 Task8 待删除 ${runId}`
+  });
+  page.once("dialog", (dialog) => dialog.accept());
+  await deletable.getByRole("button", { name: "删除草稿" }).click();
+  await expect(page.getByRole("status")).toContainText("公告草稿已删除");
+  await expect(deletable).toHaveCount(0);
+});
+
+test("分析员按 capability 只读查看且普通用户被后台 API 拒绝", async ({
+  page
+}) => {
+  await loginAs(page, policyAnalyst);
+  await page.goto("/admin");
+  await page.getByRole("button", { name: /政策规则/ }).click();
+  await expect(page.getByRole("button", { name: "新建规则草稿" })).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "创建回滚版本" })
+  ).toBeDisabled();
+  const publishButtons = page.getByRole("button", { name: "发布版本" });
+  if (await publishButtons.count()) {
+    await expect(publishButtons.first()).toBeDisabled();
+  }
+
+  await page.getByRole("button", { name: /区域参数/ }).click();
+  await expect(page.getByRole("button", { name: "导入 CSV" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: /编辑/ }).first()).toBeDisabled();
+  await page.getByRole("button", { name: /公告设置/ }).click();
+  await expect(page.getByRole("button", { name: "新建公告" })).toBeDisabled();
+
+  const forbidden = await apiContext.get(
+    "/api/admin/policy/rule-sets/cn-severance/versions",
+    { headers: { authorization: `Bearer ${otherAccessToken}` } }
+  );
+  expect(forbidden.status()).toBe(403);
+  const analystWrite = await apiContext.post(
+    "/api/admin/policy/rule-sets/cn-severance/versions",
+    {
+      headers: { authorization: `Bearer ${analystAccessToken}` },
+      data: {
+        effectiveFrom: "2200-01-01",
+        definition: { schemaVersion: 99 }
+      }
+    }
+  );
+  expect(analystWrite.status()).toBe(403);
+  expect(adminAccessToken).toBeTruthy();
 });

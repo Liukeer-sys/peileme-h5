@@ -385,8 +385,18 @@ export const createApp = (
     }
   );
 
-  app.get("/api/auth/me", requireAuth, (request, response) => {
-    response.json({ user: publicUser(request.authUser!) });
+  app.get("/api/auth/me", requireAuth, async (request, response) => {
+    const capabilities = await query<{ capability: string }>(
+      `SELECT capability
+         FROM role_capabilities
+        WHERE role = $1
+        ORDER BY capability`,
+      [request.authUser!.role]
+    );
+    response.json({
+      user: publicUser(request.authUser!),
+      capabilities: capabilities.rows.map((row) => row.capability)
+    });
   });
 
   app.get("/api/auth/sessions", requireAuth, async (request, response) => {

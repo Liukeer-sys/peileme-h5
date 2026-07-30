@@ -1480,6 +1480,523 @@ export class PolicyRepository {
     });
   }
 
+  async listRegionalParameters({
+    provinceCode,
+    cityCode,
+    year,
+    parameterType,
+    status,
+    page,
+    pageSize
+  }: {
+    provinceCode?: string;
+    cityCode?: string;
+    year?: number;
+    parameterType?: ParameterType;
+    status?: "draft" | "verified" | "stale";
+    page: number;
+    pageSize: number;
+  }) {
+    const values = [
+      provinceCode ?? null,
+      cityCode ?? null,
+      year ?? null,
+      parameterType ?? null,
+      status ?? null
+    ];
+    const where = `
+      WHERE (
+        $1::text IS NULL OR
+        rp.region_code = $1 OR
+        child.parent_code = $1
+      )
+        AND ($2::text IS NULL OR rp.region_code = $2)
+        AND ($3::integer IS NULL OR rp.year = $3)
+        AND ($4::text IS NULL OR rp.parameter_type = $4)
+        AND ($5::text IS NULL OR rp.status = $5)
+    `;
+    const [items, total] = await Promise.all([
+      query<{
+        id: string;
+        region_code: string;
+        region_name: string;
+        province_code: string;
+        province_name: string;
+        year: number;
+        parameter_type: ParameterType;
+        amount_fen: string;
+        source_name: string;
+        source_url: string;
+        source_published_at: string;
+        status: "draft" | "verified" | "stale";
+        reviewed_by: string | null;
+        reviewed_at: string | null;
+        updated_at: string;
+      }>(
+        `SELECT rp.id, rp.region_code, rp.region_name,
+                CASE
+                  WHEN child.level = 'province' THEN child.code
+                  ELSE parent.code
+                END AS province_code,
+                CASE
+                  WHEN child.level = 'province' THEN child.name
+                  ELSE parent.name
+                END AS province_name,
+                rp.year, rp.parameter_type, rp.amount_fen::text,
+                rp.source_name, rp.source_url,
+                rp.source_published_at::text, rp.status,
+                rp.reviewed_by, rp.reviewed_at::text, rp.updated_at::text
+           FROM regional_parameters rp
+           JOIN administrative_regions child ON child.code = rp.region_code
+           LEFT JOIN administrative_regions parent
+             ON parent.code = child.parent_code
+          ${where}
+          ORDER BY rp.year DESC, rp.region_code, rp.parameter_type
+          LIMIT $6 OFFSET $7`,
+        [...values, pageSize, (page - 1) * pageSize]
+      ),
+      query<{ count: string }>(
+        `SELECT count(*)::text AS count
+           FROM regional_parameters rp
+           JOIN administrative_regions child ON child.code = rp.region_code
+          ${where}`,
+        values
+      )
+    ]);
+    return {
+      items: items.rows.map((row) => ({
+        id: row.id,
+        regionCode: row.region_code,
+        regionName: row.region_name,
+        provinceCode: row.province_code,
+        provinceName: row.province_name,
+        year: row.year,
+        parameterType: row.parameter_type,
+        amountFen: Number(row.amount_fen),
+        sourceName: row.source_name,
+        sourceUrl: row.source_url,
+        sourcePublishedAt: row.source_published_at,
+        status: row.status,
+        reviewedBy: row.reviewed_by,
+        reviewedAt: row.reviewed_at,
+        updatedAt: row.updated_at
+      })),
+      pagination: {
+        page,
+        pageSize,
+        total: Number(total.rows[0]?.count || 0)
+      }
+    };
+  }
+
+  async importRegionalParameters({
+    inputs,
+    request
+  }: {
+    inputs: Array<{
+      regionCode: string;
+      regionName: string;
+      year: number;
+      parameterType: ParameterType;
+      amountFen: number;
+      sourceName: string;
+      sourceUrl: string;
+      sourcePublishedAt: string;
+      status: "draft" | "verified" | "stale";
+    }>;
+    request: Request;
+  }) {
+    return withTransaction(async (client) => {
+      const regionCodes = [...new Set(inputs.map((input) => input.regionCode))]
+        .sort();
+      const regions = await client.query<{
+        code: string;
+        name: string;
+        status: string;
+      }>(
+        `SELECT code, name, status
+           FROM administrative_regions
+          WHERE code = ANY($1::text[])
+          ORDER BY code
+          FOR SHARE`,
+        [regionCodes]
+      );
+      const byCode = new Map(regions.rows.map((row) => [row.code, row]));
+      for (const input of inputs) {
+        const region = byCode.get(input.regionCode);
+        if (!region) {
+          throw new Error(`Unknown administrative region ${input.regionCode}`);
+        }
+        if (region.status !== "active") {
+          throw new Error(
+            `Administrative region ${input.regionCode} is not active`
+          );
+        }
+        if (region.name !== input.regionName) {
+          throw new Error(
+            `Region ${input.regionCode} is named ${region.name}, received ${input.regionName}`
+          );
+        }
+      }
+
+      const imported = [];
+      for (const input of inputs) {
+        const result = await client.query<{
+          id: string;
+          region_code: string;
+          region_name: string;
+          year: number;
+          parameter_type: ParameterType;
+          amount_fen: string;
+          source_name: string;
+          source_url: string;
+          source_published_at: string;
+          status: "draft" | "verified" | "stale";
+          reviewed_by: string;
+        }>(
+          `INSERT INTO regional_parameters(
+             region_code, region_name, year, parameter_type, amount_fen,
+             source_name, source_url, source_published_at, status,
+             reviewed_by, reviewed_at
+           )
+           VALUES (
+             $1, $2, $3, $4, $5, $6, $7, $8::date, $9, $10, now()
+           )
+           ON CONFLICT (region_code, year, parameter_type)
+           DO UPDATE SET
+             region_name = EXCLUDED.region_name,
+             amount_fen = EXCLUDED.amount_fen,
+             source_name = EXCLUDED.source_name,
+             source_url = EXCLUDED.source_url,
+             source_published_at = EXCLUDED.source_published_at,
+             status = EXCLUDED.status,
+             reviewed_by = EXCLUDED.reviewed_by,
+             reviewed_at = now(),
+             updated_at = now()
+           RETURNING id, region_code, region_name, year, parameter_type,
+                     amount_fen::text, source_name, source_url,
+                     source_published_at::text, status, reviewed_by`,
+          [
+            input.regionCode,
+            input.regionName,
+            input.year,
+            input.parameterType,
+            input.amountFen,
+            input.sourceName,
+            input.sourceUrl,
+            input.sourcePublishedAt,
+            input.status,
+            request.authUser!.id
+          ]
+        );
+        const row = result.rows[0];
+        imported.push({
+          id: row.id,
+          regionCode: row.region_code,
+          regionName: row.region_name,
+          year: row.year,
+          parameterType: row.parameter_type,
+          amountFen: Number(row.amount_fen),
+          sourceName: row.source_name,
+          sourceUrl: row.source_url,
+          sourcePublishedAt: row.source_published_at,
+          status: row.status,
+          reviewedBy: row.reviewed_by
+        });
+      }
+      const batchId = crypto.randomUUID();
+      await writeAdminAudit(
+        request,
+        "policy.parameter.import",
+        "regional_parameters",
+        batchId,
+        {
+          imported: imported.length,
+          keys: imported.map(
+            (item) =>
+              `${item.regionCode}:${item.year}:${item.parameterType}`
+          )
+        },
+        client
+      );
+      return { imported: imported.length, items: imported, batchId };
+    });
+  }
+
+  async listAnnouncements() {
+    const result = await query<{
+      id: string;
+      title: string;
+      body: string;
+      placement: "main" | "ai" | "all";
+      status: "draft" | "published" | "archived";
+      starts_at: string | null;
+      ends_at: string | null;
+      created_by: string | null;
+      created_at: string;
+      updated_at: string;
+    }>(
+      `SELECT id, title, body, placement, status,
+              starts_at::text, ends_at::text, created_by,
+              created_at::text, updated_at::text
+         FROM announcements
+        ORDER BY updated_at DESC, id DESC`
+    );
+    return result.rows.map((row) => ({
+      id: row.id,
+      title: row.title,
+      body: row.body,
+      placement: row.placement,
+      status: row.status,
+      startsAt: row.starts_at,
+      endsAt: row.ends_at,
+      createdBy: row.created_by,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    }));
+  }
+
+  async createAnnouncement({
+    input,
+    request
+  }: {
+    input: {
+      title: string;
+      body: string;
+      placement: "main" | "ai" | "all";
+      status: "draft" | "published" | "archived";
+      startsAt?: string | null;
+      endsAt?: string | null;
+    };
+    request: Request;
+  }) {
+    return withTransaction(async (client) => {
+      const inserted = await client.query<{
+        id: string;
+        title: string;
+        body: string;
+        placement: "main" | "ai" | "all";
+        status: "draft" | "published" | "archived";
+        starts_at: string | null;
+        ends_at: string | null;
+        created_by: string;
+        created_at: string;
+        updated_at: string;
+      }>(
+        `INSERT INTO announcements(
+           title, body, placement, status, starts_at, ends_at, created_by
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING id, title, body, placement, status,
+                   starts_at::text, ends_at::text, created_by,
+                   created_at::text, updated_at::text`,
+        [
+          input.title,
+          input.body,
+          input.placement,
+          input.status,
+          input.startsAt ?? null,
+          input.endsAt ?? null,
+          request.authUser!.id
+        ]
+      );
+      const row = inserted.rows[0];
+      await writeAdminAudit(
+        request,
+        "announcement.create",
+        "announcement",
+        row.id,
+        { title: row.title, status: row.status, placement: row.placement },
+        client
+      );
+      return {
+        id: row.id,
+        title: row.title,
+        body: row.body,
+        placement: row.placement,
+        status: row.status,
+        startsAt: row.starts_at,
+        endsAt: row.ends_at,
+        createdBy: row.created_by,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+      };
+    });
+  }
+
+  async updateAnnouncement({
+    id,
+    input,
+    request
+  }: {
+    id: string;
+    input: {
+      title?: string;
+      body?: string;
+      placement?: "main" | "ai" | "all";
+      status?: "draft" | "published" | "archived";
+      startsAt?: string | null;
+      endsAt?: string | null;
+    };
+    request: Request;
+  }) {
+    return withTransaction(async (client) => {
+      const selected = await client.query<{
+        id: string;
+        title: string;
+        body: string;
+        placement: "main" | "ai" | "all";
+        status: "draft" | "published" | "archived";
+        starts_at: string | null;
+        ends_at: string | null;
+      }>(
+        `SELECT id, title, body, placement, status,
+                starts_at::text, ends_at::text
+           FROM announcements
+          WHERE id = $1
+          FOR UPDATE`,
+        [id]
+      );
+      const before = selected.rows[0];
+      if (!before) {
+        throw new ApiError(
+          404,
+          "ANNOUNCEMENT_NOT_FOUND",
+          "公告不存在"
+        );
+      }
+      const startsAt = Object.hasOwn(input, "startsAt")
+        ? input.startsAt ?? null
+        : before.starts_at;
+      const endsAt = Object.hasOwn(input, "endsAt")
+        ? input.endsAt ?? null
+        : before.ends_at;
+      if (
+        startsAt &&
+        endsAt &&
+        new Date(endsAt).getTime() < new Date(startsAt).getTime()
+      ) {
+        throw new ApiError(
+          400,
+          "INVALID_ANNOUNCEMENT_SCHEDULE",
+          "公告结束时间不得早于开始时间"
+        );
+      }
+      const updated = await client.query<{
+        id: string;
+        title: string;
+        body: string;
+        placement: "main" | "ai" | "all";
+        status: "draft" | "published" | "archived";
+        starts_at: string | null;
+        ends_at: string | null;
+        created_by: string | null;
+        created_at: string;
+        updated_at: string;
+      }>(
+        `UPDATE announcements
+            SET title = $2,
+                body = $3,
+                placement = $4,
+                status = $5,
+                starts_at = $6,
+                ends_at = $7,
+                updated_at = now()
+          WHERE id = $1
+          RETURNING id, title, body, placement, status,
+                    starts_at::text, ends_at::text, created_by,
+                    created_at::text, updated_at::text`,
+        [
+          id,
+          input.title ?? before.title,
+          input.body ?? before.body,
+          input.placement ?? before.placement,
+          input.status ?? before.status,
+          startsAt,
+          endsAt
+        ]
+      );
+      const row = updated.rows[0];
+      await writeAdminAudit(
+        request,
+        "announcement.update",
+        "announcement",
+        id,
+        {
+          before: {
+            title: before.title,
+            status: before.status,
+            placement: before.placement
+          },
+          after: {
+            title: row.title,
+            status: row.status,
+            placement: row.placement
+          }
+        },
+        client
+      );
+      return {
+        id: row.id,
+        title: row.title,
+        body: row.body,
+        placement: row.placement,
+        status: row.status,
+        startsAt: row.starts_at,
+        endsAt: row.ends_at,
+        createdBy: row.created_by,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+      };
+    });
+  }
+
+  async deleteAnnouncement({
+    id,
+    request
+  }: {
+    id: string;
+    request: Request;
+  }) {
+    return withTransaction(async (client) => {
+      const selected = await client.query<{
+        id: string;
+        title: string;
+        status: "draft" | "published" | "archived";
+      }>(
+        `SELECT id, title, status
+           FROM announcements
+          WHERE id = $1
+          FOR UPDATE`,
+        [id]
+      );
+      const announcement = selected.rows[0];
+      if (!announcement) {
+        throw new ApiError(
+          404,
+          "ANNOUNCEMENT_NOT_FOUND",
+          "公告不存在"
+        );
+      }
+      if (announcement.status !== "draft") {
+        throw new ApiError(
+          409,
+          "ANNOUNCEMENT_PUBLISHED",
+          "已发布或归档公告仅支持保留审计记录"
+        );
+      }
+      await client.query("DELETE FROM announcements WHERE id = $1", [id]);
+      await writeAdminAudit(
+        request,
+        "announcement.delete",
+        "announcement",
+        id,
+        { title: announcement.title, status: announcement.status },
+        client
+      );
+    });
+  }
+
   async coverage(year: number) {
     const result = await query<{
       region_code: string;

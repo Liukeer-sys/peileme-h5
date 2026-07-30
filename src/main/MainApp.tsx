@@ -636,7 +636,11 @@ export default function MainApp() {
           Object.is(wage, -0)
       )
     ) {
-      setRequestError("请检查近1至12个月的应发工资，金额需为有效数字");
+      setRequestError(
+        wageSeries.some((wage) => Number.isFinite(wage) && wage < 0)
+          ? "工资金额应大于或等于 0"
+          : "请检查近1至12个月的应发工资，金额需为有效数字"
+      );
       return;
     }
     if (!answers.wageDataConfirmed) {

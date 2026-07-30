@@ -2279,7 +2279,23 @@ describe("policy capability administration", () => {
       .get(path)
       .set(authHeader(adminToken))
       .expect(200);
-    await request(createApp())
+    const unsupportedSchema = await request(createApp())
+      .post(path)
+      .set(authHeader(adminToken))
+      .send({
+        effectiveFrom: "2026-08-01",
+        definition: { schemaVersion: 99 }
+      })
+      .expect(400);
+    expect(unsupportedSchema.body).toMatchObject({
+      error: "VALIDATION_ERROR",
+      message: "Invalid input: expected 2"
+    });
+    expect(unsupportedSchema.body.issues[0]).toMatchObject({
+      path: ["definition", "schemaVersion"]
+    });
+
+    const unknownDefinitionField = await request(createApp())
       .post(path)
       .set(authHeader(adminToken))
       .send({
@@ -2292,6 +2308,33 @@ describe("policy capability administration", () => {
         effectiveFrom: "2090-01-01"
       })
       .expect(400);
+    expect(unknownDefinitionField.body).toMatchObject({
+      error: "VALIDATION_ERROR"
+    });
+  });
+
+  it("returns role capabilities from auth me as the UI permission source of truth", async () => {
+    const admin = await request(createApp())
+      .get("/api/auth/me")
+      .set(authHeader(adminToken))
+      .expect(200);
+    expect(admin.body.capabilities).toEqual([
+      "policy.publish",
+      "policy.read",
+      "policy.write"
+    ]);
+
+    const analyst = await request(createApp())
+      .get("/api/auth/me")
+      .set(authHeader(analystToken))
+      .expect(200);
+    expect(analyst.body.capabilities).toEqual(["policy.read"]);
+
+    const user = await request(createApp())
+      .get("/api/auth/me")
+      .set(authHeader(userToken))
+      .expect(200);
+    expect(user.body.capabilities).toEqual([]);
   });
 
   it("requires publish review and trustworthy official evidence for calculation parameters", async () => {
@@ -2465,6 +2508,239 @@ describe("policy capability administration", () => {
       minimumMonthlyWage: "fallback",
       employeeAverageMonthlyWage: "manual-needed"
     });
+  });
+
+  it("filters regional parameters for analysts and rejects ordinary users", async () => {
+    await request(createApp())
+      .get("/api/admin/policy/regional-parameters?provinceCode=420000&cityCode=420100&year=2024&parameterType=employee_average_monthly_wage&status=verified")
+      .set(authHeader(userToken))
+      .expect(403);
+
+    const response = await request(createApp())
+      .get("/api/admin/policy/regional-parameters?provinceCode=420000&cityCode=420100&year=2024&parameterType=employee_average_monthly_wage&status=verified")
+      .set(authHeader(analystToken))
+      .expect(200);
+    expect(response.body.items).toHaveLength(1);
+    expect(response.body.items[0]).toMatchObject({
+      regionCode: "420100",
+      regionName: "武汉市",
+      provinceCode: "420000",
+      provinceName: "湖北省",
+      year: 2024,
+      parameterType: "employee_average_monthly_wage",
+      status: "verified"
+    });
+    expect(response.body.pagination).toEqual({
+      page: 1,
+      pageSize: 50,
+      total: 1
+    });
+  });
+
+  it("imports strict regional CSV atomically and audits every accepted row", async () => {
+    const header =
+      "region_code,region_name,year,parameter_type,amount_fen,source_name,source_url,source_published_at,status";
+    const validRows = [
+      header,
+      "420100,武汉市,2026,minimum_monthly_wage,275000,武汉市人社局,https://rsj.wuhan.gov.cn/zwgk_17/zc/2026/test.html,2026-02-01,verified",
+      "420100,武汉市,2025,employee_average_monthly_wage,1200000,武汉市统计局,https://tjj.wuhan.gov.cn/tjfw/tjgb/2026/test.html,2026-06-01,verified"
+    ].join("\n");
+
+    await request(createApp())
+      .post("/api/admin/policy/regional-parameters/import")
+      .set(authHeader(analystToken))
+      .send({ csv: validRows })
+      .expect(403);
+
+    const imported = await request(createApp())
+      .post("/api/admin/policy/regional-parameters/import")
+      .set(authHeader(adminToken))
+      .send({ csv: validRows })
+      .expect(201);
+    expect(imported.body).toMatchObject({ imported: 2 });
+    expect(imported.body.items).toHaveLength(2);
+
+    const beforeFailedImport = await query<{ count: string }>(
+      `SELECT count(*)::text AS count
+         FROM regional_parameters
+        WHERE region_code = '310000'
+          AND year = 2026`
+    );
+    const invalidRows = [
+      header,
+      "310000,上海市,2026,minimum_monthly_wage,300000,上海人社局,https://rsj.sh.gov.cn/test.html,2026-01-01,verified",
+      "420100,错误名称,2026,minimum_monthly_wage,280000,武汉人社局,https://rsj.wuhan.gov.cn/test.html,2026-01-01,verified"
+    ].join("\n");
+    const rejected = await request(createApp())
+      .post("/api/admin/policy/regional-parameters/import")
+      .set(authHeader(adminToken))
+      .send({ csv: invalidRows })
+      .expect(400);
+    expect(rejected.body).toMatchObject({
+      error: "INVALID_REGIONAL_PARAMETER_CSV"
+    });
+    const afterFailedImport = await query<{ count: string }>(
+      `SELECT count(*)::text AS count
+         FROM regional_parameters
+        WHERE region_code = '310000'
+          AND year = 2026`
+    );
+    expect(afterFailedImport.rows[0].count).toBe(
+      beforeFailedImport.rows[0].count
+    );
+
+    const audit = await query<{ count: string }>(
+      `SELECT count(*)::text AS count
+         FROM admin_audit_logs
+        WHERE action = 'policy.parameter.import'`
+    );
+    expect(audit.rows[0].count).toBe("1");
+  });
+
+  it("validates strict CSV headers before performing regional writes", async () => {
+    const response = await request(createApp())
+      .post("/api/admin/policy/regional-parameters/import")
+      .set(authHeader(adminToken))
+      .send({
+        csv:
+          "region_code,year,amount_fen\n" +
+          "420100,2026,275000"
+      })
+      .expect(400);
+    expect(response.body).toMatchObject({
+      error: "INVALID_REGIONAL_PARAMETER_CSV"
+    });
+    expect(response.body.message).toContain("CSV header must be exactly");
+  });
+
+  it("provides announcement CRUD with read-only analyst and audited admin mutations", async () => {
+    const path = "/api/admin/policy/announcements";
+    await request(createApp()).get(path).expect(401);
+    await request(createApp())
+      .get(path)
+      .set(authHeader(userToken))
+      .expect(403);
+    await request(createApp())
+      .post(path)
+      .set(authHeader(analystToken))
+      .send({
+        title: "分析员越权公告",
+        body: "不可创建",
+        placement: "main",
+        status: "draft"
+      })
+      .expect(403);
+
+    const created = await request(createApp())
+      .post(path)
+      .set(authHeader(adminToken))
+      .send({
+        title: "政策参数维护公告",
+        body: "本周六凌晨进行区域参数维护。",
+        placement: "main",
+        status: "draft",
+        startsAt: "2026-08-01T00:00:00.000Z",
+        endsAt: "2026-08-02T00:00:00.000Z"
+      })
+      .expect(201);
+    expect(created.body).toMatchObject({
+      title: "政策参数维护公告",
+      placement: "main",
+      status: "draft"
+    });
+
+    const analystList = await request(createApp())
+      .get(path)
+      .set(authHeader(analystToken))
+      .expect(200);
+    expect(analystList.body.items).toContainEqual(
+      expect.objectContaining({ id: created.body.id })
+    );
+
+    const updated = await request(createApp())
+      .patch(`${path}/${created.body.id}`)
+      .set(authHeader(adminToken))
+      .send({ status: "published", title: "区域参数维护公告" })
+      .expect(200);
+    expect(updated.body).toMatchObject({
+      status: "published",
+      title: "区域参数维护公告"
+    });
+
+    await query(
+      `INSERT INTO role_capabilities(role, capability)
+       VALUES ('analyst', 'policy.write')
+       ON CONFLICT DO NOTHING`
+    );
+    await request(createApp())
+      .patch(`${path}/${created.body.id}`)
+      .set(authHeader(analystToken))
+      .send({ title: "分析员不得改写已发布公告" })
+      .expect(403);
+
+    const immutableDelete = await request(createApp())
+      .delete(`${path}/${created.body.id}`)
+      .set(authHeader(adminToken))
+      .expect(409);
+    expect(immutableDelete.body.error).toBe("ANNOUNCEMENT_PUBLISHED");
+
+    const archived = await request(createApp())
+      .patch(`${path}/${created.body.id}`)
+      .set(authHeader(adminToken))
+      .send({ status: "archived" })
+      .expect(200);
+    expect(archived.body.status).toBe("archived");
+
+    const secondDraft = await request(createApp())
+      .post(path)
+      .set(authHeader(adminToken))
+      .send({
+        title: "待删除公告",
+        body: "草稿内容",
+        placement: "all",
+        status: "draft"
+      })
+      .expect(201);
+    await request(createApp())
+      .delete(`${path}/${secondDraft.body.id}`)
+      .set(authHeader(adminToken))
+      .expect(204);
+
+    const audits = await query<{ action: string }>(
+      `SELECT action
+         FROM admin_audit_logs
+        WHERE target_type = 'announcement'
+        ORDER BY created_at, action`
+    );
+    expect(audits.rows.map((row) => row.action)).toEqual([
+      "announcement.create",
+      "announcement.update",
+      "announcement.update",
+      "announcement.create",
+      "announcement.delete"
+    ]);
+  });
+
+  it("rejects invalid announcement schedules without persisting partial data", async () => {
+    const response = await request(createApp())
+      .post("/api/admin/policy/announcements")
+      .set(authHeader(adminToken))
+      .send({
+        title: "错误排期",
+        body: "结束时间早于开始时间",
+        placement: "main",
+        status: "draft",
+        startsAt: "2026-08-02T00:00:00.000Z",
+        endsAt: "2026-08-01T00:00:00.000Z"
+      })
+      .expect(400);
+    expect(response.body.error).toBe("VALIDATION_ERROR");
+    const persisted = await query<{ count: string }>(
+      `SELECT count(*)::text AS count
+         FROM announcements
+        WHERE title = '错误排期'`
+    );
+    expect(persisted.rows[0].count).toBe("0");
   });
 
   it("keeps a retired baseline retired when repeated seed recomputes the active pointer", async () => {

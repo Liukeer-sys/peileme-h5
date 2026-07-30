@@ -48,6 +48,19 @@ type SessionResponse = {
   user: User;
 };
 
+type MeResponse = {
+  user: User;
+  capabilities: unknown;
+};
+
+const sanitizeCapabilities = (value: unknown) =>
+  Array.isArray(value)
+    ? value.filter(
+        (capability): capability is string =>
+          typeof capability === "string"
+      )
+    : [];
+
 export type DeviceSession = {
   id: string;
   userAgent: string | null;
@@ -60,6 +73,7 @@ export type DeviceSession = {
 
 type AuthContextValue = {
   user: User | null;
+  capabilities: string[];
   grants: Grant[];
   sessions: DeviceSession[];
   ready: boolean;
@@ -114,6 +128,7 @@ export const logoutWithLocalCleanup = async (
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
+  const [capabilities, setCapabilities] = useState<string[]>([]);
   const [grants, setGrants] = useState<Grant[]>([]);
   const [sessions, setSessions] = useState<DeviceSession[]>([]);
   const [ready, setReady] = useState(false);
@@ -141,7 +156,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const acceptSession = useCallback(
     async (session: SessionResponse) => {
       setAccessToken(session.accessToken);
-      setUser(session.user);
+      const me = await api<MeResponse>("/api/auth/me", { auth: true });
+      setUser(me.user);
+      setCapabilities(sanitizeCapabilities(me.capabilities));
       await Promise.all([
         reloadGrants(),
         reloadSessions(),
@@ -157,13 +174,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const refreshed = await initializeSession();
       if (refreshed) {
         try {
-          const me = await api<{ user: User }>("/api/auth/me", { auth: true });
+          const me = await api<MeResponse>("/api/auth/me", { auth: true });
           if (active) {
             setUser(me.user);
+            setCapabilities(sanitizeCapabilities(me.capabilities));
             await Promise.all([reloadGrants(), reloadSessions()]);
           }
         } catch {
           setAccessToken(null);
+          setCapabilities([]);
         }
       }
       if (active) setReady(true);
@@ -176,6 +195,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const value = useMemo<AuthContextValue>(
     () => ({
       user,
+      capabilities,
       grants,
       sessions,
       ready,
@@ -224,6 +244,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           () => {
             setAccessToken(null);
             setUser(null);
+            setCapabilities([]);
             setGrants([]);
             setSessions([]);
             track("auth_logged_out");
@@ -241,6 +262,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (revokedCurrent) {
           setAccessToken(null);
           setUser(null);
+          setCapabilities([]);
           setGrants([]);
           setSessions([]);
           track("auth_session_revoked", { current: true });
@@ -274,6 +296,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }),
     [
       acceptSession,
+      capabilities,
       grants,
       ready,
       reloadGrants,

@@ -19,6 +19,7 @@ import {
   type PolicyFacts
 } from "./repository.js";
 import { PolicyEngineError, type PolicyOutput } from "./types.js";
+import { parseCsvRecords } from "../../lib/csv.js";
 
 const isCalendarDate = (value: string) => {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
@@ -282,6 +283,91 @@ const regionalParameterSchema = z
     }
   });
 
+const regionalParameterCsvHeader = [
+  "region_code",
+  "region_name",
+  "year",
+  "parameter_type",
+  "amount_fen",
+  "source_name",
+  "source_url",
+  "source_published_at",
+  "status"
+] as const;
+
+const regionalParameterCsvRowSchema = z
+  .object({
+    region_code: z.string().regex(/^\d{6}$/),
+    region_name: z.string().trim().min(1).max(200),
+    year: z.string().regex(/^\d{4}$/).transform(Number),
+    parameter_type: z.enum([
+      "minimum_monthly_wage",
+      "employee_average_monthly_wage"
+    ]),
+    amount_fen: z
+      .string()
+      .regex(/^\d+$/)
+      .transform(Number)
+      .pipe(positiveMoneySchema),
+    source_name: z.string().trim().min(1).max(500),
+    source_url: z.string(),
+    source_published_at: z.string(),
+    status: z.enum(["draft", "verified", "stale"])
+  })
+  .transform((row) => ({
+    regionCode: row.region_code,
+    regionName: row.region_name,
+    year: row.year,
+    parameterType: row.parameter_type,
+    amountFen: row.amount_fen,
+    sourceName: row.source_name,
+    sourceUrl: row.source_url,
+    sourcePublishedAt: row.source_published_at,
+    status: row.status
+  }));
+
+const announcementFields = {
+  title: z.string().trim().min(1).max(200),
+  body: z.string().trim().min(1).max(20_000),
+  placement: z.enum(["main", "ai", "all"]),
+  status: z.enum(["draft", "published", "archived"]),
+  startsAt: z.string().datetime({ offset: true }).nullable().optional(),
+  endsAt: z.string().datetime({ offset: true }).nullable().optional()
+};
+
+const validAnnouncementSchedule = (
+  value: { startsAt?: string | null; endsAt?: string | null },
+  context: z.RefinementCtx
+) => {
+  if (value.startsAt && value.endsAt && value.endsAt < value.startsAt) {
+    context.addIssue({
+      code: "custom",
+      path: ["endsAt"],
+      message: "公告结束时间不得早于开始时间"
+    });
+  }
+};
+
+const createAnnouncementSchema = z
+  .object(announcementFields)
+  .strict()
+  .superRefine(validAnnouncementSchedule);
+
+const updateAnnouncementSchema = z
+  .object({
+    title: announcementFields.title.optional(),
+    body: announcementFields.body.optional(),
+    placement: announcementFields.placement.optional(),
+    status: announcementFields.status.optional(),
+    startsAt: announcementFields.startsAt,
+    endsAt: announcementFields.endsAt
+  })
+  .strict()
+  .refine((value) => Object.keys(value).length > 0, {
+    message: "至少提供一个公告字段"
+  })
+  .superRefine(validAnnouncementSchedule);
+
 const requireRegionalParameterCapability = (
   request: Request,
   response: Response,
@@ -290,6 +376,18 @@ const requireRegionalParameterCapability = (
   requireCapability(
     request.body?.status === "verified" ||
     request.body?.status === "stale"
+      ? "policy.publish"
+      : "policy.write"
+  )(request, response, next);
+
+const requireAnnouncementCapability = (
+  request: Request,
+  response: Response,
+  next: NextFunction
+) =>
+  requireCapability(
+    request.body?.status &&
+    request.body.status !== "draft"
       ? "policy.publish"
       : "policy.write"
   )(request, response, next);
@@ -385,6 +483,89 @@ export const createAdminPolicyRouter = (
     }
   );
 
+  router.get(
+    "/regional-parameters",
+    read,
+    async (request, response) => {
+      const query = z
+        .object({
+          provinceCode: z.string().regex(/^\d{6}$/).optional(),
+          cityCode: z.string().regex(/^\d{6}$/).optional(),
+          year: z.coerce.number().int().min(2000).max(2100).optional(),
+          parameterType: z
+            .enum([
+              "minimum_monthly_wage",
+              "employee_average_monthly_wage"
+            ])
+            .optional(),
+          status: z.enum(["draft", "verified", "stale"]).optional(),
+          page: z.coerce.number().int().positive().default(1),
+          pageSize: z.coerce.number().int().positive().max(100).default(50)
+        })
+        .parse(request.query);
+      response.json(await repository.listRegionalParameters(query));
+    }
+  );
+
+  router.post(
+    "/regional-parameters/import",
+    publish,
+    async (request, response, next) => {
+      try {
+        const body = z
+          .object({
+            csv: z.string().min(1).max(500_000)
+          })
+          .strict()
+          .parse(request.body);
+        const records = parseCsvRecords(
+          body.csv,
+          "regional-parameters.csv",
+          regionalParameterCsvHeader,
+          500_000
+        );
+        if (!records.length) {
+          throw new Error("Regional-parameter CSV must contain at least one row");
+        }
+        const seen = new Set<string>();
+        const items = records.map((record, index) => {
+          const parsedRow = regionalParameterCsvRowSchema.parse(record);
+          const parsed = regionalParameterSchema.parse(parsedRow);
+          const key = `${parsed.regionCode}:${parsed.year}:${parsed.parameterType}`;
+          if (seen.has(key)) {
+            throw new Error(
+              `Row ${index + 2}: duplicate regional parameter ${key}`
+            );
+          }
+          seen.add(key);
+          return {
+            ...parsed,
+            regionName: parsedRow.regionName
+          };
+        });
+        const result = await repository.importRegionalParameters({
+          inputs: items,
+          request
+        });
+        response.status(201).json(result);
+      } catch (error) {
+        if (error instanceof z.ZodError || error instanceof Error) {
+          next(
+            new ApiError(
+              400,
+              "INVALID_REGIONAL_PARAMETER_CSV",
+              error instanceof z.ZodError
+                ? `第 ${Number(error.issues[0]?.path[0] ?? 0) + 2} 行：${error.issues[0]?.message || "字段无效"}`
+                : error.message
+            )
+          );
+          return;
+        }
+        next(error);
+      }
+    }
+  );
+
   router.get("/coverage", read, async (request, response) => {
     const query = z
       .object({
@@ -393,6 +574,43 @@ export const createAdminPolicyRouter = (
       .parse(request.query);
     response.json({ year: query.year, items: await repository.coverage(query.year) });
   });
+
+  router.get("/announcements", read, async (_request, response) => {
+    response.json({ items: await repository.listAnnouncements() });
+  });
+
+  router.post(
+    "/announcements",
+    requireAnnouncementCapability,
+    async (request, response) => {
+      const input = createAnnouncementSchema.parse(request.body);
+      response.status(201).json(
+        await repository.createAnnouncement({ input, request })
+      );
+    }
+  );
+
+  router.patch(
+    "/announcements/:id",
+    publish,
+    async (request, response) => {
+      const id = z.string().uuid().parse(request.params.id);
+      const input = updateAnnouncementSchema.parse(request.body);
+      response.json(
+        await repository.updateAnnouncement({ id, input, request })
+      );
+    }
+  );
+
+  router.delete(
+    "/announcements/:id",
+    write,
+    async (request, response) => {
+      const id = z.string().uuid().parse(request.params.id);
+      await repository.deleteAnnouncement({ id, request });
+      response.status(204).end();
+    }
+  );
 
   return router;
 };
