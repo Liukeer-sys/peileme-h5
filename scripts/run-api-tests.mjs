@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,11 +17,14 @@ export const TEST_DB_LOCK_PATH = path.join(
   tmpdir(),
   "peileme-h5-test-db-55432.lock"
 );
+export const TEST_DB_LOCK_PORT = 55431;
 
 class ActiveTestDbLockError extends Error {
   constructor(owner) {
     super(
-      `Test database is already owned by PID ${owner.pid} in ${owner.cwd}. ` +
+      `Test database is already owned by PID ${owner?.pid ?? "unknown"} in ${
+        owner?.cwd ?? "another worktree"
+      }. ` +
         "Wait for that test lifecycle to finish."
     );
     this.name = "ActiveTestDbLockError";
@@ -39,64 +43,110 @@ const isProcessAlive = (pid) => {
 
 const readLockOwner = async (lockPath) => {
   try {
-    return JSON.parse(await readFile(path.join(lockPath, "owner.json"), "utf8"));
+    const lockStat = await stat(lockPath);
+    const ownerPath = lockStat.isDirectory()
+      ? path.join(lockPath, "owner.json")
+      : lockPath;
+    return JSON.parse(await readFile(ownerPath, "utf8"));
   } catch (error) {
     if (error?.code === "ENOENT" || error instanceof SyntaxError) return null;
     throw error;
   }
 };
 
+const closeMutex = (mutex) =>
+  new Promise((resolve, reject) => {
+    mutex.close((error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+
+const acquireMutex = (lockPort) =>
+  new Promise((resolve, reject) => {
+    const mutex = createServer();
+    mutex.once("error", reject);
+    mutex.listen(
+      {
+        host: "127.0.0.1",
+        port: lockPort,
+        exclusive: true
+      },
+      () => {
+        mutex.removeListener("error", reject);
+        resolve(mutex);
+      }
+    );
+  });
+
+const persistLockOwner = async (lockPath, owner) => {
+  const stagingPath = `${lockPath}.${owner.token}.tmp`;
+  try {
+    await writeFile(
+      stagingPath,
+      `${JSON.stringify(owner, null, 2)}\n`,
+      { encoding: "utf8", flag: "wx" }
+    );
+    await rm(lockPath, { recursive: true, force: true });
+    await rename(stagingPath, lockPath);
+  } finally {
+    await rm(stagingPath, { force: true });
+  }
+};
+
 export const acquireTestDbLock = async ({
   lockPath = TEST_DB_LOCK_PATH,
+  lockPort = TEST_DB_LOCK_PORT,
   pid = process.pid,
   cwd = process.cwd(),
   isProcessAlive: checkProcessAlive = isProcessAlive
 } = {}) => {
-  await mkdir(path.dirname(lockPath), { recursive: true });
-
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const owner = {
-      pid,
-      cwd,
-      token: crypto.randomUUID(),
-      createdAt: new Date().toISOString()
-    };
-    const stagingPath = `${lockPath}.${owner.token}.tmp`;
-    await mkdir(stagingPath);
-    await writeFile(
-      path.join(stagingPath, "owner.json"),
-      `${JSON.stringify(owner, null, 2)}\n`,
-      "utf8"
-    );
-
-    try {
-      await rename(stagingPath, lockPath);
-      return { lockPath, owner };
-    } catch (error) {
-      await rm(stagingPath, { recursive: true, force: true });
-      if (!["EEXIST", "ENOTEMPTY", "EPERM"].includes(error?.code)) throw error;
+  let mutex;
+  try {
+    mutex = await acquireMutex(lockPort);
+  } catch (error) {
+    if (error?.code === "EADDRINUSE") {
+      throw new ActiveTestDbLockError(await readLockOwner(lockPath));
     }
-
-    const currentOwner = await readLockOwner(lockPath);
-    if (
-      currentOwner &&
-      Number.isSafeInteger(currentOwner.pid) &&
-      checkProcessAlive(currentOwner.pid)
-    ) {
-      throw new ActiveTestDbLockError(currentOwner);
-    }
-
-    await rm(lockPath, { recursive: true, force: true });
+    throw error;
   }
 
-  throw new Error(`Unable to acquire test database lock at ${lockPath}`);
+  const owner = {
+    pid,
+    cwd,
+    token: crypto.randomUUID(),
+    createdAt: new Date().toISOString()
+  };
+
+  try {
+    const previousOwner = await readLockOwner(lockPath);
+    if (
+      previousOwner &&
+      Number.isSafeInteger(previousOwner.pid) &&
+      checkProcessAlive(previousOwner.pid)
+    ) {
+      throw new ActiveTestDbLockError(previousOwner);
+    }
+    await persistLockOwner(lockPath, owner);
+    return { lockPath, lockPort, owner, mutex };
+  } catch (error) {
+    await closeMutex(mutex);
+    throw error;
+  }
 };
 
 export const releaseTestDbLock = async (lock) => {
-  const currentOwner = await readLockOwner(lock.lockPath);
-  if (currentOwner?.token !== lock.owner.token) return false;
-  await rm(lock.lockPath, { recursive: true, force: true });
-  return true;
+  let releasedOwner = false;
+  try {
+    const currentOwner = await readLockOwner(lock.lockPath);
+    if (currentOwner?.token === lock.owner.token) {
+      await rm(lock.lockPath, { recursive: true, force: true });
+      releasedOwner = true;
+    }
+    return releasedOwner;
+  } finally {
+    await closeMutex(lock.mutex);
+  }
 };
 
 export const parseLifecycleArgs = (args = []) => {
@@ -169,6 +219,7 @@ const resultExitCode = (result) => {
 export const runApiTestLifecycle = async ({
   cwd = process.cwd(),
   lockPath = TEST_DB_LOCK_PATH,
+  lockPort = TEST_DB_LOCK_PORT,
   lifecycleArgs = [],
   runCommand = spawnCommand,
   signalSource = process,
@@ -184,7 +235,7 @@ export const runApiTestLifecycle = async ({
 
   let lock;
   try {
-    lock = await acquireTestDbLock({ lockPath, cwd });
+    lock = await acquireTestDbLock({ lockPath, lockPort, cwd });
   } catch (error) {
     logError(error instanceof Error ? error.message : String(error));
     return {

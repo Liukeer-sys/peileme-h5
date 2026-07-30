@@ -17,6 +17,9 @@
 ### Create
 
 - `docker-compose.test.yml` — supervised PostgreSQL test database on loopback port `55432`.
+- `scripts/run-api-tests.mjs` — failure-safe API test lifecycle, atomic cross-worktree ownership, and signal cleanup.
+- `server/tests/run-api-tests.test.ts` — lifecycle, exit-code, signal, stale-lock, and concurrent-owner regression tests.
+- `server/tests/test-setup.test.ts` — unique upload-directory ownership and cleanup tests.
 - `database/migrations/002_policy_foundation.sql` — product channel, policy rules, regional parameters, snapshots, capabilities, and announcements.
 - `server/audit.ts` — reusable immutable admin audit writer.
 - `server/modules/policy/types.ts` — normalized policy input/output contracts.
@@ -52,8 +55,8 @@
 - `server/services.ts` — shared-domain refresh cookie and device session operations.
 - `server/security.ts` — capability-based admin middleware.
 - `server/app.ts` — mount extracted audit and policy routers; remove trusted client result writes.
-- `server/tests/api.test.ts` — new truncation order and compatibility assertions.
-- `server/tests/setup.ts` — dual-origin and cookie-domain test configuration.
+- `server/tests/api.test.ts` — dual-origin CORS behavior, new truncation order, and compatibility assertions.
+- `server/tests/setup.ts` — dual-origin, cookie-domain, and unique run-owned upload-directory configuration.
 - `src/auth/AuthContext.tsx` — device sessions and channel-safe shared auth.
 - `src/lib/api.ts` — CSRF header and typed policy calls.
 - `src/types.ts` — normalized salary and termination fields.
@@ -68,7 +71,11 @@
 
 **Files:**
 - Create: `docker-compose.test.yml`
+- Create: `scripts/run-api-tests.mjs`
+- Create: `server/tests/run-api-tests.test.ts`
+- Create: `server/tests/test-setup.test.ts`
 - Modify: `package.json`
+- Modify: `server/tests/api.test.ts`
 - Modify: `server/tests/setup.ts`
 
 - [ ] **Step 1: Add a supervised test PostgreSQL service**
@@ -92,21 +99,53 @@ services:
       - /var/lib/postgresql/data
 ```
 
-- [ ] **Step 2: Add exact lifecycle scripts to `package.json`**
+- [ ] **Step 2: Write the failing lifecycle and lock tests**
+
+Add focused tests to `server/tests/run-api-tests.test.ts` for:
+
+- successful `up -> test -> down`;
+- test exit `23` and partial-up exit `19`, with down always executed and the original code preserved;
+- SIGTERM cleanup and exit `143`;
+- a dead owner sidecar replaced by a new owner;
+- two contenders released from the same barrier against one stale sidecar, with exactly one winner and one fast active-lock failure;
+- active ownership returning nonzero without issuing any Compose command;
+- explicit `--lifecycle-test-exit-code` and `--lifecycle-test-hold-ms` acceptance controls.
+
+Run:
+
+```bash
+npx vitest run server/tests/run-api-tests.test.ts
+```
+
+Expected before the wrapper exists: FAIL because the lifecycle and atomic ownership exports are absent.
+
+- [ ] **Step 3: Add the failure-safe wrapper and lifecycle scripts**
+
+`scripts/run-api-tests.mjs` must acquire ownership before every Compose command. Bind the exclusive kernel mutex on `127.0.0.1:55431`, then atomically publish `/tmp/peileme-h5-test-db-55432.lock` with `pid`, `cwd`, `token`, and `createdAt`. A dead process releases the kernel mutex automatically; its sidecar is replaced only after the next process owns that mutex. An active mutex returns exit `73`, reports the current owner when available, and returns before the lifecycle `finally`, so the contender never downs the owner's database.
+
+After ownership, execute Compose up and Vitest. A `finally` block must run:
+
+```bash
+docker compose -f docker-compose.test.yml down --volumes --remove-orphans
+```
+
+Preserve the up or test exit code. On SIGINT/SIGTERM, interrupt the active child, run the same cleanup, and terminate with the corresponding signal status.
+
+Merge these scripts into `package.json`:
 
 ```json
 {
   "scripts": {
     "test:db:up": "docker compose -f docker-compose.test.yml up -d --wait",
     "test:db:down": "docker compose -f docker-compose.test.yml down --volumes",
-    "test:api": "npm run test:db:up && vitest run server/tests && npm run test:db:down"
+    "test:api": "node scripts/run-api-tests.mjs"
   }
 }
 ```
 
 Keep every existing script and merge these keys into the existing `scripts` object.
 
-- [ ] **Step 3: Add dual-origin test configuration**
+- [ ] **Step 4: Add isolated uploads and dual-origin CORS acceptance**
 
 Add these assignments to `server/tests/setup.ts`:
 
@@ -116,22 +155,59 @@ process.env.COOKIE_DOMAIN = "";
 process.env.CSRF_SECRET = "test-csrf-secret-that-is-longer-than-thirty-two-characters";
 ```
 
-- [ ] **Step 4: Run the current API suite against the supervised database**
+Create each run's upload directory with `mkdtempSync(path.join(tmpdir(), "peileme-test-uploads-"))`. Register only directories created by the current setup module and recursively remove those registered paths in `afterAll`. `server/tests/test-setup.test.ts` must prove that cleanup removes its owned directory and preserves an unknown historical directory and sentinel.
+
+Add behavior-level assertions to `server/tests/api.test.ts`:
+
+- `http://localhost:5173` receives its matching `Access-Control-Allow-Origin`;
+- `http://ai.localhost:5174` receives its matching `Access-Control-Allow-Origin`;
+- an unknown Origin receives no `Access-Control-Allow-Origin`.
+
+- [ ] **Step 5: Run component and real lifecycle acceptance**
 
 Run:
 
 ```bash
-npm run test:db:up
-npm test -- --run server/tests/api.test.ts
-npm run test:db:down
+npx vitest run server/tests/run-api-tests.test.ts
+npm run test:api
 ```
 
-Expected: the existing 10 API tests pass and the test database container is removed.
+Expected: 9 wrapper/lock tests pass; the complete server suite reports 23/23; the lock sidecar, mutex listener, Compose container/network, and port `55432` are removed.
 
-- [ ] **Step 5: Commit**
+Exercise a real nonzero child:
 
 ```bash
-git add docker-compose.test.yml package.json package-lock.json server/tests/setup.ts
+set +e
+npm run test:api -- --lifecycle-test-exit-code=37
+status=$?
+set -e
+test "$status" -eq 37
+```
+
+Start one owner with `--lifecycle-test-hold-ms=30000`, then start a second `npm run test:api`. Expected: the contender returns `73` in under three seconds, the owner token and Compose container ID stay unchanged, and the owner's PostgreSQL remains healthy. After the owner exits, all resources are removed.
+
+Send SIGINT and SIGTERM to a held wrapper process. Expected: exit `130` and `143`, respectively, after cleanup.
+
+After every lifecycle path, run:
+
+```bash
+test ! -e /tmp/peileme-h5-test-db-55432.lock
+test -z "$(ss -H -ltn 'sport = :55431')"
+test -z "$(ss -H -ltn 'sport = :55432')"
+test -z "$(docker compose -f docker-compose.test.yml ps --all --quiet)"
+```
+
+- [ ] **Step 6: Run full regression and commit**
+
+```bash
+npm run test:db:up
+npm test
+npm run test:db:down
+npm run build
+git add docker-compose.test.yml package.json scripts/run-api-tests.mjs \
+  server/tests/run-api-tests.test.ts server/tests/test-setup.test.ts \
+  server/tests/setup.ts server/tests/api.test.ts \
+  docs/superpowers/plans/2026-07-30-dual-web-policy-foundation.md
 git commit -m "test: supervise PostgreSQL integration database"
 ```
 

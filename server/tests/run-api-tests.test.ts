@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
-import { access, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -9,12 +10,32 @@ import * as wrapperModule from "../../scripts/run-api-tests.mjs";
 const wrapperPath = path.resolve("scripts/run-api-tests.mjs");
 const loadWrapper = async () => wrapperModule;
 
+const getAvailablePort = () =>
+  new Promise<number>((resolve, reject) => {
+    const server = createServer();
+    server.once("error", reject);
+    server.listen({ host: "127.0.0.1", port: 0, exclusive: true }, () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close();
+        reject(new Error("Expected a TCP test mutex address"));
+        return;
+      }
+      server.close((error) => {
+        if (error) reject(error);
+        else resolve(address.port);
+      });
+    });
+  });
+
 let tempRoot = "";
 let lockPath = "";
+let lockPort = 0;
 
 beforeEach(async () => {
   tempRoot = await mkdtemp(path.join(tmpdir(), "peileme-lifecycle-test-"));
   lockPath = path.join(tempRoot, "test-db.lock");
+  lockPort = await getAvailablePort();
 });
 
 afterEach(async () => {
@@ -36,6 +57,7 @@ describe("API test lifecycle wrapper", () => {
     const commands: Array<{ phase: string; args: string[] }> = [];
     const result = await runApiTestLifecycle({
       lockPath,
+      lockPort,
       runCommand: async ({ phase, args }: { phase: string; args: string[] }) => {
         phases.push(phase);
         commands.push({ phase, args });
@@ -60,6 +82,7 @@ describe("API test lifecycle wrapper", () => {
     const phases: string[] = [];
     const result = await runApiTestLifecycle({
       lockPath,
+      lockPort,
       runCommand: async ({ phase }: { phase: string }) => {
         phases.push(phase);
         return { exitCode: phase === "test" ? 23 : 0, signal: null };
@@ -75,6 +98,7 @@ describe("API test lifecycle wrapper", () => {
     const phases: string[] = [];
     const result = await runApiTestLifecycle({
       lockPath,
+      lockPort,
       runCommand: async ({ phase }: { phase: string }) => {
         phases.push(phase);
         return { exitCode: phase === "up" ? 19 : 0, signal: null };
@@ -87,23 +111,77 @@ describe("API test lifecycle wrapper", () => {
 
   it("reclaims a lock owned by a dead process", async () => {
     const { acquireTestDbLock, releaseTestDbLock } = await loadWrapper();
-    const stale = await acquireTestDbLock({
+    await writeFile(
       lockPath,
-      pid: 41001,
-      cwd: "/stale/worktree",
-      isProcessAlive: () => false
-    });
+      JSON.stringify({
+        pid: 41001,
+        cwd: "/stale/worktree",
+        token: "stale-token"
+      }),
+      "utf8"
+    );
     const reclaimed = await acquireTestDbLock({
       lockPath,
+      lockPort,
       pid: 41002,
       cwd: "/current/worktree",
       isProcessAlive: () => false
     });
+    const persistedOwner = JSON.parse(await readFile(lockPath, "utf8"));
 
-    expect(reclaimed.owner.token).not.toBe(stale.owner.token);
+    expect(reclaimed.owner.token).not.toBe("stale-token");
     expect(reclaimed.owner.pid).toBe(41002);
+    expect(persistedOwner).toEqual(reclaimed.owner);
     await releaseTestDbLock(reclaimed);
     await expect(access(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("allows only one synchronized contender to recover the same stale lock", async () => {
+    const { acquireTestDbLock, releaseTestDbLock } = await loadWrapper();
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: 42000,
+        cwd: "/dead/worktree",
+        token: "shared-stale-token"
+      }),
+      "utf8"
+    );
+
+    let releaseBarrier!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      releaseBarrier = resolve;
+    });
+    const contend = async (pid: number) => {
+      await barrier;
+      return acquireTestDbLock({
+        lockPath,
+        lockPort,
+        pid,
+        cwd: `/contender-${pid}`,
+        isProcessAlive: () => false
+      });
+    };
+    const attempts = [contend(42001), contend(42002)];
+    releaseBarrier();
+    const results = await Promise.allSettled(attempts);
+
+    const winners = results.filter(
+      (result): result is PromiseFulfilledResult<any> =>
+        result.status === "fulfilled"
+    );
+    const losers = results.filter(
+      (result): result is PromiseRejectedResult => result.status === "rejected"
+    );
+    expect(winners).toHaveLength(1);
+    expect(losers).toHaveLength(1);
+    expect(String(losers[0].reason)).toContain("already owned");
+
+    const winner = winners[0].value;
+    const persistedOwner = JSON.parse(await readFile(lockPath, "utf8"));
+    expect(persistedOwner).toEqual(winner.owner);
+    expect(persistedOwner.token).not.toBe("shared-stale-token");
+    await releaseTestDbLock(winner);
   });
 
   it("fails fast for an active lock without running or cleaning Compose", async () => {
@@ -111,6 +189,7 @@ describe("API test lifecycle wrapper", () => {
       await loadWrapper();
     const active = await acquireTestDbLock({
       lockPath,
+      lockPort,
       pid: process.pid,
       cwd: "/active/worktree"
     });
@@ -119,6 +198,7 @@ describe("API test lifecycle wrapper", () => {
 
     const result = await runApiTestLifecycle({
       lockPath,
+      lockPort,
       runCommand,
       logError: (message: string) => errors.push(message)
     });
@@ -140,6 +220,7 @@ describe("API test lifecycle wrapper", () => {
 
     const result = await runApiTestLifecycle({
       lockPath,
+      lockPort,
       signalSource,
       runCommand: async ({
         phase,
