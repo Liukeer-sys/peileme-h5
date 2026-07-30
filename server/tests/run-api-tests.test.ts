@@ -1,6 +1,6 @@
-import { EventEmitter } from "node:events";
+import { EventEmitter, once } from "node:events";
 import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { createServer } from "node:net";
+import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -109,6 +109,63 @@ describe("API test lifecycle wrapper", () => {
     expect(phases).toEqual(["up", "down"]);
   });
 
+  it("returns exit 1 when release fails after a successful lifecycle", async () => {
+    const { releaseTestDbLock, runApiTestLifecycle } = await loadWrapper();
+    const errors: string[] = [];
+    const result = await runApiTestLifecycle({
+      lockPath,
+      lockPort,
+      runCommand: async () => ({ exitCode: 0, signal: null }),
+      releaseLock: async (lock: unknown) => {
+        await releaseTestDbLock(lock);
+        throw new Error("release failed");
+      },
+      logError: (message: string) => errors.push(message)
+    });
+
+    expect(result).toEqual({ exitCode: 1, signal: null });
+    expect(errors.join("\n")).toContain("release failed");
+  });
+
+  it("preserves a test failure when down also fails", async () => {
+    const { runApiTestLifecycle } = await loadWrapper();
+    const errors: string[] = [];
+    const result = await runApiTestLifecycle({
+      lockPath,
+      lockPort,
+      runCommand: async ({ phase }: { phase: string }) => ({
+        exitCode: phase === "test" ? 23 : phase === "down" ? 29 : 0,
+        signal: null
+      }),
+      logError: (message: string) => errors.push(message)
+    });
+
+    expect(result).toEqual({ exitCode: 23, signal: null });
+    expect(errors.join("\n")).toContain("cleanup failed with exit code 29");
+  });
+
+  it("preserves a test failure when down and release also fail", async () => {
+    const { releaseTestDbLock, runApiTestLifecycle } = await loadWrapper();
+    const errors: string[] = [];
+    const result = await runApiTestLifecycle({
+      lockPath,
+      lockPort,
+      runCommand: async ({ phase }: { phase: string }) => ({
+        exitCode: phase === "test" ? 23 : phase === "down" ? 29 : 0,
+        signal: null
+      }),
+      releaseLock: async (lock: unknown) => {
+        await releaseTestDbLock(lock);
+        throw new Error("release failed");
+      },
+      logError: (message: string) => errors.push(message)
+    });
+
+    expect(result).toEqual({ exitCode: 23, signal: null });
+    expect(errors.join("\n")).toContain("cleanup failed with exit code 29");
+    expect(errors.join("\n")).toContain("release failed");
+  });
+
   it("reclaims a lock owned by a dead process", async () => {
     const { acquireTestDbLock, releaseTestDbLock } = await loadWrapper();
     await writeFile(
@@ -160,6 +217,47 @@ describe("API test lifecycle wrapper", () => {
     await releaseTestDbLock(acquired);
   });
 
+  it("releases the mutex promptly while a client tries to stay connected", async () => {
+    const { acquireTestDbLock, releaseTestDbLock } = await loadWrapper();
+    const acquired = await acquireTestDbLock({
+      lockPath,
+      lockPort,
+      pid: 41701,
+      cwd: "/mutex-client"
+    });
+    const client = createConnection({
+      host: "127.0.0.1",
+      port: lockPort
+    });
+    client.on("error", () => {});
+    await once(client, "connect");
+    client.write("keep-open");
+
+    const releasePromise = releaseTestDbLock(acquired);
+    let releasedPromptly: boolean;
+    try {
+      releasedPromptly = await Promise.race([
+        releasePromise.then(() => true),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 50))
+      ]);
+    } finally {
+      if ("resetAndDestroy" in client) client.resetAndDestroy();
+      else client.destroy();
+      acquired.mutex.closeAllConnections?.();
+      await Promise.race([
+        releasePromise,
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error("mutex release cleanup exceeded 200ms")),
+            200
+          )
+        )
+      ]);
+    }
+
+    expect(releasedPromptly).toBe(true);
+  });
+
   it("allows only one synchronized contender to recover the same stale lock", async () => {
     const { acquireTestDbLock, releaseTestDbLock } = await loadWrapper();
     await writeFile(
@@ -198,7 +296,7 @@ describe("API test lifecycle wrapper", () => {
     );
     expect(winners).toHaveLength(1);
     expect(losers).toHaveLength(1);
-    expect(String(losers[0].reason)).toContain("already owned");
+    expect(String(losers[0].reason)).toContain("mutex port occupied");
 
     const winner = winners[0].value;
     const persistedOwner = JSON.parse(await readFile(lockPath, "utf8"));
@@ -229,10 +327,45 @@ describe("API test lifecycle wrapper", () => {
     expect(result.exitCode).not.toBe(0);
     expect(result.signal).toBeNull();
     expect(runCommand).not.toHaveBeenCalled();
-    expect(errors.join("\n")).toContain("already owned");
+    expect(errors.join("\n")).toContain("mutex port occupied");
     expect(errors.join("\n")).toContain(String(process.pid));
+    expect(errors.join("\n")).toContain("for diagnostics only");
+    expect(errors.join("\n")).toContain("no Compose command was run");
     await expect(access(lockPath)).resolves.toBeUndefined();
     await releaseTestDbLock(active);
+  });
+
+  it("reports an occupied mutex without a sidecar as an unknown owner", async () => {
+    const { runApiTestLifecycle } = await loadWrapper();
+    const mutex = createServer((socket) => socket.destroy());
+    await new Promise<void>((resolve, reject) => {
+      mutex.once("error", reject);
+      mutex.listen(
+        { host: "127.0.0.1", port: lockPort, exclusive: true },
+        resolve
+      );
+    });
+    const runCommand = vi.fn();
+    const errors: string[] = [];
+
+    try {
+      const result = await runApiTestLifecycle({
+        lockPath,
+        lockPort,
+        runCommand,
+        logError: (message: string) => errors.push(message)
+      });
+
+      expect(result).toEqual({ exitCode: 73, signal: null });
+      expect(runCommand).not.toHaveBeenCalled();
+      expect(errors.join("\n")).toContain("mutex port occupied");
+      expect(errors.join("\n")).toContain("owner unknown");
+      expect(errors.join("\n")).toContain("no Compose command was run");
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        mutex.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
   });
 
   it("interrupts the active child, cleans up, and maps SIGTERM to exit 143", async () => {
@@ -272,18 +405,115 @@ describe("API test lifecycle wrapper", () => {
     expect(phases).toEqual(["up", "test", "down"]);
   });
 
-  it("parses explicit lifecycle-only failure and hold controls", async () => {
+  it("escalates a first signal after the grace period and still cleans up", async () => {
+    const { runApiTestLifecycle } = await loadWrapper();
+    const signalSource = new EventEmitter();
+    const phases: string[] = [];
+    const kills: string[] = [];
+
+    const result = await runApiTestLifecycle({
+      lockPath,
+      lockPort,
+      signalSource,
+      signalGraceMs: 10,
+      runCommand: async ({
+        phase,
+        onSpawn
+      }: {
+        phase: string;
+        onSpawn: (child: { kill: (signal: string) => boolean }) => void;
+      }) => {
+        phases.push(phase);
+        if (phase !== "test") return { exitCode: 0, signal: null };
+        return await new Promise((resolve) => {
+          const fallback = setTimeout(
+            () => resolve({ exitCode: 98, signal: null }),
+            100
+          );
+          onSpawn({
+            kill: (signal: string) => {
+              kills.push(signal);
+              if (signal === "SIGKILL") {
+                clearTimeout(fallback);
+                resolve({ exitCode: null, signal });
+              }
+              return true;
+            }
+          });
+          queueMicrotask(() => signalSource.emit("SIGTERM"));
+        });
+      }
+    });
+
+    expect(result).toEqual({ exitCode: 143, signal: "SIGTERM" });
+    expect(kills).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(phases).toEqual(["up", "test", "down"]);
+    await expect(access(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("escalates a second signal immediately and still cleans up", async () => {
+    const { runApiTestLifecycle } = await loadWrapper();
+    const signalSource = new EventEmitter();
+    const phases: string[] = [];
+    const kills: string[] = [];
+
+    const result = await runApiTestLifecycle({
+      lockPath,
+      lockPort,
+      signalSource,
+      signalGraceMs: 1_000,
+      runCommand: async ({
+        phase,
+        onSpawn
+      }: {
+        phase: string;
+        onSpawn: (child: { kill: (signal: string) => boolean }) => void;
+      }) => {
+        phases.push(phase);
+        if (phase !== "test") return { exitCode: 0, signal: null };
+        return await new Promise((resolve) => {
+          const fallback = setTimeout(
+            () => resolve({ exitCode: 98, signal: null }),
+            100
+          );
+          onSpawn({
+            kill: (signal: string) => {
+              kills.push(signal);
+              if (signal === "SIGKILL") {
+                clearTimeout(fallback);
+                resolve({ exitCode: null, signal });
+              }
+              return true;
+            }
+          });
+          queueMicrotask(() => {
+            signalSource.emit("SIGINT");
+            signalSource.emit("SIGINT");
+          });
+        });
+      }
+    });
+
+    expect(result).toEqual({ exitCode: 130, signal: "SIGINT" });
+    expect(kills).toEqual(["SIGINT", "SIGKILL"]);
+    expect(phases).toEqual(["up", "test", "down"]);
+    await expect(access(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("parses explicit lifecycle-only failure, hold, and stubborn controls", async () => {
     const { parseLifecycleArgs } = await loadWrapper();
 
     expect(
       parseLifecycleArgs([
         "--lifecycle-test-exit-code=31",
         "--lifecycle-test-hold-ms=250",
+        "--lifecycle-test-stubborn-ms=60000",
         "--reporter=dot"
       ])
     ).toEqual({
       forcedTestExitCode: 31,
       holdMs: 250,
+      stubbornMs: 60_000,
       vitestArgs: ["--reporter=dot"]
     });
   });

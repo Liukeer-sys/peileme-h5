@@ -105,12 +105,15 @@ Add focused tests to `server/tests/run-api-tests.test.ts` for:
 
 - successful `up -> test -> down`;
 - test exit `23` and partial-up exit `19`, with down always executed and the original code preserved;
-- SIGTERM cleanup and exit `143`;
+- SIGTERM cleanup and exit `143`, including a child that ignores the first signal until the grace timer sends `SIGKILL`;
+- a second SIGINT/SIGTERM immediately escalating the active child to `SIGKILL` while preserving the first signal's exit `130`/`143`;
 - a dead owner sidecar replaced by a new owner;
 - an idle mutex replacing a stale sidecar whose PID has been reused by a live, unrelated process;
+- mutex release completing promptly when a client attempts to keep its connection open;
 - two contenders released from the same barrier against one stale sidecar, with exactly one winner and one fast active-lock failure;
-- active ownership returning nonzero without issuing any Compose command;
-- explicit `--lifecycle-test-exit-code` and `--lifecycle-test-hold-ms` acceptance controls.
+- active ownership returning nonzero without issuing any Compose command, with separate diagnostics for a known sidecar owner and an occupied mutex with no sidecar;
+- cleanup and lock-release failures preserving an earlier up/test failure, while a release failure after success returns `1`;
+- explicit `--lifecycle-test-exit-code`, `--lifecycle-test-hold-ms`, and `--lifecycle-test-stubborn-ms` acceptance controls.
 
 Run:
 
@@ -122,7 +125,7 @@ Expected before the wrapper exists: FAIL because the lifecycle and atomic owners
 
 - [ ] **Step 3: Add the failure-safe wrapper and lifecycle scripts**
 
-`scripts/run-api-tests.mjs` must acquire ownership before every Compose command. The exclusive kernel mutex on `127.0.0.1:55431` is the sole active-ownership fact. After binding it successfully, atomically replace any existing `/tmp/peileme-h5-test-db-55432.lock` sidecar with the new `pid`, `cwd`, `token`, and `createdAt`; sidecar PID liveness never blocks the mutex owner because PIDs can be reused. A failed bind reads the sidecar only for diagnostics, returns exit `73`, and returns before the lifecycle `finally`, so the contender never downs the owner's database.
+`scripts/run-api-tests.mjs` must acquire ownership before every Compose command. The exclusive kernel mutex on `127.0.0.1:55431` is the sole active-ownership fact. It immediately destroys accepted client connections so mutex release stays bounded. After binding it successfully, atomically replace any existing `/tmp/peileme-h5-test-db-55432.lock` sidecar with the new `pid`, `cwd`, `token`, and `createdAt`; sidecar PID liveness never blocks the mutex owner because PIDs can be reused. A failed bind reads the sidecar only for diagnostics, reports an unknown owner when the sidecar is absent, returns exit `73`, and returns before the lifecycle `finally`, so the contender never downs the owner's database.
 
 After ownership, execute Compose up and Vitest. A `finally` block must run:
 
@@ -130,7 +133,7 @@ After ownership, execute Compose up and Vitest. A `finally` block must run:
 docker compose -f docker-compose.test.yml down --volumes --remove-orphans
 ```
 
-Preserve the up or test exit code. On SIGINT/SIGTERM, interrupt the active child, run the same cleanup, and terminate with the corresponding signal status.
+Preserve the up or test exit code through cleanup and lock-release failures. On the first SIGINT/SIGTERM, forward that signal to the active child process group where supported, start a two-second grace timer, and escalate to `SIGKILL` when the child remains alive. A second signal escalates immediately. Wait for child exit, run the same cleanup, release ownership, and terminate with the original signal status `130`/`143`.
 
 Merge these scripts into `package.json`:
 
@@ -173,7 +176,7 @@ npx vitest run server/tests/run-api-tests.test.ts
 npm run test:api
 ```
 
-Expected: 10 wrapper/lock tests pass; the complete server suite reports 24/24; the lock sidecar, mutex listener, Compose container/network, and port `55432` are removed.
+Expected: 17 wrapper/lock tests pass; the complete server suite reports 32/32; the lock sidecar, mutex listener, Compose container/network, and port `55432` are removed.
 
 Exercise a real nonzero child:
 
@@ -187,7 +190,7 @@ test "$status" -eq 37
 
 Start one owner with `--lifecycle-test-hold-ms=30000`, then start a second `npm run test:api`. Expected: the contender returns `73` in under three seconds, the owner token and Compose container ID stay unchanged, and the owner's PostgreSQL remains healthy. After the owner exits, all resources are removed.
 
-Send SIGINT and SIGTERM to a held wrapper process. Expected: exit `130` and `143`, respectively, after cleanup.
+Send SIGINT and SIGTERM to a held wrapper process. Repeat with `--lifecycle-test-stubborn-ms=60000`, allowing the grace timer to escalate once and sending the same signal twice for the immediate escalation path. Expected: exit `130` and `143`, respectively, after child exit and cleanup.
 
 After every lifecycle path, run:
 

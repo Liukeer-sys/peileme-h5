@@ -20,12 +20,15 @@ export const TEST_DB_LOCK_PATH = path.join(
 export const TEST_DB_LOCK_PORT = 55431;
 
 class ActiveTestDbLockError extends Error {
-  constructor(owner) {
+  constructor(owner, lockPort) {
+    const ownerDetails = owner
+      ? `sidecar reports PID ${owner.pid ?? "unknown"} in ${
+          owner.cwd ?? "an unknown worktree"
+        } for diagnostics only`
+      : "owner unknown";
     super(
-      `Test database is already owned by PID ${owner?.pid ?? "unknown"} in ${
-        owner?.cwd ?? "another worktree"
-      }. ` +
-        "Wait for that test lifecycle to finish."
+      `Test database mutex port occupied (${lockPort}); ${ownerDetails}; ` +
+        "no Compose command was run."
     );
     this.name = "ActiveTestDbLockError";
     this.owner = owner;
@@ -51,11 +54,12 @@ const closeMutex = (mutex) =>
       if (error) reject(error);
       else resolve();
     });
+    mutex.closeAllConnections?.();
   });
 
 const acquireMutex = (lockPort) =>
   new Promise((resolve, reject) => {
-    const mutex = createServer();
+    const mutex = createServer((socket) => socket.destroy());
     mutex.once("error", reject);
     mutex.listen(
       {
@@ -96,7 +100,10 @@ export const acquireTestDbLock = async ({
     mutex = await acquireMutex(lockPort);
   } catch (error) {
     if (error?.code === "EADDRINUSE") {
-      throw new ActiveTestDbLockError(await readLockOwner(lockPath));
+      throw new ActiveTestDbLockError(
+        await readLockOwner(lockPath),
+        lockPort
+      );
     }
     throw error;
   }
@@ -134,6 +141,7 @@ export const releaseTestDbLock = async (lock) => {
 export const parseLifecycleArgs = (args = []) => {
   let forcedTestExitCode = null;
   let holdMs = 0;
+  let stubbornMs = null;
   const vitestArgs = [];
 
   for (const argument of args) {
@@ -153,10 +161,20 @@ export const parseLifecycleArgs = (args = []) => {
       holdMs = value;
       continue;
     }
+    if (argument.startsWith("--lifecycle-test-stubborn-ms=")) {
+      const value = Number(argument.split("=", 2)[1]);
+      if (!Number.isInteger(value) || value < 1 || value > 60_000) {
+        throw new Error(
+          "--lifecycle-test-stubborn-ms must be an integer from 1 to 60000"
+        );
+      }
+      stubbornMs = value;
+      continue;
+    }
     vitestArgs.push(argument);
   }
 
-  return { forcedTestExitCode, holdMs, vitestArgs };
+  return { forcedTestExitCode, holdMs, stubbornMs, vitestArgs };
 };
 
 const spawnCommand = ({ command, args, cwd, onSpawn, logError }) =>
@@ -164,7 +182,8 @@ const spawnCommand = ({ command, args, cwd, onSpawn, logError }) =>
     const child = spawn(command, args, {
       cwd,
       stdio: "inherit",
-      shell: false
+      shell: false,
+      detached: process.platform !== "win32"
     });
     onSpawn(child);
     child.once("error", (error) => {
@@ -175,6 +194,26 @@ const spawnCommand = ({ command, args, cwd, onSpawn, logError }) =>
       resolve({ exitCode, signal });
     });
   });
+
+const signalChildTree = (child, signal) => {
+  if (
+    process.platform !== "win32" &&
+    Number.isInteger(child?.pid) &&
+    child.pid > 0
+  ) {
+    try {
+      process.kill(-child.pid, signal);
+      return true;
+    } catch {
+      // Fall through when the child is not a process-group leader.
+    }
+  }
+  try {
+    return child?.kill(signal) ?? false;
+  } catch {
+    return false;
+  }
+};
 
 const waitForHold = (holdMs, wasSignalled) =>
   new Promise((resolve) => {
@@ -204,7 +243,9 @@ export const runApiTestLifecycle = async ({
   lockPort = TEST_DB_LOCK_PORT,
   lifecycleArgs = [],
   runCommand = spawnCommand,
+  releaseLock = releaseTestDbLock,
   signalSource = process,
+  signalGraceMs = 2_000,
   logError = (message) => console.error(message)
 } = {}) => {
   let parsedArgs;
@@ -226,16 +267,41 @@ export const runApiTestLifecycle = async ({
     };
   }
 
-  const { forcedTestExitCode, holdMs, vitestArgs } = parsedArgs;
+  const { forcedTestExitCode, holdMs, stubbornMs, vitestArgs } = parsedArgs;
   let activeChild = null;
   let phase = "up";
   let requestedSignal = null;
   let primaryExitCode = 0;
+  let signalEscalationTimer = null;
+
+  const clearSignalEscalation = () => {
+    if (signalEscalationTimer) {
+      clearTimeout(signalEscalationTimer);
+      signalEscalationTimer = null;
+    }
+  };
+
+  const escalateActiveChild = () => {
+    clearSignalEscalation();
+    if (phase !== "down" && activeChild) {
+      signalChildTree(activeChild, "SIGKILL");
+    }
+  };
+
+  const forwardFirstSignal = () => {
+    if (phase === "down" || !activeChild || !requestedSignal) return;
+    signalChildTree(activeChild, requestedSignal);
+    clearSignalEscalation();
+    signalEscalationTimer = setTimeout(escalateActiveChild, signalGraceMs);
+  };
 
   const handleSignal = (signal) => {
-    if (requestedSignal) return;
-    requestedSignal = signal;
-    if (phase !== "down") activeChild?.kill(signal);
+    if (!requestedSignal) {
+      requestedSignal = signal;
+      forwardFirstSignal();
+      return;
+    }
+    escalateActiveChild();
   };
   const onSigint = () => handleSignal("SIGINT");
   const onSigterm = () => handleSignal("SIGTERM");
@@ -252,8 +318,10 @@ export const runApiTestLifecycle = async ({
       logError,
       onSpawn: (child) => {
         activeChild = child;
+        if (requestedSignal) forwardFirstSignal();
       }
     });
+    clearSignalEscalation();
     activeChild = null;
     if (result.signal && !requestedSignal) requestedSignal = result.signal;
     return result;
@@ -276,15 +344,25 @@ export const runApiTestLifecycle = async ({
 
     if (primaryExitCode === 0 && !requestedSignal) {
       const testCommand = process.execPath;
-      const testArgs =
-        forcedTestExitCode === null
-          ? [
-              path.join(cwd, "node_modules", "vitest", "vitest.mjs"),
-              "run",
-              "server/tests",
-              ...vitestArgs
-            ]
-          : ["-e", `process.exit(${forcedTestExitCode})`];
+      let testArgs;
+      if (forcedTestExitCode !== null) {
+        testArgs = ["-e", `process.exit(${forcedTestExitCode})`];
+      } else if (stubbornMs !== null) {
+        testArgs = [
+          "-e",
+          "const peilemeLifecycleStubborn = true;" +
+            "process.on('SIGINT', () => {});" +
+            "process.on('SIGTERM', () => {});" +
+            `setTimeout(() => process.exit(peilemeLifecycleStubborn ? 0 : 1), ${stubbornMs});`
+        ];
+      } else {
+        testArgs = [
+          path.join(cwd, "node_modules", "vitest", "vitest.mjs"),
+          "run",
+          "server/tests",
+          ...vitestArgs
+        ];
+      }
       const test = await runPhase("test", testCommand, testArgs);
       primaryExitCode = resultExitCode(test);
     }
@@ -294,6 +372,7 @@ export const runApiTestLifecycle = async ({
         SIGNAL_EXIT_CODES[requestedSignal] ?? (primaryExitCode || 1);
     }
   } finally {
+    clearSignalEscalation();
     try {
       const down = await runPhase("down", "docker", [
         "compose",
@@ -318,7 +397,14 @@ export const runApiTestLifecycle = async ({
       if (primaryExitCode === 0) primaryExitCode = 1;
     } finally {
       try {
-        await releaseTestDbLock(lock);
+        await releaseLock(lock);
+      } catch (error) {
+        logError(
+          `Test database lock release failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+        if (primaryExitCode === 0) primaryExitCode = 1;
       } finally {
         signalSource.off("SIGINT", onSigint);
         signalSource.off("SIGTERM", onSigterm);

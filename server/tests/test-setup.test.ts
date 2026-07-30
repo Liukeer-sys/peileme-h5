@@ -31,4 +31,20 @@ describe("test upload environment", () => {
       rmSync(historical, { recursive: true, force: true });
     }
   });
+
+  it("retains ownership when removing an owned directory fails", () => {
+    const owned = testSetup.createTestUploadDir();
+
+    try {
+      expect(() =>
+        testSetup.cleanupTestUploadDir(owned, (_path, _options) => {
+          throw new Error("rm failed");
+        })
+      ).toThrow("rm failed");
+      expect(existsSync(owned)).toBe(true);
+      expect(testSetup.cleanupTestUploadDir(owned)).toBe(true);
+    } finally {
+      rmSync(owned, { recursive: true, force: true });
+    }
+  });
 });

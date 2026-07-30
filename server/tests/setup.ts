@@ -11,10 +11,14 @@ export const createTestUploadDir = () => {
   return uploadDir;
 };
 
-export const cleanupTestUploadDir = (uploadDir: string) => {
+export const cleanupTestUploadDir = (
+  uploadDir: string,
+  removeDir: typeof rmSync = rmSync
+) => {
   const resolvedUploadDir = path.resolve(uploadDir);
-  if (!ownedUploadDirs.delete(resolvedUploadDir)) return false;
-  rmSync(resolvedUploadDir, { recursive: true, force: true });
+  if (!ownedUploadDirs.has(resolvedUploadDir)) return false;
+  removeDir(resolvedUploadDir, { recursive: true, force: true });
+  ownedUploadDirs.delete(resolvedUploadDir);
   return true;
 };
 
