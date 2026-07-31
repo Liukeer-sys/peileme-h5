@@ -6,12 +6,16 @@ import { ApiError, track } from "../lib/api";
 type AuthModalProps = {
   open: boolean;
   initialMode?: "login" | "register" | "reset";
+  description?: string;
+  privacyNote?: string;
   onClose: () => void;
 };
 
 export default function AuthModal({
   open,
   initialMode = "login",
+  description = "保存历史测算、兑换邀请码并管理账号。",
+  privacyNote = "验证码仅用于身份验证。登录记录可在个人中心管理。",
   onClose
 }: AuthModalProps) {
   const { login, register, resetPassword, sendCode } = useAuth();
@@ -122,7 +126,7 @@ export default function AuthModal({
         </button>
         <div className="account-mark">赔</div>
         <h2 id="auth-dialog-title">{mode === "register" ? "建立你的赔了么档案" : mode === "reset" ? "重置登录密码" : "登录赔了么"}</h2>
-        <p>{mode === "reset" ? "验证邮箱或手机号后设置新密码。" : "保存历史测算、兑换邀请码，并安全管理你上传的材料。"}</p>
+        <p>{mode === "reset" ? "验证邮箱或手机号后设置新密码。" : description}</p>
 
         {mode === "login" && (
           <div className="account-tabs">
@@ -232,7 +236,7 @@ export default function AuthModal({
             </button>
           )}
         </div>
-        <small>验证码仅用于身份验证。材料默认私有保存，可随时在个人中心查看。</small>
+        <small>{privacyNote}</small>
       </section>
     </div>
   );

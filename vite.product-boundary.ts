@@ -1,5 +1,6 @@
 import type { OutputAsset, OutputBundle, OutputChunk } from "rollup";
 import type { Plugin } from "vite";
+import { aiOnlyCssSelectors } from "./product-boundary-markers";
 
 export type ProductBoundaryChannel = "main" | "ai";
 
@@ -34,8 +35,12 @@ export const assertProductBoundary = (
   }
 
   const emittedCss = cssAssets.map(assetSource).join("\n");
-  if (channel === "main" && emittedCss.includes(".ai-intro")) {
-    throw new Error("main CSS contains AI-only selectors");
+  if (channel === "main") {
+    for (const selector of aiOnlyCssSelectors) {
+      if (emittedCss.includes(selector)) {
+        throw new Error(`main CSS contains AI-only selector: ${selector}`);
+      }
+    }
   }
   if (channel === "ai" && !emittedCss.includes(".ai-intro")) {
     throw new Error("AI CSS is missing AI-only selectors");

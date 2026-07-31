@@ -1,19 +1,15 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useAuth, type GrantModule } from "../auth/AuthContext";
 import { useDialogFocus } from "../hooks/useDialogFocus";
-import { api, ApiError, downloadFromApi, track } from "../lib/api";
-import PolicyHistory from "../main/PolicyHistory";
+import { ApiError, track } from "../lib/api";
+import {
+  MainPanelLifecycleGuard,
+  createMainPanelPrivateState
+} from "./MainPanelLifecycle";
+import PolicyHistory from "./PolicyHistory";
 import type { PolicyHistoryDetail } from "../types";
 
-type UploadItem = {
-  id: string;
-  original_name: string;
-  size_bytes: string;
-  status: string;
-  created_at: string;
-};
-
-type AccountPanelProps = {
+type MainAccountPanelProps = {
   open: boolean;
   onClose: () => void;
   historyRefreshKey?: string;
@@ -26,63 +22,129 @@ const moduleNames: Record<GrantModule, string> = {
   evidencePack: "离职证据包"
 };
 
-export default function AccountPanel({
+export default function MainAccountPanel({
   open,
   onClose,
   historyRefreshKey,
   policyRecalculating = false,
   onPolicyRecalculate
-}: AccountPanelProps) {
+}: MainAccountPanelProps) {
   const { user, grants, logout, redeemInvite, updateProfile } = useAuth();
   const [invite, setInvite] = useState("");
   const [message, setMessage] = useState("");
-  const [uploads, setUploads] = useState<UploadItem[]>([]);
   const [displayName, setDisplayName] = useState("");
   const [busy, setBusy] = useState(false);
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const displayNameRef = useRef<HTMLInputElement | null>(null);
+  const lifecycleGuardRef = useRef(new MainPanelLifecycleGuard());
+  const visibleUserIdRef = useRef<string | null>(null);
+  visibleUserIdRef.current = open && user ? user.id : null;
+
+  const resetPrivateState = useCallback((nextDisplayName = "") => {
+    const nextState = createMainPanelPrivateState(nextDisplayName);
+    setInvite(nextState.invite);
+    setMessage(nextState.message);
+    setDisplayName(nextState.displayName);
+    setBusy(nextState.busy);
+  }, []);
 
   useDialogFocus(open && Boolean(user), dialogRef, onClose, displayNameRef);
 
   useEffect(() => {
-    if (!open || !user) return;
-    setDisplayName(user.displayName || "");
-    void api<{ files: UploadItem[] }>("/api/uploads/mine", { auth: true })
-      .then((savedUploads) => {
-        setUploads(savedUploads.files);
-      })
-      .catch(() => {
-        setUploads([]);
-      });
-  }, [open, user]);
+    if (!open || !user) {
+      lifecycleGuardRef.current.deactivate();
+      resetPrivateState();
+      return;
+    }
+    const guard = lifecycleGuardRef.current;
+    guard.activate(user.id);
+    resetPrivateState(user.displayName || "");
+    return () => guard.deactivate();
+  }, [open, resetPrivateState, user?.id]);
+
+  useEffect(() => {
+    if (open && user) setDisplayName(user.displayName || "");
+  }, [open, user?.displayName, user?.id]);
 
   if (!open || !user) return null;
 
   const redeem = async () => {
+    const lifecycle = lifecycleGuardRef.current.beginMutation(user.id);
+    if (!lifecycle) return;
+    const inviteCode = invite.trim();
     setBusy(true);
     setMessage("");
     try {
-      const modules = await redeemInvite(invite);
+      const modules = await redeemInvite(inviteCode);
+      if (
+        !lifecycleGuardRef.current.isCurrent(
+          lifecycle,
+          visibleUserIdRef.current
+        )
+      ) {
+        return;
+      }
       setMessage(`已解锁：${modules.map((item) => moduleNames[item]).join("、")}`);
       setInvite("");
     } catch (error) {
+      if (
+        !lifecycleGuardRef.current.isCurrent(
+          lifecycle,
+          visibleUserIdRef.current
+        )
+      ) {
+        return;
+      }
       setMessage(error instanceof ApiError ? error.message : "兑换失败，请稍后重试");
     } finally {
-      setBusy(false);
+      if (
+        lifecycleGuardRef.current.isCurrent(
+          lifecycle,
+          visibleUserIdRef.current
+        )
+      ) {
+        setBusy(false);
+      }
     }
   };
 
   const saveProfile = async () => {
-    if (!displayName.trim()) return;
+    const nextDisplayName = displayName.trim();
+    if (!nextDisplayName) return;
+    const lifecycle = lifecycleGuardRef.current.beginMutation(user.id);
+    if (!lifecycle) return;
     setBusy(true);
     setMessage("");
     try {
-      await updateProfile(displayName.trim());
+      await updateProfile(nextDisplayName);
+      if (
+        !lifecycleGuardRef.current.isCurrent(
+          lifecycle,
+          visibleUserIdRef.current
+        )
+      ) {
+        return;
+      }
       setMessage("称呼已更新");
     } catch (error) {
+      if (
+        !lifecycleGuardRef.current.isCurrent(
+          lifecycle,
+          visibleUserIdRef.current
+        )
+      ) {
+        return;
+      }
       setMessage(error instanceof ApiError ? error.message : "更新失败，请稍后重试");
     } finally {
-      setBusy(false);
+      if (
+        lifecycleGuardRef.current.isCurrent(
+          lifecycle,
+          visibleUserIdRef.current
+        )
+      ) {
+        setBusy(false);
+      }
     }
   };
 
@@ -165,41 +227,6 @@ export default function AccountPanel({
           />
         </div>
 
-        <div className="account-panel-section">
-          <strong>已上传材料</strong>
-          <div className="history-list">
-            {uploads.length ? (
-              uploads.slice(0, 6).map((item) => (
-                <article key={item.id} className="upload-history-item">
-                  <div>
-                    <b>{item.original_name}</b>
-                    <span>
-                      {Math.max(1, Math.round(Number(item.size_bytes) / 1024))} KB ·
-                      {item.status === "stored" ? " 已安全保存" : ` ${item.status}`} ·
-                      {new Date(item.created_at).toLocaleString("zh-CN")}
-                    </span>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      void downloadFromApi(
-                        `/api/uploads/${item.id}/download`,
-                        item.original_name
-                      ).catch((error) =>
-                        setMessage(error instanceof ApiError ? error.message : "下载失败")
-                      )
-                    }
-                  >
-                    下载
-                  </button>
-                </article>
-              ))
-            ) : (
-              <p>上传 HR 协议或截图后，材料会显示在这里。</p>
-            )}
-          </div>
-        </div>
-
         {["admin", "analyst"].includes(user.role) && (
           <a className="admin-entry-link" href="/admin" onClick={() => track("admin_opened")}>
             进入管理后台 →
@@ -208,7 +235,7 @@ export default function AccountPanel({
         <button
           className="ghost-button account-logout"
           type="button"
-          onClick={() => void logout().then(onClose)}
+          onClick={() => void logout().finally(onClose).catch(() => undefined)}
         >
           退出登录
         </button>

@@ -1,5 +1,6 @@
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
+import { aiOnlyCssSelectors } from "../../product-boundary-markers.js";
 
 type VerifyWebArtifactsOptions = {
   mainDir: string;
@@ -18,9 +19,36 @@ const forbiddenMainMarkers = [
   "LLM_PROVIDER",
   "ai-worker",
   "文件签署分析",
-  "劳动文件审查"
+  "劳动文件审查",
+  "/api/admin/uploads",
+  "/api/uploads/mine",
+  "/api/uploads/",
+  "/api/uploads",
+  "已上传材料",
+  "上传 HR 协议或截图",
+  "安全管理你上传的材料",
+  "材料默认私有保存",
+  "材料管理",
+  ...aiOnlyCssSelectors
 ];
-const requiredAiMarker = "AI 深度分析版";
+const requiredAiMarkers = [
+  "AI 深度分析版",
+  "AI_DOCUMENT_REVIEW",
+  "/api/uploads",
+  "/api/uploads/mine",
+  "/api/uploads/",
+  "/api/admin/uploads",
+  "ai-document-upload-input"
+];
+const aiDocumentInputAssignment =
+  String.raw`class(?:Name)?\s*(?:=|:)\s*["']ai-document-upload-input["']`;
+const fileTypeAssignment =
+  String.raw`type\s*(?:=|:)\s*["']file["']`;
+const aiDocumentFileInputPattern = new RegExp(
+  `(?:${aiDocumentInputAssignment}[^<>{}]{0,160}${fileTypeAssignment}|` +
+    `${fileTypeAssignment}[^<>{}]{0,160}${aiDocumentInputAssignment})`
+);
+const aiUserDownloadPattern = /\/api\/uploads\/[^"'`\s]{1,160}\/download/;
 
 const listFiles = async (root: string): Promise<string[]> => {
   const entries = await readdir(root, { withFileTypes: true });
@@ -70,8 +98,19 @@ export const verifyWebArtifacts = async ({
     }
   }
 
-  if (!aiArtifact.includes(requiredAiMarker)) {
-    throw new Error(`AI artifact is missing marker: ${requiredAiMarker}`);
+  for (const marker of requiredAiMarkers) {
+    if (!aiArtifact.includes(marker)) {
+      throw new Error(`AI artifact is missing marker: ${marker}`);
+    }
+  }
+
+  if (!aiDocumentFileInputPattern.test(aiArtifact)) {
+    throw new Error('AI artifact is missing marker: type="file"');
+  }
+  if (!aiUserDownloadPattern.test(aiArtifact)) {
+    throw new Error(
+      "AI artifact is missing marker: /api/uploads/:id/download"
+    );
   }
 
   return {

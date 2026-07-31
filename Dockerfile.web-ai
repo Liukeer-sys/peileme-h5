@@ -4,7 +4,7 @@ ARG VITE_SHARE_URL
 ENV VITE_SHARE_URL=$VITE_SHARE_URL
 COPY package.json package-lock.json ./
 RUN npm ci
-COPY ai.html tsconfig.json vite.ai.config.ts vite.product-boundary.ts ./
+COPY ai.html tsconfig.json vite.ai.config.ts vite.product-boundary.ts product-boundary-markers.ts ./
 COPY public-ai ./public-ai
 COPY src ./src
 RUN npm run build:web:ai

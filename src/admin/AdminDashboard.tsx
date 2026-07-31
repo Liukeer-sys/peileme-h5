@@ -2,11 +2,13 @@ import {
   useCallback,
   useEffect,
   useMemo,
-  useState
+  useRef,
+  useState,
+  type ReactNode
 } from "react";
-import { useAuth } from "../auth/AuthContext";
+import { useAuth, type User } from "../auth/AuthContext";
 import AuthModal from "../components/AuthModal";
-import { api, ApiError, downloadFromApi } from "../lib/api";
+import { api, ApiError } from "../lib/api";
 import {
   DataTable,
   dateTime,
@@ -16,38 +18,65 @@ import {
 import AnnouncementsPanel from "./policy/AnnouncementsPanel";
 import PolicyRulesPanel from "./policy/PolicyRulesPanel";
 import RegionalDataPanel from "./policy/RegionalDataPanel";
+import { isCurrentAdminEndpoint } from "./AdminEndpointBoundary";
 
-type Tab =
+type BaseTab =
   | "overview"
   | "policyRules"
   | "regionalData"
   | "announcements"
   | "users"
   | "assessments"
-  | "uploads"
   | "invites"
   | "events"
   | "audit"
   | "system";
 
-const navItems: Array<{ id: Tab; label: string; icon: string }> = [
+type AdminExtensionContext = {
+  data: Record<string, unknown>;
+  rows: UnknownRow[];
+  adminUser: User;
+  setError: (message: string) => void;
+};
+
+export type AdminDashboardExtension = {
+  id: string;
+  label: string;
+  icon: string;
+  after?: BaseTab;
+  endpoint: string;
+  overviewMetric?: {
+    label: string;
+    dataKey: string;
+    note: string;
+  };
+  render: (context: AdminExtensionContext) => ReactNode;
+};
+
+type AdminDashboardProps = {
+  extensions?: AdminDashboardExtension[];
+};
+
+const navItems: Array<{ id: BaseTab; label: string; icon: string }> = [
   { id: "overview", label: "经营概览", icon: "⌁" },
   { id: "policyRules", label: "政策规则", icon: "规" },
   { id: "regionalData", label: "区域参数", icon: "域" },
   { id: "announcements", label: "公告设置", icon: "告" },
   { id: "users", label: "用户管理", icon: "人" },
   { id: "assessments", label: "测算记录", icon: "算" },
-  { id: "uploads", label: "材料管理", icon: "件" },
   { id: "invites", label: "邀请码", icon: "码" },
   { id: "events", label: "埋点统计", icon: "数" },
   { id: "audit", label: "审计日志", icon: "审" },
   { id: "system", label: "系统状态", icon: "稳" }
 ];
 
+const noExtensions: AdminDashboardExtension[] = [];
 
-export default function AdminDashboard() {
+export default function AdminDashboard({
+  extensions = noExtensions
+}: AdminDashboardProps) {
   const { user, capabilities, ready, logout } = useAuth();
-  const [tab, setTab] = useState<Tab>("overview");
+  const [tab, setTab] = useState<string>("overview");
   const [data, setData] = useState<Record<string, unknown>>({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -55,42 +84,125 @@ export default function AdminDashboard() {
   const [inviteDescription, setInviteDescription] = useState("");
   const [inviteUses, setInviteUses] = useState("1");
   const [policyRefreshKey, setPolicyRefreshKey] = useState(0);
+  const requestGenerationRef = useRef(0);
+  const requestControllerRef = useRef<AbortController | null>(null);
 
   const isAdmin = Boolean(user && ["admin", "analyst"].includes(user.role));
+  const allNavItems = useMemo(
+    () => {
+      const positioned = navItems.flatMap((item) => [
+        item,
+        ...extensions
+          .filter((extension) => extension.after === item.id)
+          .map(({ id, label, icon }) => ({ id, label, icon }))
+      ]);
+      return [
+        ...positioned,
+        ...extensions
+          .filter((extension) => !extension.after)
+          .map(({ id, label, icon }) => ({ id, label, icon }))
+      ];
+    },
+    [extensions]
+  );
+  const activeExtension = useMemo(
+    () => extensions.find((extension) => extension.id === tab),
+    [extensions, tab]
+  );
   const endpoint = useMemo(
-    () =>
-      ({
+    () => {
+      const baseEndpoint = ({
         overview: "/api/admin/overview?days=30",
         policyRules: "",
         regionalData: "",
         announcements: "",
         users: "/api/admin/users?pageSize=100",
         assessments: "/api/admin/assessments?pageSize=100",
-        uploads: "/api/admin/uploads?pageSize=100",
         invites: "/api/admin/invites",
         events: "/api/admin/events?days=30",
         audit: "/api/admin/audit-logs?pageSize=100",
         system: "/api/admin/system"
-      })[tab],
-    [tab]
+      } as Record<string, string>)[tab];
+      return baseEndpoint ?? activeExtension?.endpoint ?? "";
+    },
+    [activeExtension, tab]
   );
+  const activeEndpointRef = useRef(endpoint);
+  activeEndpointRef.current = endpoint;
 
-  const load = useCallback(async () => {
-    if (!isAdmin || !endpoint) return;
+  const load = useCallback(async (capturedEndpoint = endpoint) => {
+    if (
+      !isAdmin ||
+      !isCurrentAdminEndpoint(activeEndpointRef.current, capturedEndpoint)
+    ) {
+      return;
+    }
+    requestControllerRef.current?.abort();
+    const controller = new AbortController();
+    requestControllerRef.current = controller;
+    const generation = requestGenerationRef.current + 1;
+    requestGenerationRef.current = generation;
     setLoading(true);
     setError("");
+    setData({});
     try {
-      setData(await api<Record<string, unknown>>(endpoint, { auth: true }));
+      const responseData = await api<Record<string, unknown>>(capturedEndpoint, {
+        auth: true,
+        signal: controller.signal
+      });
+      if (
+        isCurrentAdminEndpoint(
+          activeEndpointRef.current,
+          capturedEndpoint
+        ) &&
+        requestGenerationRef.current === generation &&
+        !controller.signal.aborted
+      ) {
+        setData(responseData);
+      }
     } catch (requestError) {
-      setError(requestError instanceof ApiError ? requestError.message : "加载失败");
+      if (
+        isCurrentAdminEndpoint(
+          activeEndpointRef.current,
+          capturedEndpoint
+        ) &&
+        requestGenerationRef.current === generation &&
+        !controller.signal.aborted
+      ) {
+        setError(
+          requestError instanceof ApiError ? requestError.message : "加载失败"
+        );
+      }
     } finally {
-      setLoading(false);
+      if (
+        isCurrentAdminEndpoint(
+          activeEndpointRef.current,
+          capturedEndpoint
+        ) &&
+        requestGenerationRef.current === generation
+      ) {
+        if (requestControllerRef.current === controller) {
+          requestControllerRef.current = null;
+        }
+        setLoading(false);
+      }
     }
   }, [endpoint, isAdmin]);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    requestGenerationRef.current += 1;
+    requestControllerRef.current?.abort();
+    requestControllerRef.current = null;
+    setData({});
+    setError("");
+    setLoading(false);
+    if (endpoint && isAdmin) void load(endpoint);
+    return () => {
+      requestGenerationRef.current += 1;
+      requestControllerRef.current?.abort();
+      requestControllerRef.current = null;
+    };
+  }, [endpoint, isAdmin, load]);
 
   if (!ready) {
     return <main className="admin-login-state">正在确认管理会话…</main>;
@@ -115,6 +227,8 @@ export default function AdminDashboard() {
   const rows = ((data.items || data.recentAssessments || []) as UnknownRow[]);
   const overview = (data.summary || {}) as UnknownRow;
   const createInvite = async () => {
+    const capturedEndpoint = endpoint;
+    const capturedGeneration = requestGenerationRef.current;
     setLoading(true);
     setError("");
     try {
@@ -127,28 +241,47 @@ export default function AdminDashboard() {
           grants: ["caseLawPack", "evidencePack"]
         }
       });
-      setInviteDescription("");
-      setInviteUses("1");
-      await load();
+      if (
+        isCurrentAdminEndpoint(activeEndpointRef.current, capturedEndpoint) &&
+        requestGenerationRef.current === capturedGeneration
+      ) {
+        setInviteDescription("");
+        setInviteUses("1");
+      }
+      await load(capturedEndpoint);
     } catch (requestError) {
-      setError(requestError instanceof ApiError ? requestError.message : "创建失败");
+      if (
+        isCurrentAdminEndpoint(activeEndpointRef.current, capturedEndpoint) &&
+        requestGenerationRef.current === capturedGeneration
+      ) {
+        setError(
+          requestError instanceof ApiError ? requestError.message : "创建失败"
+        );
+      }
     } finally {
-      setLoading(false);
+      if (
+        isCurrentAdminEndpoint(activeEndpointRef.current, capturedEndpoint) &&
+        requestGenerationRef.current === capturedGeneration
+      ) {
+        setLoading(false);
+      }
     }
   };
 
   const updateUser = async (id: unknown, patch: Record<string, unknown>) => {
+    const capturedEndpoint = endpoint;
     await api(`/api/admin/users/${id}`, { method: "PATCH", auth: true, body: patch });
-    await load();
+    await load(capturedEndpoint);
   };
 
   const toggleInvite = async (row: UnknownRow) => {
+    const capturedEndpoint = endpoint;
     await api(`/api/admin/invites/${row.id}`, {
       method: "PATCH",
       auth: true,
       body: { enabled: !row.enabled }
     });
-    await load();
+    await load(capturedEndpoint);
   };
 
   return (
@@ -159,12 +292,16 @@ export default function AdminDashboard() {
           <div><strong>赔了么</strong><small>运营管理台</small></div>
         </a>
         <nav>
-          {navItems.map((item) => (
+          {allNavItems.map((item) => (
             <button
               key={item.id}
               className={tab === item.id ? "active" : ""}
               type="button"
-              onClick={() => setTab(item.id)}
+              onClick={() => {
+                setData({});
+                setError("");
+                setTab(item.id);
+              }}
             >
               <i>{item.icon}</i>{item.label}
             </button>
@@ -181,7 +318,7 @@ export default function AdminDashboard() {
         <header className="admin-header">
           <div>
             <span>生产环境 · 数据实时更新</span>
-            <h1>{navItems.find((item) => item.id === tab)?.label}</h1>
+            <h1>{allNavItems.find((item) => item.id === tab)?.label}</h1>
           </div>
           <button
             type="button"
@@ -232,7 +369,16 @@ export default function AdminDashboard() {
                 ["访问会话", overview.sessions, "近 30 天"],
                 ["完成测算", overview.completed_assessments, "结果已入库"],
                 ["新增用户", overview.registered_users, "账号已验证"],
-                ["上传材料", overview.uploaded_files, "私有存储"]
+                ...extensions
+                  .filter((extension) => extension.overviewMetric)
+                  .map((extension) => {
+                    const metric = extension.overviewMetric!;
+                    return [
+                      metric.label,
+                      overview[metric.dataKey],
+                      metric.note
+                    ] as [string, unknown, string];
+                  })
               ] as Array<[string, unknown, string]>).map(([label, metric, note]) => (
                 <article key={String(label)}>
                   <span>{label}</span><strong>{value(metric)}</strong><small>{note}</small>
@@ -310,48 +456,6 @@ export default function AdminDashboard() {
                 { key: "reason", label: "离职原因", render: (row) => value((row.answers as UnknownRow | undefined)?.terminationReason) },
                 { key: "current_step", label: "停留步骤" },
                 { key: "created_at", label: "时间", render: (row) => dateTime(row.created_at) }
-              ]}
-            />
-          </section>
-        )}
-
-        {tab === "uploads" && (
-          <section className="admin-card">
-            <h2>用户材料 <small>共 {value((data.pagination as UnknownRow | undefined)?.total)} 份</small></h2>
-            <DataTable
-              rows={rows}
-              columns={[
-                { key: "original_name", label: "文件名" },
-                { key: "identity", label: "用户", render: (row) => value(row.display_name || row.email || row.phone) },
-                { key: "city", label: "测算城市" },
-                { key: "mime_type", label: "类型" },
-                {
-                  key: "size_bytes",
-                  label: "大小",
-                  render: (row) => `${Math.max(1, Math.round(Number(row.size_bytes || 0) / 1024))} KB`
-                },
-                { key: "status", label: "处理状态" },
-                { key: "created_at", label: "上传时间", render: (row) => dateTime(row.created_at) },
-                {
-                  key: "actions",
-                  label: "操作",
-                  render: (row) =>
-                    adminUser.role === "admin" ? (
-                      <button
-                        type="button"
-                        onClick={() =>
-                          void downloadFromApi(
-                            `/api/admin/uploads/${row.id}/download`,
-                            value(row.original_name)
-                          ).catch((requestError) =>
-                            setError(requestError instanceof ApiError ? requestError.message : "下载失败")
-                          )
-                        }
-                      >
-                        下载
-                      </button>
-                    ) : "只读"
-                }
               ]}
             />
           </section>
@@ -446,6 +550,13 @@ export default function AdminDashboard() {
             </section>
           </div>
         )}
+
+        {activeExtension?.render({
+          data,
+          rows,
+          adminUser,
+          setError
+        })}
       </section>
     </main>
   );

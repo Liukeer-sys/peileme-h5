@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useAuth } from "../auth/AuthContext";
-import AccountPanel from "../components/AccountPanel";
 import AuthModal from "../components/AuthModal";
+import MainAccountPanel from "./MainAccountPanel";
 import ChatBubble from "../components/ChatBubble";
 import OptionButtons from "../components/OptionButtons";
 import type { XiaoPeiAvatarState } from "../constants/xiaopeiAvatarStates";
@@ -1281,10 +1281,11 @@ export default function MainApp() {
         </div>
       )}
 
-      <AuthModal open={authOpen} onClose={() => setAuthOpen(false)} />
-      <AccountPanel
-        open={accountOpen}
-        onClose={() => {
+       <AuthModal open={authOpen} onClose={() => setAuthOpen(false)} />
+       <MainAccountPanel
+         key={user?.id ?? "signed-out"}
+         open={accountOpen}
+         onClose={() => {
           cancelPolicyOperation();
           setAccountOpen(false);
         }}

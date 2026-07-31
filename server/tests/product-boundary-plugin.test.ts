@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { aiOnlyCssSelectors } from "../../product-boundary-markers";
 import { createProductBoundaryPlugin } from "../../vite.product-boundary";
 
 type OutputChunk = {
@@ -78,7 +79,7 @@ describe("Rollup product module graph boundary", () => {
           source: ".ai-intro{}"
         }
       })
-    ).toThrow("main CSS contains AI-only selectors");
+    ).toThrow("main CSS contains AI-only selector: .ai-intro");
 
     expect(() =>
       runBundleCheck("ai", {
@@ -96,4 +97,25 @@ describe("Rollup product module graph boundary", () => {
       })
     ).toThrow("AI CSS is missing AI-only selectors");
   });
+
+  it.each(aiOnlyCssSelectors)(
+    "rejects the AI-only selector %s in main CSS",
+    (selector) => {
+    expect(() =>
+      runBundleCheck("main", {
+        "index.js": {
+          type: "chunk",
+          fileName: "assets/index.js",
+          modules: { "/repo/src/main/MainApp.tsx": {} },
+          code: ""
+        },
+        "main.css": {
+          type: "asset",
+          fileName: "assets/main.css",
+          source: `${selector}{}`
+        }
+      })
+    ).toThrow(`main CSS contains AI-only selector: ${selector}`);
+    }
+  );
 });

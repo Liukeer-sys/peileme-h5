@@ -3,6 +3,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY tsconfig.scripts.json ./
+COPY product-boundary-markers.ts ./
 COPY scripts ./scripts
 COPY server ./server
 COPY database ./database

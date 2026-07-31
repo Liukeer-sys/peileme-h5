@@ -7,7 +7,7 @@ import "./styles.css";
 import "./admin/admin.css";
 import "./ai/ai.css";
 
-const AdminDashboard = lazy(() => import("./admin/AdminDashboard"));
+const AdminDashboard = lazy(() => import("./ai/admin/AiAdminDashboard"));
 
 if (productChannel !== "ai") {
   throw new Error("The AI entry requires the AI product channel");

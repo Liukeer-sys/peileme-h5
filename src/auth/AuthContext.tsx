@@ -4,10 +4,18 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode
 } from "react";
-import { api, initializeSession, setAccessToken, track } from "../lib/api";
+import {
+  api,
+  beginAuthTransition,
+  completeAuthTransition,
+  initializeSession,
+  setAccessToken,
+  track
+} from "../lib/api";
 
 export type User = {
   id: string;
@@ -17,6 +25,46 @@ export type User = {
   displayName: string | null;
   status: "active" | "disabled";
 };
+
+export type AuthCommitIdentity = {
+  userId: string;
+  generation: number;
+};
+
+export const isCurrentAuthIdentity = (
+  currentUserId: string | null,
+  currentGeneration: number,
+  expected: AuthCommitIdentity
+) =>
+  currentUserId === expected.userId &&
+  currentGeneration === expected.generation;
+
+export function applyAuthScopedReload<T>(
+  currentUserId: string | null,
+  currentGeneration: number,
+  expected: AuthCommitIdentity,
+  currentValue: T,
+  nextValue: T
+) {
+  return isCurrentAuthIdentity(
+    currentUserId,
+    currentGeneration,
+    expected
+  )
+    ? nextValue
+    : currentValue;
+}
+
+export const applyProfileUpdateForInitiator = (
+  current: User | null,
+  currentGeneration: number,
+  expected: AuthCommitIdentity,
+  displayName: string
+): User | null =>
+  current &&
+  isCurrentAuthIdentity(current.id, currentGeneration, expected)
+    ? { ...current, displayName }
+    : current;
 
 export const grantModules = ["caseLawPack", "evidencePack"] as const;
 export type GrantModule = (typeof grantModules)[number];
@@ -126,63 +174,166 @@ export const logoutWithLocalCleanup = async (
   if (failed) throw new LogoutError(remoteError);
 };
 
+export const revokeCurrentSessionWithTransition = async (
+  remoteRevoke: () => Promise<void>,
+  clearLocal: () => void
+) => {
+  await remoteRevoke();
+  const transition = await beginAuthTransition();
+  try {
+    clearLocal();
+  } finally {
+    completeAuthTransition(transition);
+  }
+};
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [capabilities, setCapabilities] = useState<string[]>([]);
   const [grants, setGrants] = useState<Grant[]>([]);
   const [sessions, setSessions] = useState<DeviceSession[]>([]);
   const [ready, setReady] = useState(false);
+  const currentUserIdRef = useRef<string | null>(null);
+  const authGenerationRef = useRef(0);
 
-  const reloadGrants = useCallback(async () => {
+  const currentAuthIdentity = useCallback((): AuthCommitIdentity | null => {
+    const userId = currentUserIdRef.current;
+    return userId
+      ? { userId, generation: authGenerationRef.current }
+      : null;
+  }, []);
+
+  const commitUser = useCallback((nextUser: User | null) => {
+    currentUserIdRef.current = nextUser?.id ?? null;
+    setUser(nextUser);
+  }, []);
+
+  const reloadGrantsForIdentity = useCallback(async (
+    expected: AuthCommitIdentity | null
+  ) => {
+    if (!expected) {
+      if (!currentUserIdRef.current) setGrants([]);
+      return;
+    }
     try {
       const result = await api<{ grants: unknown }>("/api/access/me", { auth: true });
-      setGrants(sanitizeGrants(result.grants));
+      const nextGrants = sanitizeGrants(result.grants);
+      setGrants((current) =>
+        applyAuthScopedReload(
+          currentUserIdRef.current,
+          authGenerationRef.current,
+          expected,
+          current,
+          nextGrants
+        )
+      );
     } catch {
-      setGrants([]);
+      setGrants((current) =>
+        applyAuthScopedReload(
+          currentUserIdRef.current,
+          authGenerationRef.current,
+          expected,
+          current,
+          []
+        )
+      );
     }
   }, []);
 
-  const reloadSessions = useCallback(async () => {
+  const reloadSessionsForIdentity = useCallback(async (
+    expected: AuthCommitIdentity | null
+  ) => {
+    if (!expected) {
+      if (!currentUserIdRef.current) setSessions([]);
+      return;
+    }
     try {
       const result = await api<{ items: DeviceSession[] }>("/api/auth/sessions", {
         auth: true
       });
-      setSessions(result.items);
+      setSessions((current) =>
+        applyAuthScopedReload(
+          currentUserIdRef.current,
+          authGenerationRef.current,
+          expected,
+          current,
+          result.items
+        )
+      );
     } catch {
-      setSessions([]);
+      setSessions((current) =>
+        applyAuthScopedReload(
+          currentUserIdRef.current,
+          authGenerationRef.current,
+          expected,
+          current,
+          []
+        )
+      );
     }
   }, []);
 
+  const reloadGrants = useCallback(
+    () => reloadGrantsForIdentity(currentAuthIdentity()),
+    [currentAuthIdentity, reloadGrantsForIdentity]
+  );
+
+  const reloadSessions = useCallback(
+    () => reloadSessionsForIdentity(currentAuthIdentity()),
+    [currentAuthIdentity, reloadSessionsForIdentity]
+  );
+
   const acceptSession = useCallback(
-    async (session: SessionResponse) => {
+    async (session: SessionResponse, generation: number) => {
+      if (authGenerationRef.current !== generation) return false;
       setAccessToken(session.accessToken);
       const me = await api<MeResponse>("/api/auth/me", { auth: true });
-      setUser(me.user);
+      if (authGenerationRef.current !== generation) return false;
+      commitUser(me.user);
       setCapabilities(sanitizeCapabilities(me.capabilities));
+      setGrants([]);
+      setSessions([]);
+      const identity = { userId: me.user.id, generation };
       await Promise.all([
-        reloadGrants(),
-        reloadSessions(),
+        reloadGrantsForIdentity(identity),
+        reloadSessionsForIdentity(identity),
         api("/api/assessments/claim", { method: "POST", auth: true }).catch(() => undefined)
       ]);
+      return authGenerationRef.current === generation;
     },
-    [reloadGrants, reloadSessions]
+    [commitUser, reloadGrantsForIdentity, reloadSessionsForIdentity]
   );
 
   useEffect(() => {
     let active = true;
+    const generation = authGenerationRef.current + 1;
+    authGenerationRef.current = generation;
     void (async () => {
       const refreshed = await initializeSession();
-      if (refreshed) {
+      if (
+        refreshed &&
+        active &&
+        authGenerationRef.current === generation
+      ) {
         try {
           const me = await api<MeResponse>("/api/auth/me", { auth: true });
-          if (active) {
-            setUser(me.user);
+          if (active && authGenerationRef.current === generation) {
+            commitUser(me.user);
             setCapabilities(sanitizeCapabilities(me.capabilities));
-            await Promise.all([reloadGrants(), reloadSessions()]);
+            const identity = { userId: me.user.id, generation };
+            await Promise.all([
+              reloadGrantsForIdentity(identity),
+              reloadSessionsForIdentity(identity)
+            ]);
           }
         } catch {
-          setAccessToken(null);
-          setCapabilities([]);
+          if (active && authGenerationRef.current === generation) {
+            setAccessToken(null);
+            commitUser(null);
+            setCapabilities([]);
+            setGrants([]);
+            setSessions([]);
+          }
         }
       }
       if (active) setReady(true);
@@ -190,7 +341,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => {
       active = false;
     };
-  }, [reloadGrants, reloadSessions]);
+  }, [commitUser, reloadGrantsForIdentity, reloadSessionsForIdentity]);
 
   const value = useMemo<AuthContextValue>(
     () => ({
@@ -205,23 +356,41 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           body: { target, purpose }
         }),
       login: async (identifier, credential) => {
-        const session = await api<SessionResponse>("/api/auth/login", {
-          method: "POST",
-          body: { identifier, ...credential }
-        });
-        await acceptSession(session);
-        track("auth_logged_in", { method: credential.code ? "code" : "password" });
+        const generation = authGenerationRef.current + 1;
+        authGenerationRef.current = generation;
+        const transition = await beginAuthTransition();
+        try {
+          const session = await api<SessionResponse>("/api/auth/login", {
+            method: "POST",
+            body: { identifier, ...credential }
+          });
+          if (await acceptSession(session, generation)) {
+            track("auth_logged_in", {
+              method: credential.code ? "code" : "password"
+            });
+          }
+        } finally {
+          completeAuthTransition(transition);
+        }
       },
       register: async (input) => {
-        const session = await api<SessionResponse>("/api/auth/register", {
-          method: "POST",
-          body: input
-        });
-        await acceptSession(session);
-        track("auth_registered", {
-          channel: input.target.includes("@") ? "email" : "sms",
-          invite: Boolean(input.inviteCode)
-        });
+        const generation = authGenerationRef.current + 1;
+        authGenerationRef.current = generation;
+        const transition = await beginAuthTransition();
+        try {
+          const session = await api<SessionResponse>("/api/auth/register", {
+            method: "POST",
+            body: input
+          });
+          if (await acceptSession(session, generation)) {
+            track("auth_registered", {
+              channel: input.target.includes("@") ? "email" : "sms",
+              invite: Boolean(input.inviteCode)
+            });
+          }
+        } finally {
+          completeAuthTransition(transition);
+        }
       },
       resetPassword: async (target, code, password) => {
         await api("/api/auth/reset-password", {
@@ -231,62 +400,94 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         track("password_reset");
       },
       updateProfile: async (displayName) => {
+        const identity = currentAuthIdentity();
+        if (!identity) throw new Error("AUTH_REQUIRED");
         const result = await api<{ displayName: string }>("/api/auth/me", {
           method: "PATCH",
           auth: true,
           body: { displayName }
         });
-        setUser((current) => current ? { ...current, displayName: result.displayName } : current);
-      },
-      logout: async () => {
-        await logoutWithLocalCleanup(
-          () => api("/api/auth/logout", { method: "POST" }),
-          () => {
-            setAccessToken(null);
-            setUser(null);
-            setCapabilities([]);
-            setGrants([]);
-            setSessions([]);
-            track("auth_logged_out");
-          }
+        setUser((current) =>
+          applyProfileUpdateForInitiator(
+            current,
+            authGenerationRef.current,
+            identity,
+            result.displayName
+          )
         );
       },
+      logout: async () => {
+        const generation = authGenerationRef.current + 1;
+        authGenerationRef.current = generation;
+        const transition = await beginAuthTransition();
+        try {
+          await logoutWithLocalCleanup(
+            () => api("/api/auth/logout", { method: "POST" }),
+            () => {
+              if (authGenerationRef.current !== generation) return;
+              setAccessToken(null);
+              commitUser(null);
+              setCapabilities([]);
+              setGrants([]);
+              setSessions([]);
+              track("auth_logged_out");
+            }
+          );
+        } finally {
+          completeAuthTransition(transition);
+        }
+      },
       revokeSession: async (id) => {
+        const identity = currentAuthIdentity();
         const revokedCurrent = sessions.some(
           (session) => session.id === id && session.isCurrent
         );
-        await api(`/api/auth/sessions/${id}`, {
-          method: "DELETE",
-          auth: true
-        });
+        const revokeGeneration = revokedCurrent
+          ? authGenerationRef.current + 1
+          : authGenerationRef.current;
         if (revokedCurrent) {
-          setAccessToken(null);
-          setUser(null);
-          setCapabilities([]);
-          setGrants([]);
-          setSessions([]);
-          track("auth_session_revoked", { current: true });
+          authGenerationRef.current = revokeGeneration;
+        }
+        const remoteRevoke = () =>
+          api<void>(`/api/auth/sessions/${id}`, {
+            method: "DELETE",
+            auth: true
+          });
+        if (revokedCurrent) {
+          await revokeCurrentSessionWithTransition(remoteRevoke, () => {
+            if (authGenerationRef.current !== revokeGeneration) return;
+            setAccessToken(null);
+            commitUser(null);
+            setCapabilities([]);
+            setGrants([]);
+            setSessions([]);
+            track("auth_session_revoked", { current: true });
+          });
           return;
         }
-        await reloadSessions();
+        await remoteRevoke();
+        await reloadSessionsForIdentity(identity);
         track("auth_session_revoked", { current: false });
       },
       revokeOtherSessions: async () => {
+        const identity = currentAuthIdentity();
         const result = await api<{ revoked: number }>(
           "/api/auth/sessions/revoke-others",
           { method: "POST", auth: true }
         );
-        await reloadSessions();
+        await reloadSessionsForIdentity(identity);
         track("auth_other_sessions_revoked", { count: result.revoked });
         return result.revoked;
       },
       redeemInvite: async (code) => {
+        const identity = currentAuthIdentity();
+        if (!identity) throw new Error("AUTH_REQUIRED");
         const result = await api<{ grants: unknown }>("/api/invites/redeem", {
           method: "POST",
           auth: true,
           body: { code }
         });
-        await reloadGrants();
+        await reloadGrantsForIdentity(identity);
         const modules = sanitizeGrantModules(result.grants);
         track("invite_redeemed", { modules });
         return modules;
@@ -297,10 +498,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [
       acceptSession,
       capabilities,
+      commitUser,
+      currentAuthIdentity,
       grants,
       ready,
       reloadGrants,
+      reloadGrantsForIdentity,
       reloadSessions,
+      reloadSessionsForIdentity,
       sessions,
       user
     ]

@@ -28,6 +28,10 @@ export const sessionId = persistentId(SESSION_KEY, "session", window.sessionStor
 
 let accessToken: string | null = null;
 let refreshPromise: Promise<boolean> | null = null;
+let refreshController: AbortController | null = null;
+let refreshBlocked = false;
+let authEpoch = 0;
+const activeAuthTransitions = new Set<number>();
 
 const csrfHeader = (): Record<string, string> => {
   const encodedToken = document.cookie
@@ -61,10 +65,15 @@ export const setAccessToken = (token: string | null) => {
 };
 
 const refreshSession = async () => {
+  if (refreshBlocked) return false;
   if (!refreshPromise) {
-    refreshPromise = fetch("/api/auth/refresh", {
+    const capturedEpoch = authEpoch;
+    const controller = new AbortController();
+    refreshController = controller;
+    const currentRefresh = fetch("/api/auth/refresh", {
       method: "POST",
       credentials: "include",
+      signal: controller.signal,
       headers: {
         "x-visitor-id": visitorId,
         "x-session-id": sessionId,
@@ -72,6 +81,7 @@ const refreshSession = async () => {
       }
     })
       .then(async (response) => {
+        if (capturedEpoch !== authEpoch || refreshBlocked) return false;
         if (response.status === 204) {
           setAccessToken(null);
           return false;
@@ -86,10 +96,30 @@ const refreshSession = async () => {
       })
       .catch(() => false)
       .finally(() => {
-        refreshPromise = null;
+        if (refreshPromise === currentRefresh) {
+          refreshPromise = null;
+          refreshController = null;
+        }
       });
+    refreshPromise = currentRefresh;
   }
   return refreshPromise;
+};
+
+export const beginAuthTransition = async () => {
+  refreshBlocked = true;
+  authEpoch += 1;
+  const transitionEpoch = authEpoch;
+  activeAuthTransitions.add(transitionEpoch);
+  const pendingRefresh = refreshPromise;
+  refreshController?.abort();
+  if (pendingRefresh) await pendingRefresh.catch(() => false);
+  return transitionEpoch;
+};
+
+export const completeAuthTransition = (transitionEpoch: number) => {
+  activeAuthTransitions.delete(transitionEpoch);
+  if (activeAuthTransitions.size === 0) refreshBlocked = false;
 };
 
 type ApiOptions = Omit<RequestInit, "body"> & {
@@ -233,11 +263,17 @@ export const getSharedPolicyResult = async (
   };
 };
 
-export async function downloadFromApi(path: string, fallbackName: string) {
+export async function downloadFromApi(
+  path: string,
+  fallbackName: string,
+  signal?: AbortSignal
+) {
   if (!accessToken) await refreshSession();
+  if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
   const makeRequest = () =>
     fetch(path, {
       credentials: "include",
+      signal,
       headers: {
         "x-visitor-id": visitorId,
         "x-session-id": sessionId,
@@ -247,8 +283,10 @@ export async function downloadFromApi(path: string, fallbackName: string) {
     });
   let response = await makeRequest();
   if (response.status === 401 && (await refreshSession())) {
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     response = await makeRequest();
   }
+  if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
   if (!response.ok) {
     const error = (await response.json().catch(() => ({}))) as {
       error?: string;
@@ -264,7 +302,9 @@ export async function downloadFromApi(path: string, fallbackName: string) {
   const utf8Name = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
   const basicName = disposition.match(/filename="?([^";]+)"?/i)?.[1];
   const filename = decodeURIComponent(utf8Name || basicName || fallbackName);
-  const url = URL.createObjectURL(await response.blob());
+  const blob = await response.blob();
+  if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+  const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
   anchor.download = filename;

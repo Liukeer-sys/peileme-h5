@@ -1,15 +1,18 @@
 import { expect, test, type APIResponse, type Page } from "@playwright/test";
 
-const requiredUrl = (name: string) => {
+const requiredValue = (name: string) => {
   const value = process.env[name]?.trim();
   if (!value) {
     throw new Error(`${name} is required for the dual web artifact acceptance suite`);
   }
-  return value.replace(/\/$/, "");
+  return value;
 };
 
+const requiredUrl = (name: string) => requiredValue(name).replace(/\/$/, "");
 const mainBaseUrl = requiredUrl("E2E_MAIN_ARTIFACT_URL");
 const aiBaseUrl = requiredUrl("E2E_AI_ARTIFACT_URL");
+const adminEmail = requiredValue("E2E_ADMIN_EMAIL");
+const adminPassword = requiredValue("E2E_ADMIN_PASSWORD");
 
 const securityHeaders = [
   "content-security-policy",
@@ -51,14 +54,81 @@ test.describe("separate main and AI web artifacts", () => {
     page
   }) => {
     const expectNoFailures = watchBrowserFailures(page);
+    const uploadRequests: string[] = [];
+    page.on("request", (request) => {
+      if (/\/api\/(?:admin\/)?uploads(?:\/|$|\?)/.test(request.url())) {
+        uploadRequests.push(request.url());
+      }
+    });
     await page.setViewportSize({ width: 390, height: 844 });
 
     const response = await page.goto(mainBaseUrl);
     expect(response?.status()).toBe(200);
     await expect(page).toHaveTitle("赔了么 - 牛马身价预评估");
     await expect(page.getByText("AI 深度分析版")).toHaveCount(0);
-    await page.getByRole("button", { name: "上海", exact: true }).click();
-    await expect(page.locator(".composer input[type=month]")).toBeVisible();
+    await expect(page.getByText("已上传材料", { exact: true })).toHaveCount(0);
+    await expect(page.getByText("材料管理", { exact: true })).toHaveCount(0);
+    await expect(page.locator('input[type="file"]')).toHaveCount(0);
+    const shanghai = page.getByRole("button", { name: "上海", exact: true });
+    if (await shanghai.isEnabled()) {
+      await shanghai.click();
+      await expect(page.locator(".composer input[type=month]")).toBeVisible();
+    } else {
+      await page.getByRole("button", { name: "选择全部省市" }).click();
+      const regionDialog = page.getByRole("dialog", { name: "选择工作地区" });
+      await expect(regionDialog).toBeVisible();
+      await regionDialog.getByLabel("搜索省份或城市").fill("上海");
+      await regionDialog.getByRole("button", { name: "关闭" }).click();
+    }
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.goto(`${mainBaseUrl}/admin`);
+    await expect(page.getByRole("heading", { name: "赔了么管理后台" })).toBeVisible();
+    await expect(page.getByText("材料管理", { exact: true })).toHaveCount(0);
+    await expect(page.locator('input[type="file"]')).toHaveCount(0);
+    await page.getByRole("button", { name: "管理员登录" }).click();
+    await expect(
+      page.getByText("保存历史测算、兑换邀请码并管理账号。", { exact: true })
+    ).toBeVisible();
+    await page.getByRole("button", { name: "密码登录" }).click();
+    await page.getByLabel("邮箱 / 手机号").fill(adminEmail);
+    await page.getByLabel("密码", { exact: true }).fill(adminPassword);
+    await page
+      .getByRole("dialog")
+      .getByRole("button", { name: "登录", exact: true })
+      .click();
+    await expect(page.getByRole("heading", { name: "经营概览" })).toBeVisible();
+
+    const adminTabs = [
+      ["经营概览", "转化漏斗"],
+      ["政策规则", "规则版本"],
+      ["区域参数", "区域参数清单"],
+      ["公告设置", "公告编排"],
+      ["用户管理", "用户清单"],
+      ["测算记录", "测算记录"],
+      ["邀请码", "邀请码清单"],
+      ["埋点统计", "近 30 天埋点"],
+      ["审计日志", "管理操作审计"],
+      ["系统状态", "运行状态"]
+    ] as const;
+    for (const [label, contentHeading] of adminTabs) {
+      await page.getByRole("button", { name: new RegExp(label) }).click();
+      await expect(
+        page.getByRole("heading", { level: 1, name: label, exact: true })
+      ).toBeVisible();
+      await expect(
+        page.getByRole("heading", { name: contentHeading, exact: false }).first()
+      ).toBeVisible();
+      await expect(page.locator("#ai-document-upload-input")).toHaveCount(0);
+      await expect(page.locator(".ai-review-entry")).toHaveCount(0);
+      await expect(page.locator(".upload-box")).toHaveCount(0);
+      await expect(page.locator(".upload-history-item")).toHaveCount(0);
+    }
+    await expect(page.getByText("材料管理", { exact: true })).toHaveCount(0);
+    await expect(page.getByText("已上传材料", { exact: true })).toHaveCount(0);
+    await expect(
+      page.getByText("登录后可安全管理你上传的材料", { exact: false })
+    ).toHaveCount(0);
+    expect(uploadRequests).toEqual([]);
     expectNoFailures();
   });
 
@@ -79,6 +149,14 @@ test.describe("separate main and AI web artifacts", () => {
     );
     await expect(page.getByRole("button", { name: "上海", exact: true })).toHaveCount(
       0
+    );
+    await page.getByRole("button", { name: "登录并上传材料" }).click();
+    await expect(
+      page.getByText("登录后可安全管理你上传的材料", { exact: false })
+    ).toBeVisible();
+    await page.getByRole("button", { name: "获取验证码" }).click();
+    await expect(page.locator(".account-message")).toContainText(
+      "请输入邮箱或中国大陆手机号"
     );
     expectNoFailures();
   });

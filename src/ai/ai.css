@@ -62,3 +62,145 @@
   letter-spacing: 0.04em;
   box-shadow: 0 8px 24px rgba(70, 55, 84, 0.08);
 }
+
+.ai-top-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ai-top-actions button {
+  font: inherit;
+  cursor: pointer;
+}
+
+.ai-workspace-button {
+  position: relative;
+  z-index: 1;
+  margin-top: 24px;
+}
+
+.ai-account-panel {
+  max-height: min(820px, calc(100vh - 36px));
+}
+
+.ai-review-entry {
+  border: 1px solid rgba(125, 106, 199, 0.2);
+  background:
+    radial-gradient(circle at 100% 0, rgba(188, 168, 240, 0.2), transparent 38%),
+    rgba(255, 255, 255, 0.78);
+}
+
+.ai-review-entry > p {
+  margin: 10px 0 0;
+  color: #716779;
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.ai-review-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ai-review-heading > div {
+  display: grid;
+  gap: 5px;
+}
+
+.ai-review-heading span {
+  color: #6654aa;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.ai-review-heading small {
+  color: #9a8ca5;
+  font-size: 10px;
+}
+
+.upload-box {
+  min-height: 78px;
+  display: grid;
+  place-items: center;
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px dashed rgba(82, 70, 94, 0.28);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.72);
+  color: #4f4658;
+  font-weight: 900;
+  text-align: center;
+  cursor: pointer;
+}
+
+.ai-document-upload-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.upload-box:has(.ai-document-upload-input:focus-visible) {
+  outline: 3px solid rgba(102, 84, 170, 0.42);
+  outline-offset: 3px;
+}
+
+.compact-upload {
+  min-height: 56px;
+  margin: 10px 0;
+}
+
+.ai-upload-submit {
+  width: 100%;
+}
+
+.upload-history-item {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.upload-history-item > div {
+  min-width: 0;
+}
+
+.upload-history-item b {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upload-history-item button {
+  border: 1px solid rgba(82, 70, 94, 0.18);
+  border-radius: 999px;
+  background: #fff9df;
+  color: #51485a;
+  padding: 7px 12px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+@media (max-width: 480px) {
+  .ai-top-actions {
+    gap: 5px;
+  }
+
+  .ai-top-actions .mini-button {
+    padding-inline: 9px;
+    font-size: 11px;
+  }
+
+  .ai-review-heading small {
+    display: none;
+  }
+}
