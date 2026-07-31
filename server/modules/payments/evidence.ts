@@ -1,5 +1,56 @@
 import { createHash } from "node:crypto";
 
+const intrinsicApply = Reflect.apply;
+const DateIntrinsic = Date;
+const ArrayBufferIntrinsic = ArrayBuffer;
+const arrayBufferIsViewIntrinsic = ArrayBuffer.isView;
+const arrayIsArrayIntrinsic = Array.isArray;
+const SharedArrayBufferIntrinsic =
+  typeof SharedArrayBuffer === "function" ? SharedArrayBuffer : undefined;
+
+const captureGetter = (target: object, key: PropertyKey) => {
+  const getter = Object.getOwnPropertyDescriptor(target, key)?.get;
+  if (!getter) throw new TypeError(`Missing intrinsic getter: ${String(key)}`);
+  return getter;
+};
+
+const callIntrinsic = <Result>(intrinsic: Function, receiver: object) =>
+  intrinsicApply(intrinsic, receiver, []) as Result;
+
+const dateGetTimeIntrinsic = Date.prototype.getTime;
+const dateToISOStringIntrinsic = Date.prototype.toISOString;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const typedArrayBufferIntrinsic = captureGetter(typedArrayPrototype, "buffer");
+const typedArrayByteOffsetIntrinsic = captureGetter(
+  typedArrayPrototype,
+  "byteOffset"
+);
+const typedArrayByteLengthIntrinsic = captureGetter(
+  typedArrayPrototype,
+  "byteLength"
+);
+const typedArrayLengthIntrinsic = captureGetter(typedArrayPrototype, "length");
+const typedArrayTagIntrinsic = captureGetter(
+  typedArrayPrototype,
+  Symbol.toStringTag
+);
+const dataViewBufferIntrinsic = captureGetter(DataView.prototype, "buffer");
+const dataViewByteOffsetIntrinsic = captureGetter(
+  DataView.prototype,
+  "byteOffset"
+);
+const dataViewByteLengthIntrinsic = captureGetter(
+  DataView.prototype,
+  "byteLength"
+);
+const arrayBufferByteLengthIntrinsic = captureGetter(
+  ArrayBuffer.prototype,
+  "byteLength"
+);
+const sharedArrayBufferByteLengthIntrinsic = SharedArrayBufferIntrinsic
+  ? captureGetter(SharedArrayBufferIntrinsic.prototype, "byteLength")
+  : undefined;
+
 const MAX_DEPTH = 8;
 const MAX_ARRAY_ITEMS = 50;
 const MAX_OBJECT_KEYS = 100;
@@ -204,24 +255,29 @@ const hashEvidence = (input: unknown) => {
     let isDate: boolean;
     let isBinaryView: boolean;
     let isArrayBuffer: boolean;
+    let isSharedArrayBuffer: boolean;
     let isArray: boolean;
     try {
-      isDate = value instanceof Date;
-      isBinaryView = ArrayBuffer.isView(value);
-      isArrayBuffer = value instanceof ArrayBuffer;
-      isArray = Array.isArray(value);
+      isDate = value instanceof DateIntrinsic;
+      isBinaryView = arrayBufferIsViewIntrinsic(value);
+      isArrayBuffer = value instanceof ArrayBufferIntrinsic;
+      isSharedArrayBuffer = Boolean(
+        SharedArrayBufferIntrinsic && value instanceof SharedArrayBufferIntrinsic
+      );
+      isArray = arrayIsArrayIntrinsic(value);
     } catch {
       writeToken("unreadable-object", String(objectId));
       continue;
     }
 
     if (isDate) {
-      const dateValue = value as Date;
       try {
-        const time = dateValue.getTime();
+        const time = callIntrinsic<number>(dateGetTimeIntrinsic, value);
         writeToken(
           "date",
-          Number.isNaN(time) ? "[Invalid Date]" : dateValue.toISOString()
+          Number.isNaN(time)
+            ? "[Invalid Date]"
+            : callIntrinsic<string>(dateToISOStringIntrinsic, value)
         );
       } catch {
         writeToken("unreadable-object", String(objectId));
@@ -231,45 +287,91 @@ const hashEvidence = (input: unknown) => {
       continue;
     }
     if (isBinaryView) {
-      const binaryView = value as ArrayBufferView;
-      let viewName = "ArrayBufferView";
       try {
-        viewName = Object.prototype.toString.call(value);
-      } catch {
-        viewName = "[Unreadable ArrayBufferView]";
-      }
-      let indexedLength = 0;
-      try {
+        let viewName: string;
+        let viewBuffer: ArrayBufferLike;
+        let byteOffset: number;
+        let byteLength: number;
+        let indexedLength: number;
+        try {
+          byteLength = callIntrinsic<number>(
+            dataViewByteLengthIntrinsic,
+            value
+          );
+          viewBuffer = callIntrinsic<ArrayBufferLike>(
+            dataViewBufferIntrinsic,
+            value
+          );
+          byteOffset = callIntrinsic<number>(
+            dataViewByteOffsetIntrinsic,
+            value
+          );
+          viewName = "DataView";
+          indexedLength = 0;
+        } catch {
+          byteLength = callIntrinsic<number>(
+            typedArrayByteLengthIntrinsic,
+            value
+          );
+          viewBuffer = callIntrinsic<ArrayBufferLike>(
+            typedArrayBufferIntrinsic,
+            value
+          );
+          byteOffset = callIntrinsic<number>(
+            typedArrayByteOffsetIntrinsic,
+            value
+          );
+          indexedLength = callIntrinsic<number>(
+            typedArrayLengthIntrinsic,
+            value
+          );
+          viewName = callIntrinsic<string>(typedArrayTagIntrinsic, value);
+        }
         writeToken("binary-view-type", viewName);
         writeToken(
           "binary-view-bytes",
-          new Uint8Array(
-            binaryView.buffer,
-            binaryView.byteOffset,
-            binaryView.byteLength
+          new Uint8Array(viewBuffer, byteOffset, byteLength)
+        );
+        tasks.push(
+          ownPropertiesTask(
+            value,
+            objectId,
+            indexedLength > 0 ? "typed-array-extras" : "all",
+            indexedLength
           )
         );
-        if (!(binaryView instanceof DataView)) {
-          indexedLength = (binaryView as unknown as { length: number }).length;
-        }
+      } catch {
+        writeToken("unreadable-object", String(objectId));
+      }
+      continue;
+    }
+    if (isArrayBuffer) {
+      try {
+        const byteLength = callIntrinsic<number>(
+          arrayBufferByteLengthIntrinsic,
+          value
+        );
+        writeToken(
+          "array-buffer",
+          new Uint8Array(value as ArrayBuffer, 0, byteLength)
+        );
       } catch {
         writeToken("unreadable-object", String(objectId));
         continue;
       }
-      tasks.push(
-        ownPropertiesTask(
-          value,
-          objectId,
-          indexedLength > 0 ? "typed-array-extras" : "all",
-          indexedLength
-        )
-      );
+      tasks.push(ownPropertiesTask(value, objectId));
       continue;
     }
-    if (isArrayBuffer) {
-      const arrayBufferValue = value as ArrayBuffer;
+    if (isSharedArrayBuffer) {
       try {
-        writeToken("array-buffer", new Uint8Array(arrayBufferValue));
+        const byteLength = callIntrinsic<number>(
+          sharedArrayBufferByteLengthIntrinsic!,
+          value
+        );
+        writeToken(
+          "shared-array-buffer",
+          new Uint8Array(value as SharedArrayBuffer, 0, byteLength)
+        );
       } catch {
         writeToken("unreadable-object", String(objectId));
         continue;
@@ -367,28 +469,58 @@ export const sanitizePaymentEvidence = (input: unknown): unknown => {
     seen.add(value);
     let isDate: boolean;
     let isBinaryView: boolean;
+    let isArrayBuffer: boolean;
+    let isSharedArrayBuffer: boolean;
     let isArray: boolean;
     try {
-      isDate = value instanceof Date;
-      isBinaryView = ArrayBuffer.isView(value);
-      isArray = Array.isArray(value);
+      isDate = value instanceof DateIntrinsic;
+      isBinaryView = arrayBufferIsViewIntrinsic(value);
+      isArrayBuffer = value instanceof ArrayBufferIntrinsic;
+      isSharedArrayBuffer = Boolean(
+        SharedArrayBufferIntrinsic && value instanceof SharedArrayBufferIntrinsic
+      );
+      isArray = arrayIsArrayIntrinsic(value);
     } catch {
       limitExceeded = true;
       return "[Unreadable Object]";
     }
     if (isDate) {
-      const dateValue = value as Date;
       try {
-        return dateValue.toISOString();
+        return callIntrinsic<string>(dateToISOStringIntrinsic, value);
       } catch {
         limitExceeded = true;
         return "[Unreadable Date]";
       }
     }
     if (isBinaryView) {
-      const binaryView = value as ArrayBufferView;
       try {
-        return `[Binary ${binaryView.byteLength} bytes]`;
+        let byteLength: number;
+        try {
+          byteLength = callIntrinsic<number>(
+            dataViewByteLengthIntrinsic,
+            value
+          );
+        } catch {
+          byteLength = callIntrinsic<number>(
+            typedArrayByteLengthIntrinsic,
+            value
+          );
+        }
+        return `[Binary ${byteLength} bytes]`;
+      } catch {
+        limitExceeded = true;
+        return "[Unreadable Binary]";
+      }
+    }
+    if (isArrayBuffer || isSharedArrayBuffer) {
+      try {
+        const byteLength = isArrayBuffer
+          ? callIntrinsic<number>(arrayBufferByteLengthIntrinsic, value)
+          : callIntrinsic<number>(
+              sharedArrayBufferByteLengthIntrinsic!,
+              value
+            );
+        return `[Binary ${byteLength} bytes]`;
       } catch {
         limitExceeded = true;
         return "[Unreadable Binary]";

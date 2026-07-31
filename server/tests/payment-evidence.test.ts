@@ -154,4 +154,182 @@ describe("payment evidence full-content digest", () => {
     const first = hashOf(proxy);
     expect(hashOf(proxy)).toBe(first);
   });
+
+  it("uses Date internal slots without invoking spoofed own methods", () => {
+    let getterCalls = 0;
+    const makeEvidence = (iso: string) => {
+      const date = new Date(iso);
+      Object.defineProperties(date, {
+        getTime: {
+          enumerable: true,
+          get: () => {
+            getterCalls += 1;
+            return () => 0;
+          }
+        },
+        toISOString: {
+          enumerable: true,
+          get: () => {
+            getterCalls += 1;
+            return () => "2000-01-01T00:00:00.000Z";
+          }
+        }
+      });
+      return { oversized: "x".repeat(5_000), date };
+    };
+    const left = makeEvidence("2026-08-01T00:00:00.000Z");
+    const right = makeEvidence("2026-08-02T00:00:00.000Z");
+
+    const first = hashOf(left);
+    const repeated = hashOf(left);
+    const different = hashOf(right);
+
+    expect(getterCalls).toBe(0);
+    expect(repeated).toBe(first);
+    expect(different).not.toBe(first);
+  });
+
+  it("uses typed-array internal slots without invoking spoofed own getters", () => {
+    let getterCalls = 0;
+    const spoofBuffer = new ArrayBuffer(3);
+    new Uint8Array(spoofBuffer).set([9, 9, 9]);
+    const makeEvidence = (lastByte: number) => {
+      const bytes = new Uint8Array([1, 2, lastByte]);
+      Object.defineProperties(bytes, {
+        buffer: {
+          enumerable: true,
+          get: () => {
+            getterCalls += 1;
+            return spoofBuffer;
+          }
+        },
+        byteOffset: {
+          enumerable: true,
+          get: () => {
+            getterCalls += 1;
+            return 0;
+          }
+        },
+        byteLength: {
+          enumerable: true,
+          get: () => {
+            getterCalls += 1;
+            return 3;
+          }
+        },
+        length: {
+          enumerable: true,
+          get: () => {
+            getterCalls += 1;
+            return 3;
+          }
+        },
+        [Symbol.toStringTag]: {
+          enumerable: true,
+          get: () => {
+            getterCalls += 1;
+            return "SpoofedView";
+          }
+        }
+      });
+      return { oversized: "x".repeat(5_000), bytes };
+    };
+    const left = makeEvidence(3);
+    const right = makeEvidence(4);
+
+    const first = hashOf(left);
+    const repeated = hashOf(left);
+    const different = hashOf(right);
+
+    expect(getterCalls).toBe(0);
+    expect(repeated).toBe(first);
+    expect(different).not.toBe(first);
+  });
+
+  it("uses DataView internal slots without invoking spoofed own getters", () => {
+    let getterCalls = 0;
+    const spoofBuffer = new ArrayBuffer(3);
+    new Uint8Array(spoofBuffer).set([9, 9, 9]);
+    const makeEvidence = (lastByte: number) => {
+      const buffer = new ArrayBuffer(3);
+      new Uint8Array(buffer).set([1, 2, lastByte]);
+      const view = new DataView(buffer);
+      Object.defineProperties(view, {
+        buffer: {
+          enumerable: true,
+          get: () => {
+            getterCalls += 1;
+            return spoofBuffer;
+          }
+        },
+        byteOffset: {
+          enumerable: true,
+          get: () => {
+            getterCalls += 1;
+            return 0;
+          }
+        },
+        byteLength: {
+          enumerable: true,
+          get: () => {
+            getterCalls += 1;
+            return 3;
+          }
+        },
+        [Symbol.toStringTag]: {
+          enumerable: true,
+          get: () => {
+            getterCalls += 1;
+            return "SpoofedView";
+          }
+        }
+      });
+      return { oversized: "x".repeat(5_000), view };
+    };
+    const left = makeEvidence(3);
+    const right = makeEvidence(4);
+
+    const first = hashOf(left);
+    const repeated = hashOf(left);
+    const different = hashOf(right);
+
+    expect(getterCalls).toBe(0);
+    expect(repeated).toBe(first);
+    expect(different).not.toBe(first);
+  });
+
+  it("includes SharedArrayBuffer bytes without invoking spoofed own getters", () => {
+    let getterCalls = 0;
+    const makeEvidence = (lastByte: number) => {
+      const buffer = new SharedArrayBuffer(3);
+      new Uint8Array(buffer).set([1, 2, lastByte]);
+      Object.defineProperties(buffer, {
+        byteLength: {
+          enumerable: true,
+          get: () => {
+            getterCalls += 1;
+            return 3;
+          }
+        },
+        [Symbol.toStringTag]: {
+          enumerable: true,
+          get: () => {
+            getterCalls += 1;
+            return "SpoofedBuffer";
+          }
+        }
+      });
+      return { oversized: "x".repeat(5_000), buffer };
+    };
+    const left = makeEvidence(3);
+    const right = makeEvidence(4);
+
+    const first = hashOf(left);
+    const repeated = hashOf(left);
+    const different = hashOf(right);
+
+    expect(getterCalls).toBe(0);
+    expect(repeated).toBe(first);
+    expect(different).not.toBe(first);
+  });
 });
