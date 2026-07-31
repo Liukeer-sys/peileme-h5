@@ -42,6 +42,16 @@ services:
       PORT: 3001
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       UPLOAD_DIR: /app/data/uploads
+      LLM_PRIMARY: ${LLM_PRIMARY:-tuzi}
+      LLM_TUZI_BASE_URL: ${LLM_TUZI_BASE_URL:-https://api.tu-zi.com}
+      LLM_TUZI_API_KEY: ${LLM_TUZI_API_KEY:-}
+      LLM_TUZI_MODEL: ${LLM_TUZI_MODEL:-gpt-5.4}
+      LLM_DATAEYES_BASE_URL: ${LLM_DATAEYES_BASE_URL:-https://cloud.dataeyes.ai}
+      LLM_DATAEYES_API_KEY: ${LLM_DATAEYES_API_KEY:-}
+      LLM_DATAEYES_MODEL: ${LLM_DATAEYES_MODEL:-gemini-2.5-pro}
+      LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-3}
+      LLM_RETRY_BACKOFF_MS: ${LLM_RETRY_BACKOFF_MS:-800}
+      LLM_REQUEST_TIMEOUT_MS: ${LLM_REQUEST_TIMEOUT_MS:-90000}
     volumes:
       - peileme_uploads:/app/data/uploads
     expose:

@@ -2,6 +2,7 @@ import bcrypt from "bcryptjs";
 import { closePool, query } from "./db.js";
 import { runMigrations } from "./migrate.js";
 import { seedPolicyFoundation } from "./modules/policy/seed.js";
+import { importBundledPolicyData } from "./modules/policy/baseline-data.js";
 
 export const seed = async () => {
   await runMigrations();
@@ -37,6 +38,11 @@ export const seed = async () => {
 
   await seedPolicyFoundation();
   console.log("Policy foundation ensured");
+  const baseline = await importBundledPolicyData();
+  console.log(
+    `Policy baseline ensured (${baseline.administrativeRegions} regions, ` +
+      `${baseline.regionalParameters} parameters)`
+  );
 };
 
 if (process.argv[1]?.endsWith("seed.ts") || process.argv[1]?.endsWith("seed.js")) {
