@@ -282,7 +282,19 @@ const paymentSensitiveSentinels = () => ({
   acctNoCamel: `AcctNoCamel-${randomUUID()}`,
   account: `Account-${randomUUID()}`,
   accountId: `AccountId-${randomUUID()}`,
-  userAccount: `UserAccount-${randomUUID()}`
+  userAccount: `UserAccount-${randomUUID()}`,
+  normalizedCvv: `NormalizedCvv-${randomUUID()}`,
+  normalizedPassword: `NormalizedPassword-${randomUUID()}`,
+  normalizedPan: `NormalizedPan-${randomUUID()}`,
+  normalizedSecret: `NormalizedSecret-${randomUUID()}`,
+  trackData: `TrackData-${randomUUID()}`,
+  trackOne: `TrackOne-${randomUUID()}`,
+  trackTwo: `TrackTwo-${randomUUID()}`,
+  magstripe: `Magstripe-${randomUUID()}`,
+  cardholderName: `CardholderName-${randomUUID()}`,
+  expiryDate: `ExpiryDate-${randomUUID()}`,
+  expirationDate: `ExpirationDate-${randomUUID()}`,
+  serviceCode: `ServiceCode-${randomUUID()}`
 });
 
 const paymentSensitiveFields = (
@@ -348,7 +360,19 @@ const paymentSensitiveFields = (
   acctNo: sentinels.acctNoCamel,
   account: sentinels.account,
   account_id: sentinels.accountId,
-  user_account: sentinels.userAccount
+  user_account: sentinels.userAccount,
+  "c\0vv": sentinels.normalizedCvv,
+  pass_word: sentinels.normalizedPassword,
+  "p\0an": sentinels.normalizedPan,
+  se_cret: sentinels.normalizedSecret,
+  track_data: sentinels.trackData,
+  track1: sentinels.trackOne,
+  "track-2": sentinels.trackTwo,
+  magstripe: sentinels.magstripe,
+  cardholder_name: sentinels.cardholderName,
+  expiry_date: sentinels.expiryDate,
+  expirationDate: sentinels.expirationDate,
+  service_code: sentinels.serviceCode
 });
 
 const paymentAuditFields = (prefix: "create" | "verify") => ({

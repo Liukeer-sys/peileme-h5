@@ -1,5 +1,5 @@
 import { runInNewContext } from "node:vm";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { sanitizePaymentEvidence } from "../modules/payments/evidence.js";
 
 type TruncatedEvidence = {
@@ -164,12 +164,12 @@ describe("payment evidence full-content digest", () => {
     expectDistinctStableHashes(makeEvidence("A"), makeEvidence("B"));
   });
 
-  it("stably hashes revoked proxies without throwing", () => {
+  it("omits revoked proxies without throwing or reading traps", () => {
     const { proxy, revoke } = Proxy.revocable({}, {});
     revoke();
 
-    const first = hashOf(proxy);
-    expect(hashOf(proxy)).toBe(first);
+    expectDigestOmitted(proxy);
+    expectDigestOmitted(proxy);
   });
 
   it("uses Date internal slots without invoking spoofed own methods", () => {
@@ -449,7 +449,7 @@ describe("payment evidence full-content digest", () => {
     expect(getterCalls).toBe(0);
   });
 
-  it("hashes proxy arrays without invoking their get trap", () => {
+  it("omits proxy arrays without invoking their get trap", () => {
     let getCalls = 0;
     const evidence = new Proxy(
       Array.from({ length: 51 }, (_, index) => index),
@@ -461,12 +461,12 @@ describe("payment evidence full-content digest", () => {
       }
     );
 
-    const first = hashOf(evidence);
-    expect(hashOf(evidence)).toBe(first);
+    expectDigestOmitted(evidence);
+    expectDigestOmitted(evidence);
     expect(getCalls).toBe(0);
   });
 
-  it("stably truncates proxy arrays whose item descriptors throw", () => {
+  it("omits proxy arrays whose item descriptors would throw", () => {
     let getCalls = 0;
     const target = ["safe"];
     const evidence = new Proxy(target, {
@@ -482,12 +482,12 @@ describe("payment evidence full-content digest", () => {
       }
     });
 
-    const first = hashOf(evidence);
-    expect(hashOf(evidence)).toBe(first);
+    expectDigestOmitted(evidence);
+    expectDigestOmitted(evidence);
     expect(getCalls).toBe(0);
   });
 
-  it("stably truncates when an object descriptor fails after Object.keys", () => {
+  it("omits object proxies before descriptor traps can run", () => {
     let descriptorPhase = 0;
     const target = { safe: "kept" };
     const evidence = new Proxy(target, {
@@ -504,8 +504,9 @@ describe("payment evidence full-content digest", () => {
       }
     });
 
-    const first = hashOf(evidence);
-    expect(hashOf(evidence)).toBe(first);
+    expectDigestOmitted(evidence);
+    expectDigestOmitted(evidence);
+    expect(descriptorPhase).toBe(0);
   });
 
   it("sanitizes ordinary object accessors without invoking getters", () => {
@@ -567,6 +568,22 @@ describe("payment evidence full-content digest", () => {
       account: "account-secret",
       account_id: "account-id-secret",
       user_account: "user-account-secret",
+      "c\0vv": "normalized-cvv-secret",
+      pass_word: "normalized-password-secret",
+      "p\0an": "normalized-pan-secret",
+      se_cret: "normalized-secret",
+      track_data: "track-data-secret",
+      track1: "track-one-secret",
+      "track-2": "track-two-secret",
+      magstripe: "magstripe-secret",
+      mag_stripe: "split-magstripe-secret",
+      cardholder_name: "cardholder-secret",
+      cardHolderName: "camel-cardholder-secret",
+      expiry_date: "expiry-secret",
+      expi_ry_date: "split-expiry-secret",
+      expirationDate: "expiration-secret",
+      service_code: "service-code-secret",
+      serviceCode: "camel-service-code-secret",
       microphone_status: "enabled",
       tokenization_status: "complete",
       name: "provider-audit",
@@ -579,6 +596,29 @@ describe("payment evidence full-content digest", () => {
       name: "provider-audit",
       key: "provider-audit-key"
     });
+  });
+
+  it("bounds BigInt sanitization and hashing before decimal conversion", () => {
+    expect(sanitizePaymentEvidence(9_007_199_254_740_993n)).toBe(
+      "9007199254740993"
+    );
+    expectDistinctStableHashes(
+      { oversized: "x".repeat(5_000), counter: 123n },
+      { oversized: "x".repeat(5_000), counter: 124n }
+    );
+
+    const huge = 1n << 2_000_000n;
+    const decimalSpy = vi.spyOn(BigInt.prototype, "toString");
+    try {
+      const startedAt = performance.now();
+      expectDigestOmitted(huge);
+      expectDigestOmitted(-huge);
+      expectDigestOmitted({ oversized: "x".repeat(5_000), huge });
+      expect(performance.now() - startedAt).toBeLessThan(1_500);
+      expect(decimalSpy).not.toHaveBeenCalled();
+    } finally {
+      decimalSpy.mockRestore();
+    }
   });
 
   it("redacts sensitive values before hashing without reading accessors", () => {
@@ -738,8 +778,8 @@ describe("payment evidence full-content digest", () => {
       }
     });
 
-    const first = hashOf(evidence);
-    expect(hashOf(evidence)).toBe(first);
+    expectDigestOmitted(evidence);
+    expectDigestOmitted(evidence);
     expect(outerDescriptorCalls).toBe(0);
     expect(descriptorGetterCalls).toBe(0);
   });
@@ -768,8 +808,8 @@ describe("payment evidence full-content digest", () => {
       getOwnPropertyDescriptor: () => descriptorResult
     });
 
-    const first = hashOf(evidence);
-    expect(hashOf(evidence)).toBe(first);
+    expectDigestOmitted(evidence);
+    expectDigestOmitted(evidence);
     expect(descriptorGetterCalls).toBe(0);
   });
 
@@ -843,10 +883,8 @@ describe("payment evidence full-content digest", () => {
         throw new Error("collection proxy get must not run");
       }
     });
-    const first = hashOf({ oversized: "x".repeat(5_000), value: proxied });
-    expect(
-      hashOf({ oversized: "x".repeat(5_000), value: proxied })
-    ).toBe(first);
+    expectDigestOmitted({ oversized: "x".repeat(5_000), value: proxied });
+    expectDigestOmitted({ oversized: "x".repeat(5_000), value: proxied });
     expect(proxyGetCalls).toBe(0);
   });
 

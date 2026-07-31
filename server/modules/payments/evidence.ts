@@ -88,6 +88,8 @@ const MAX_DIGEST_NODES = 100_000;
 const MAX_DIGEST_DEPTH = 64;
 const MAX_DIGEST_STRING_CODE_UNITS = 262_144;
 const MAX_DIGEST_BINARY_BYTES = 1_048_576;
+const MAX_DIGEST_BIGINT_ABS = (1n << 4_096n) - 1n;
+const MIN_DIGEST_BIGINT = -MAX_DIGEST_BIGINT_ABS;
 
 const sensitiveKeySegments = new Set([
   "authorization",
@@ -115,7 +117,10 @@ const sensitiveKeySegments = new Set([
   "pin",
   "passphrase",
   "pan",
-  "account"
+  "account",
+  "track1",
+  "track2",
+  "magstripe"
 ]);
 
 const sensitiveKeySequences = [
@@ -152,12 +157,26 @@ const sensitiveKeySequences = [
   ["client", "ip"],
   ["client", "ip", "address"],
   ["spbill", "create", "ip"],
-  ["spbill", "create", "ip", "address"]
+  ["spbill", "create", "ip", "address"],
+  ["track", "data"],
+  ["track", "1"],
+  ["track", "2"],
+  ["cardholder", "name"],
+  ["card", "holder", "name"],
+  ["expiry", "date"],
+  ["expiration", "date"],
+  ["service", "code"]
 ] as const;
 
 const compactSensitiveKeys = new Set(
-  sensitiveKeySequences.map((sequence) => sequence.join(""))
+  [
+    ...sensitiveKeySegments,
+    ...sensitiveKeySequences.map((sequence) => sequence.join(""))
+  ]
 );
+
+const exceedsBigIntSafetyLimit = (value: bigint) =>
+  value > MAX_DIGEST_BIGINT_ABS || value < MIN_DIGEST_BIGINT;
 
 const includesTokenSequence = (
   segments: string[],
@@ -440,6 +459,10 @@ const hashEvidenceUnchecked = (input: unknown): string | null => {
         );
         continue;
       case "bigint":
+        if (exceedsBigIntSafetyLimit(value)) {
+          safetyLimitExceeded = true;
+          continue;
+        }
         writeToken("bigint", value.toString());
         continue;
       case "boolean":
@@ -467,7 +490,7 @@ const hashEvidenceUnchecked = (input: unknown): string | null => {
     }
 
     if (isOpaqueProxy(value)) {
-      writeToken("opaque-proxy");
+      safetyLimitExceeded = true;
       continue;
     }
 
@@ -824,6 +847,10 @@ export const sanitizePaymentEvidence = (input: unknown): unknown => {
       case "number":
         return Number.isFinite(value) ? value : String(value);
       case "bigint":
+        if (exceedsBigIntSafetyLimit(value)) {
+          limitExceeded = true;
+          return null;
+        }
         return value.toString();
       case "boolean":
         return value;
