@@ -383,67 +383,73 @@ export const getAvailableEntitlements = async (
   }));
 };
 
-export const consumeEntitlement = async (
+export const consumeEntitlementInTransaction = async (
+  client: pg.PoolClient,
   usageIdInput: string
 ): Promise<EntitlementUsageTransition> => {
   const usageId = requireUuid(usageIdInput);
-  return withTransaction(async (client) => {
-    const usage = await getLockedUsage(client, usageId);
-    if (usage.status === "consumed") {
-      return {
-        usageId: usage.id,
-        entitlementId: usage.entitlement_id,
-        status: usage.status
-      };
-    }
-    if (usage.status === "released") {
-      throw new CommerceError("ENTITLEMENT_USAGE_CLOSED");
-    }
-
-    await client.query(
-      `UPDATE entitlement_usages
-       SET status = 'consumed',
-           consumed_at = now()
-       WHERE id = $1`,
-      [usage.id]
-    );
-    await client.query(
-      `WITH reserved_marker AS (
-         SELECT business_id, created_at
-         FROM entitlement_usages
-         WHERE entitlement_id = $1
-           AND status = 'reserved'
-         ORDER BY created_at DESC, id DESC
-         LIMIT 1
-       )
-       UPDATE entitlements e
-       SET status = CASE
-             WHEN e.status = 'revoked' THEN 'revoked'
-             WHEN e.remaining_uses > 0 THEN 'active'
-             WHEN EXISTS (SELECT 1 FROM reserved_marker) THEN 'reserved'
-             ELSE 'consumed'
-           END,
-           reserved_for = CASE
-             WHEN e.total_uses = 1
-               THEN (SELECT business_id FROM reserved_marker)
-             ELSE NULL
-           END,
-           reserved_at = CASE
-             WHEN e.total_uses = 1
-               THEN (SELECT created_at FROM reserved_marker)
-             ELSE NULL
-           END,
-           updated_at = now()
-       WHERE e.id = $1`,
-      [usage.entitlement_id]
-    );
+  const usage = await getLockedUsage(client, usageId);
+  if (usage.status === "consumed") {
     return {
       usageId: usage.id,
       entitlementId: usage.entitlement_id,
-      status: "consumed"
+      status: usage.status
     };
-  });
+  }
+  if (usage.status === "released") {
+    throw new CommerceError("ENTITLEMENT_USAGE_CLOSED");
+  }
+
+  await client.query(
+    `UPDATE entitlement_usages
+     SET status = 'consumed',
+         consumed_at = now()
+     WHERE id = $1`,
+    [usage.id]
+  );
+  await client.query(
+    `WITH reserved_marker AS (
+       SELECT business_id, created_at
+       FROM entitlement_usages
+       WHERE entitlement_id = $1
+         AND status = 'reserved'
+       ORDER BY created_at DESC, id DESC
+       LIMIT 1
+     )
+     UPDATE entitlements e
+     SET status = CASE
+           WHEN e.status = 'revoked' THEN 'revoked'
+           WHEN e.remaining_uses > 0 THEN 'active'
+           WHEN EXISTS (SELECT 1 FROM reserved_marker) THEN 'reserved'
+           ELSE 'consumed'
+         END,
+         reserved_for = CASE
+           WHEN e.total_uses = 1
+             THEN (SELECT business_id FROM reserved_marker)
+           ELSE NULL
+         END,
+         reserved_at = CASE
+           WHEN e.total_uses = 1
+             THEN (SELECT created_at FROM reserved_marker)
+           ELSE NULL
+         END,
+         updated_at = now()
+     WHERE e.id = $1`,
+    [usage.entitlement_id]
+  );
+  return {
+    usageId: usage.id,
+    entitlementId: usage.entitlement_id,
+    status: "consumed"
+  };
 };
+
+export const consumeEntitlement = async (
+  usageIdInput: string
+): Promise<EntitlementUsageTransition> =>
+  withTransaction((client) =>
+    consumeEntitlementInTransaction(client, usageIdInput)
+  );
 
 export const releaseEntitlement = async (
   usageIdInput: string

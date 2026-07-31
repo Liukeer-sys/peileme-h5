@@ -1363,20 +1363,39 @@ describe("versioned policy public API", () => {
     }
   });
 
-  it("recovers completion after consume commits without charging the draft twice", async () => {
+  it.each(["assessment", "snapshot"] as const)(
+    "atomically rolls back and releases usage when %s persistence fails",
+    async (failureTarget) => {
     const businessDraftId = await createUnfundedDraft();
     await grantPolicyUses(100);
-    await query(`
-      CREATE FUNCTION fail_policy_completion_for_task3b()
-      RETURNS trigger LANGUAGE plpgsql AS $$
-      BEGIN
-        RAISE EXCEPTION 'forced policy completion failure';
-      END;
-      $$;
-      CREATE TRIGGER fail_policy_completion_for_task3b_trigger
-      BEFORE INSERT ON policy_calculation_snapshots
-      FOR EACH ROW EXECUTE FUNCTION fail_policy_completion_for_task3b()
-    `);
+    if (failureTarget === "assessment") {
+      await query(`
+        CREATE FUNCTION fail_policy_completion_for_task3b()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF NEW.status = 'completed' THEN
+            RAISE EXCEPTION 'forced policy assessment completion failure';
+          END IF;
+          RETURN NEW;
+        END;
+        $$;
+        CREATE TRIGGER fail_policy_completion_for_task3b_trigger
+        BEFORE UPDATE ON assessments
+        FOR EACH ROW EXECUTE FUNCTION fail_policy_completion_for_task3b()
+      `);
+    } else {
+      await query(`
+        CREATE FUNCTION fail_policy_completion_for_task3b()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          RAISE EXCEPTION 'forced policy snapshot completion failure';
+        END;
+        $$;
+        CREATE TRIGGER fail_policy_completion_for_task3b_trigger
+        BEFORE INSERT ON policy_calculation_snapshots
+        FOR EACH ROW EXECUTE FUNCTION fail_policy_completion_for_task3b()
+      `);
+    }
     try {
       await request(createApp())
         .post("/api/policy/calculate")
@@ -1408,17 +1427,30 @@ describe("versioned policy public API", () => {
         [businessDraftId]
       );
       expect(interrupted.rows[0]).toEqual({
-        remaining_uses: 99,
-        usage_status: "consumed",
+        remaining_uses: 100,
+        usage_status: "released",
         draft_status: "in_progress",
         snapshots: "0"
       });
+      const history = await request(createApp())
+        .get("/api/policy/history")
+        .set(authHeader(userToken))
+        .expect(200);
+      expect(history.body.items).toEqual([]);
     } finally {
-      await query(`
-        DROP TRIGGER IF EXISTS fail_policy_completion_for_task3b_trigger
-          ON policy_calculation_snapshots;
-        DROP FUNCTION IF EXISTS fail_policy_completion_for_task3b()
-      `);
+      if (failureTarget === "assessment") {
+        await query(`
+          DROP TRIGGER IF EXISTS fail_policy_completion_for_task3b_trigger
+            ON assessments;
+          DROP FUNCTION IF EXISTS fail_policy_completion_for_task3b()
+        `);
+      } else {
+        await query(`
+          DROP TRIGGER IF EXISTS fail_policy_completion_for_task3b_trigger
+            ON policy_calculation_snapshots;
+          DROP FUNCTION IF EXISTS fail_policy_completion_for_task3b()
+        `);
+      }
       await query(
         `UPDATE promotion_rules
             SET status = 'active'
@@ -1434,11 +1466,13 @@ describe("versioned policy public API", () => {
     expect(recovered.body.assessmentId).toBe(businessDraftId);
     const finalState = await query<{
       remaining_uses: number;
+      usage_status: string;
       usages: string;
       snapshots: string;
     }>(
       `SELECT
          e.remaining_uses,
+         eu.status AS usage_status,
          (
            SELECT count(*)::text
              FROM entitlement_usages eu2
@@ -1458,10 +1492,12 @@ describe("versioned policy public API", () => {
     );
     expect(finalState.rows[0]).toEqual({
       remaining_uses: 99,
+      usage_status: "consumed",
       usages: "1",
       snapshots: "1"
     });
-  });
+    }
+  );
 
   it.each([
     [

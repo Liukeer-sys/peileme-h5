@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import type { Request } from "express";
+import type pg from "pg";
 import { z } from "zod";
 import { writeAdminAudit } from "../../audit.js";
 import { query, withTransaction } from "../../db.js";
@@ -614,7 +615,7 @@ export class PolicyRepository {
     userId: string;
     facts: PolicyFacts;
     calculate: PolicyCalculator;
-    beforeComplete?: () => Promise<void>;
+    beforeComplete?: (client: pg.PoolClient) => Promise<void>;
   }): Promise<CalculationResult> {
     const normalizedFacts = normalizePolicyFacts(facts);
     return withTransaction(async (client) => {
@@ -934,7 +935,7 @@ export class PolicyRepository {
       const parameterIds = provenanceValues.flatMap((item) =>
         item.source === "database" ? [item.parameterId] : []
       );
-      await beforeComplete?.();
+      await beforeComplete?.(client);
       await client.query(
         `UPDATE assessments
             SET status = 'completed',

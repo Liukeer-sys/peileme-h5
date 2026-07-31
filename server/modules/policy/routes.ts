@@ -12,7 +12,7 @@ import {
   getProductBySku
 } from "../commerce/catalog.js";
 import {
-  consumeEntitlement,
+  consumeEntitlementInTransaction,
   releaseEntitlement,
   reserveEntitlement,
   type EntitlementReservation
@@ -248,26 +248,24 @@ export const createPolicyRouter = (
         throw error;
       }
 
-      let consumptionCommitted = reservation.status === "consumed";
       try {
         const result = await repository.calculateAndPersist({
           assessmentId: draft.assessmentId,
           userId: request.authUser!.id,
           facts,
           calculate,
-          beforeComplete: async () => {
+          beforeComplete: async (client) => {
             if (reservation.status === "reserved") {
-              await consumeEntitlement(reservation.usageId);
-              consumptionCommitted = true;
+              await consumeEntitlementInTransaction(
+                client,
+                reservation.usageId
+              );
             }
           }
         });
         response.status(201).json(result);
       } catch (error) {
-        if (
-          reservation.status === "reserved" &&
-          !consumptionCommitted
-        ) {
+        if (reservation.status === "reserved") {
           try {
             await releaseEntitlement(reservation.usageId);
           } catch (releaseError) {
