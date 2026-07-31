@@ -883,6 +883,7 @@ export type ExpiredOrderReconciliationSummary = {
   deferredByReason: {
     providerQueryError: number;
     paymentVerificationFailed: number;
+    closeCapacityExceeded: number;
     unsafeOrChangedState: number;
   };
 };
@@ -952,10 +953,11 @@ export const reconcileAndCloseExpiredOrders = async (input: {
   const deferredByReason = {
     providerQueryError: 0,
     paymentVerificationFailed: 0,
+    closeCapacityExceeded: 0,
     unsafeOrChangedState: 0
   };
 
-  if (provider && safeToClose.length < limit) {
+  if (provider) {
     const candidates = await query<ReconciliationCandidate>(
       `SELECT
          o.id,
@@ -985,6 +987,7 @@ export const reconcileAndCloseExpiredOrders = async (input: {
           deferred:
             | "providerQueryError"
             | "paymentVerificationFailed"
+            | "closeCapacityExceeded"
             | "unsafeOrChangedState";
         }
       | { providerConfirmedPaid: true };
@@ -1091,6 +1094,17 @@ export const reconcileAndCloseExpiredOrders = async (input: {
         deferredByReason[outcome.deferred] += 1;
       } else if (safeToClose.length < limit) {
         safeToClose.push(outcome.safeToClose);
+      } else {
+        await query(
+          `UPDATE payment_attempts
+           SET error_code = 'RECONCILIATION_CLOSE_CAPACITY_EXCEEDED',
+               error_message = '本轮安全关单容量已满，等待下次处理',
+               updated_at = now()
+           WHERE id = $1
+             AND status IN ('CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED')`,
+          [outcome.safeToClose.attemptId]
+        );
+        deferredByReason.closeCapacityExceeded += 1;
       }
     }
   }
@@ -1126,6 +1140,7 @@ export const reconcileAndCloseExpiredOrders = async (input: {
     const deferredCount =
       deferredByReason.providerQueryError +
       deferredByReason.paymentVerificationFailed +
+      deferredByReason.closeCapacityExceeded +
       deferredByReason.unsafeOrChangedState;
     const summary: ExpiredOrderReconciliationSummary = {
       scannedCount,

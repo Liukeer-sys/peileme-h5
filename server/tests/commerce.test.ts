@@ -3040,6 +3040,14 @@ describe("atomic commerce orders and payments", () => {
         close()
       ]);
       expect(outcomes[1].status).toBe("fulfilled");
+      if (outcomes[1].status === "fulfilled") {
+        const summary = outcomes[1].value.summary;
+        expect(summary.scannedCount).toBe(
+          summary.closedCount +
+            summary.providerConfirmedPaidCount +
+            summary.deferredCount
+        );
+      }
       if (outcomes[0].status === "rejected") {
         await close();
       }
@@ -3345,6 +3353,7 @@ describe("atomic commerce orders and payments", () => {
         deferredByReason: {
           providerQueryError: 2,
           paymentVerificationFailed: 0,
+          closeCapacityExceeded: 0,
           unsafeOrChangedState: 0
         }
       });
@@ -3360,6 +3369,7 @@ describe("atomic commerce orders and payments", () => {
         deferredByReason: {
           providerQueryError: 0,
           paymentVerificationFailed: 1,
+          closeCapacityExceeded: 0,
           unsafeOrChangedState: 0
         }
       });
@@ -3454,6 +3464,293 @@ describe("atomic commerce orders and payments", () => {
               error_code: null,
               transactions: "0",
               entitlements: "0"
+            }
+          ]
+        ])
+      );
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("accounts for and rotates provider-null outcomes beyond close capacity", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const candidates = await Promise.all([
+        createFailedPaymentOrder(userId, "capacity-null-first"),
+        createFailedPaymentOrder(userId, "capacity-null-second"),
+        createFailedPaymentOrder(userId, "capacity-null-third")
+      ]);
+      const orderIds = candidates.map((candidate) => candidate.order.id);
+      const attemptIds = candidates.map((candidate) => candidate.attemptId);
+      await query(
+        `UPDATE orders
+         SET created_at = now() - interval '10 minutes',
+             expires_at = now() - interval '5 minutes'
+         WHERE id = ANY($1::uuid[])`,
+        [orderIds]
+      );
+      await query(
+        `UPDATE payment_attempts
+         SET updated_at = CASE
+           WHEN id = $2 THEN now() - interval '8 minutes'
+           WHEN id = $3 THEN now() - interval '7 minutes'
+           ELSE now() - interval '6 minutes'
+         END
+         WHERE id = ANY($1::uuid[])`,
+        [attemptIds, attemptIds[0], attemptIds[1]]
+      );
+      const queryCallsByRun: string[][] = [[], [], []];
+      let currentRun = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          throw new Error("cleanup must not create");
+        },
+        async queryPayment(orderNo: string, signal: AbortSignal) {
+          expect(signal.aborted).toBe(false);
+          queryCallsByRun[currentRun].push(orderNo);
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          return null;
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      const reconciliations = [];
+      for (currentRun = 0; currentRun < 3; currentRun += 1) {
+        reconciliations.push(
+          await reconcileAndCloseExpiredOrders({
+            provider,
+            limit: 1,
+            providerQueryBudget: 3,
+            providerTimeoutMs: 100
+          })
+        );
+      }
+
+      expect(queryCallsByRun.map((calls) => calls.length)).toEqual([
+        3, 2, 1
+      ]);
+      expect(
+        queryCallsByRun.every((calls) => calls.length <= 3)
+      ).toBe(true);
+      expect(reconciliations.map((result) => result.summary)).toEqual([
+        {
+          scannedCount: 3,
+          closedCount: 1,
+          providerConfirmedPaidCount: 0,
+          deferredCount: 2,
+          hasMore: true,
+          deferredByReason: {
+            providerQueryError: 0,
+            paymentVerificationFailed: 0,
+            closeCapacityExceeded: 2,
+            unsafeOrChangedState: 0
+          }
+        },
+        {
+          scannedCount: 2,
+          closedCount: 1,
+          providerConfirmedPaidCount: 0,
+          deferredCount: 1,
+          hasMore: true,
+          deferredByReason: {
+            providerQueryError: 0,
+            paymentVerificationFailed: 0,
+            closeCapacityExceeded: 1,
+            unsafeOrChangedState: 0
+          }
+        },
+        {
+          scannedCount: 1,
+          closedCount: 1,
+          providerConfirmedPaidCount: 0,
+          deferredCount: 0,
+          hasMore: false,
+          deferredByReason: {
+            providerQueryError: 0,
+            paymentVerificationFailed: 0,
+            closeCapacityExceeded: 0,
+            unsafeOrChangedState: 0
+          }
+        }
+      ]);
+      for (const reconciliation of reconciliations) {
+        const summary = reconciliation.summary;
+        expect(summary.scannedCount).toBe(
+          summary.closedCount +
+            summary.providerConfirmedPaidCount +
+            summary.deferredCount
+        );
+      }
+      expect(
+        reconciliations.flatMap((result) => result.closedOrderIds).sort()
+      ).toEqual([...orderIds].sort());
+      const persisted = await query<{
+        id: string;
+        status: string;
+        error_code: string | null;
+      }>(
+        `SELECT o.id, o.status, attempt.error_code
+         FROM orders o
+         JOIN LATERAL (
+           SELECT error_code
+           FROM payment_attempts
+           WHERE order_id = o.id
+           ORDER BY created_at DESC, id DESC
+           LIMIT 1
+         ) attempt ON true
+         WHERE o.id = ANY($1::uuid[])`,
+        [orderIds]
+      );
+      expect(persisted.rows.every((row) => row.status === "CLOSED")).toBe(
+        true
+      );
+      expect(
+        persisted.rows.filter(
+          (row) =>
+            row.error_code ===
+            "RECONCILIATION_CLOSE_CAPACITY_EXCEEDED"
+        )
+      ).toHaveLength(2);
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("recovers provider-confirmed payment while no-attempt close capacity is full", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const firstCreated = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `paid-backlog-first-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      const secondCreated = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `paid-backlog-second-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      const paid = await createFailedPaymentOrder(
+        userId,
+        "paid-backlog-provider"
+      );
+      await query(
+        `UPDATE orders
+         SET created_at = now() - interval '10 minutes',
+             expires_at = CASE
+               WHEN id = $2 THEN now() - interval '8 minutes'
+               WHEN id = $3 THEN now() - interval '7 minutes'
+               ELSE now() - interval '5 minutes'
+             END
+         WHERE id = ANY($1::uuid[])`,
+        [
+          [firstCreated.id, secondCreated.id, paid.order.id],
+          firstCreated.id,
+          secondCreated.id
+        ]
+      );
+      const queryCalls: string[] = [];
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          throw new Error("cleanup must not create");
+        },
+        async queryPayment(orderNo: string, signal: AbortSignal) {
+          expect(signal.aborted).toBe(false);
+          queryCalls.push(orderNo);
+          return {
+            orderNo,
+            channel: "fake" as const,
+            channelTransactionId: `paid-backlog-${randomUUID()}`,
+            amountFen: paid.order.amountFen,
+            currency: "CNY" as const,
+            paidAt: new Date(Date.now() - 7 * 60_000).toISOString(),
+            raw: { source: "paid-backlog-reconciliation" }
+          };
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+
+      const reconciliation = await reconcileAndCloseExpiredOrders({
+        provider,
+        limit: 1,
+        providerQueryBudget: 1,
+        providerTimeoutMs: 100
+      });
+
+      expect(queryCalls).toEqual([paid.order.orderNo]);
+      expect(reconciliation.closedOrderIds).toEqual([firstCreated.id]);
+      expect(reconciliation.summary).toEqual({
+        scannedCount: 2,
+        closedCount: 1,
+        providerConfirmedPaidCount: 1,
+        deferredCount: 0,
+        hasMore: true,
+        deferredByReason: {
+          providerQueryError: 0,
+          paymentVerificationFailed: 0,
+          closeCapacityExceeded: 0,
+          unsafeOrChangedState: 0
+        }
+      });
+      const states = await query<{
+        id: string;
+        status: string;
+        transactions: string;
+        entitlements: string;
+      }>(
+        `SELECT
+           o.id,
+           o.status,
+           (SELECT count(*)::text
+              FROM payment_transactions
+             WHERE order_id = o.id) AS transactions,
+           (SELECT count(*)::text
+              FROM entitlements
+             WHERE source_id = o.id) AS entitlements
+         FROM orders o
+         WHERE o.id = ANY($1::uuid[])`,
+        [[firstCreated.id, secondCreated.id, paid.order.id]]
+      );
+      expect(new Map(states.rows.map((row) => [row.id, row]))).toEqual(
+        new Map([
+          [
+            firstCreated.id,
+            {
+              id: firstCreated.id,
+              status: "CLOSED",
+              transactions: "0",
+              entitlements: "0"
+            }
+          ],
+          [
+            secondCreated.id,
+            {
+              id: secondCreated.id,
+              status: "CREATED",
+              transactions: "0",
+              entitlements: "0"
+            }
+          ],
+          [
+            paid.order.id,
+            {
+              id: paid.order.id,
+              status: "COMPLETED",
+              transactions: "1",
+              entitlements: "1"
             }
           ]
         ])
@@ -4022,6 +4319,7 @@ describe("atomic commerce orders and payments", () => {
           deferredByReason: {
             providerQueryError: 0,
             paymentVerificationFailed: 0,
+            closeCapacityExceeded: 0,
             unsafeOrChangedState: 0
           }
         }
@@ -4041,6 +4339,7 @@ describe("atomic commerce orders and payments", () => {
             deferredByReason: {
               providerQueryError: number;
               paymentVerificationFailed: number;
+              closeCapacityExceeded: number;
               unsafeOrChangedState: number;
             };
           };
@@ -4068,6 +4367,7 @@ describe("atomic commerce orders and payments", () => {
               deferredByReason: {
                 providerQueryError: 0,
                 paymentVerificationFailed: 0,
+                closeCapacityExceeded: 0,
                 unsafeOrChangedState: 0
               }
             }
