@@ -120,12 +120,12 @@ test("真实外部邮箱收到验证码并覆盖错误码、注册、刷新会�
 
     await dialog.getByPlaceholder("6 位验证码").fill(code);
     await dialog.getByRole("button", { name: "注册并登录" }).click();
-    await expect(page.getByRole("button", { name: "真实邮箱验收" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "真实邮箱" })).toBeVisible();
     await page.reload();
-    await expect(page.getByRole("button", { name: "真实邮箱验收" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "真实邮箱" })).toBeVisible();
 
     await page.goto(aiBaseUrl);
-    await expect(page.getByRole("button", { name: "真实邮箱验收" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "真实邮箱" })).toBeVisible();
     await page.getByLabel("把你的情况说具体一些").fill(
       "公司要求协商离职，我工作三年，月工资一万元，有劳动合同和解除通知，请分析补偿与证据风险。"
     );
@@ -149,7 +149,7 @@ test("真实外部邮箱收到验证码并覆盖错误码、注册、刷新会�
     ]);
     expect(exhaustedResponse.status()).toBe(402);
     await expect(page.getByRole("status")).toContainText("需要可用次数");
-    await page.getByRole("button", { name: "真实邮箱验收" }).click();
+    await page.getByRole("button", { name: "真实邮箱" }).click();
     await page.getByRole("dialog").getByRole("button", { name: "退出登录" }).click();
     await expect(page.getByRole("button", { name: "登录", exact: true })).toBeVisible();
     expectNoRuntimeFailures();

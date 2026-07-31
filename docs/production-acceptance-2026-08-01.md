@@ -23,4 +23,10 @@
 
 ## 发布后记录
 
-发布完成后在本节登记提交号、备份目录、容器健康、Worker 降级任务号、真实邮箱用例、Playwright 通过数、回环与公网检查结果。
+- 运行提交：`c9a0679`；生产备份：`/opt/1panel/backup/peileme/20260731T221906Z`；回滚镜像标签：`rollback-20260731T221908Z`。
+- 数据状态：迁移 `016_ai_worker_attempts.sql`，364 个行政区域，63 条参数；三项首次权益均为启用、每项 1 次。
+- 本地证据：服务端非支付测试 671/671；政策站 Playwright 26/26；AI、双站、后台、材料、账号和构建产物 Playwright 16/16；受控真实 Provider 降级 1/1；Compose 重启前后浏览器 4/4 且数据库哨兵保留。
+- 生产证据：真实外部邮箱验证码 1/1；生产安全矩阵 13/13，调试验证码专属 2 条由真实邮箱链路替代；受控 Provider 降级 1/1；重启后双站 2/2。
+- 降级任务：`fb5b63ee-eda8-4deb-9ad3-1f1dafb0a352`，`tuzi / PROVIDER_ERROR` 后由 `dataeyes` 成功完成。
+- 运行恢复：`db`、`api`、`ai-worker`、`web-main`、`web-ai` 全部 healthy；四应用服务重启后数据库哨兵保留，Worker 实例 ID 更新且心跳新鲜。
+- 公网结果：`https://peileme.art`、`https://ai.peileme.art`、两个 `/admin` 与两个 `/api/health` 均从发布机外通过 HTTPS 返回 200；健康版本为 `c9a0679`，生产 `OTP_DEBUG=false`。
