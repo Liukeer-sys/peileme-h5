@@ -1,12 +1,18 @@
 import { Router, type Request } from "express";
 import { z } from "zod";
+import { writeAdminAudit } from "../../audit.js";
 import { ApiError } from "../../errors.js";
 import { getConfig } from "../../config.js";
-import { query } from "../../db.js";
-import { requireAdmin, requireAuth } from "../../security.js";
+import { query, withTransaction } from "../../db.js";
+import {
+  requireAdmin,
+  requireAuth,
+  requireSuperAdmin
+} from "../../security.js";
 import { getActiveCatalog } from "./catalog.js";
 import {
   closeExpiredOrders,
+  closeExpiredOrdersInTransaction,
   createInvoiceRequest,
   createOrder,
   getOwnedOrder,
@@ -277,7 +283,7 @@ export const createCommerceRouters = (
   adminRouter.post(
     "/close-expired",
     requireAuth,
-    requireAdmin,
+    requireSuperAdmin,
     async (request, response, next) => {
       try {
         const body = z
@@ -286,7 +292,25 @@ export const createCommerceRouters = (
           })
           .strict()
           .parse(request.body);
-        const closedOrderIds = await closeExpiredOrders(body.limit);
+        const closedOrderIds = await withTransaction(async (client) => {
+          const ids = await closeExpiredOrdersInTransaction(
+            client,
+            body.limit
+          );
+          await writeAdminAudit(
+            request,
+            "commerce.orders.close_expired",
+            "orders",
+            undefined,
+            {
+              limit: body.limit,
+              closedCount: ids.length,
+              closedOrderIds: ids
+            },
+            client
+          );
+          return ids;
+        });
         response.json({
           closedCount: closedOrderIds.length,
           closedOrderIds

@@ -700,43 +700,50 @@ export const listOwnedOrders = async (
   };
 };
 
-export const closeExpiredOrders = async (limit = 200) => {
+export const closeExpiredOrdersInTransaction = async (
+  client: pg.PoolClient,
+  limit = 200
+) => {
   if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
     throw new CommerceError("INVALID_COMMERCE_INPUT");
   }
-  return withTransaction(async (client) => {
-    const expired = await client.query<{ id: string }>(
-      `SELECT id
-       FROM orders
-       WHERE expires_at <= now()
-         AND status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED')
-       ORDER BY expires_at, id
-       LIMIT $1
-       FOR UPDATE SKIP LOCKED`,
-      [limit]
-    );
-    const orderIds = expired.rows.map((row) => row.id);
-    if (!orderIds.length) return [];
-    await client.query(
-      `UPDATE payment_attempts
-       SET status = 'CLOSED',
-           updated_at = now()
-       WHERE order_id = ANY($1::uuid[])
-         AND status IN ('CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED')`,
-      [orderIds]
-    );
-    const result = await client.query<{ id: string }>(
-      `UPDATE orders
-       SET status = 'CLOSED',
-           closed_at = now(),
-           updated_at = now()
-       WHERE id = ANY($1::uuid[])
-         AND status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED')
-       RETURNING id`,
-      [orderIds]
-    );
-    return result.rows.map((row) => row.id);
-  });
+  const expired = await client.query<{ id: string }>(
+    `SELECT id
+     FROM orders
+     WHERE expires_at <= now()
+       AND status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED')
+     ORDER BY expires_at, id
+     LIMIT $1
+     FOR UPDATE SKIP LOCKED`,
+    [limit]
+  );
+  const orderIds = expired.rows.map((row) => row.id);
+  if (!orderIds.length) return [];
+  await client.query(
+    `UPDATE payment_attempts
+     SET status = 'CLOSED',
+         updated_at = now()
+     WHERE order_id = ANY($1::uuid[])
+       AND status IN ('CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED')`,
+    [orderIds]
+  );
+  const result = await client.query<{ id: string }>(
+    `UPDATE orders
+     SET status = 'CLOSED',
+         closed_at = now(),
+         updated_at = now()
+     WHERE id = ANY($1::uuid[])
+       AND status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED')
+     RETURNING id`,
+    [orderIds]
+  );
+  return result.rows.map((row) => row.id);
+};
+
+export const closeExpiredOrders = async (limit = 200) => {
+  return withTransaction((client) =>
+    closeExpiredOrdersInTransaction(client, limit)
+  );
 };
 
 export type PaymentStartResult = {
@@ -748,12 +755,15 @@ export type PaymentStartResult = {
   expiresAt: Date;
 };
 
-type PreparedPayment = {
-  existing?: PaymentStartResult;
-  attemptId: string;
-  generation: string;
-  order: CommerceOrder;
-};
+type PreparedPayment =
+  | { expired: true }
+  | {
+      expired?: false;
+      existing?: PaymentStartResult;
+      attemptId: string;
+      generation: string;
+      order: CommerceOrder;
+    };
 
 type FailedPaymentRecovery = {
   orderId: string;
@@ -842,6 +852,14 @@ const preparePayment = async (
     if (row.expires_at.getTime() <= Date.now()) {
       if (["CREATED", "PAYING", "PAYMENT_FAILED"].includes(row.status)) {
         await client.query(
+          `UPDATE payment_attempts
+           SET status = 'CLOSED',
+               updated_at = now()
+           WHERE order_id = $1
+             AND status IN ('CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED')`,
+          [row.id]
+        );
+        await client.query(
           `UPDATE orders
            SET status = 'CLOSED',
                closed_at = now(),
@@ -850,7 +868,7 @@ const preparePayment = async (
           [row.id]
         );
       }
-      throw new CommerceError("ORDER_EXPIRED");
+      return { expired: true };
     }
     if (!["CREATED", "PAYING", "PAYMENT_FAILED"].includes(row.status)) {
       throw new CommerceError("ORDER_STATE_CONFLICT");
@@ -1035,6 +1053,9 @@ export const startPayment = async (
     orderId,
     input.provider
   );
+  if (prepared.expired) {
+    throw new CommerceError("ORDER_EXPIRED");
+  }
   if (prepared.existing) return prepared.existing;
 
   try {

@@ -54,6 +54,10 @@ const cleanupEntitlementTestUsers = async (userIds: string[]) => {
     "DELETE FROM entitlement_usages WHERE user_id = ANY($1::uuid[])",
     [userIds]
   );
+  await query(
+    "DELETE FROM admin_audit_logs WHERE admin_user_id = ANY($1::uuid[])",
+    [userIds]
+  );
   await query("DELETE FROM entitlements WHERE user_id = ANY($1::uuid[])", [
     userIds
   ]);
@@ -2377,6 +2381,83 @@ describe("atomic commerce orders and payments", () => {
     }
   });
 
+  it("commits expiry closure before returning ORDER_EXPIRED", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const order = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `expired-start-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      const attempt = await query<{ id: string }>(
+        `INSERT INTO payment_attempts(order_id, channel, status)
+         VALUES ($1, 'fake', 'PENDING')
+         RETURNING id`,
+        [order.id]
+      );
+      await query(
+        `UPDATE orders
+         SET status = 'PAYING',
+             created_at = now() - interval '2 minutes',
+             expires_at = now() - interval '1 minute'
+         WHERE id = $1`,
+        [order.id]
+      );
+      let createCalls = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          createCalls += 1;
+          throw new Error("must not create");
+        },
+        async queryPayment() {
+          return null;
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      const start = () =>
+        startPayment({
+          userId: userId!,
+          orderId: order.id,
+          provider,
+          clientIp: "127.0.0.1",
+          returnUrl: "http://peileme.test/return",
+          notifyUrl: "http://peileme.test/notify",
+          providerTimeoutMs: 100
+        });
+
+      await expect(start()).rejects.toMatchObject({ code: "ORDER_EXPIRED" });
+      const first = await query<{
+        status: string;
+        closed_at: Date | null;
+        attempt_status: string;
+      }>(
+        `SELECT o.status, o.closed_at, pa.status AS attempt_status
+         FROM orders o
+         JOIN payment_attempts pa ON pa.order_id = o.id
+         WHERE o.id = $1`,
+        [order.id]
+      );
+      expect(first.rows[0]).toMatchObject({
+        status: "CLOSED",
+        closed_at: expect.any(Date),
+        attempt_status: "CLOSED"
+      });
+      await expect(start()).rejects.toMatchObject({
+        code: "ORDER_EXPIRED"
+      });
+      expect(createCalls).toBe(0);
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
   it("times out a hanging provider call and retries the same attempt", async () => {
     await seedPolicyFoundation();
     let userId: string | undefined;
@@ -3262,13 +3343,22 @@ describe("atomic commerce orders and payments", () => {
   it("mounts a minimal authenticated admin commerce status endpoint", async () => {
     await seedPolicyFoundation();
     const userIds: string[] = [];
+    let auditFailureInstalled = false;
     try {
       const userId = await createEntitlementTestUser(true);
       userIds.push(userId);
+      const analystId = await createEntitlementTestUser(true);
+      userIds.push(analystId);
+      await query("UPDATE users SET role = 'analyst' WHERE id = $1", [
+        analystId
+      ]);
       const adminId = await createEntitlementTestUser(true);
       userIds.push(adminId);
       await query("UPDATE users SET role = 'admin' WHERE id = $1", [adminId]);
-      const tokenFor = async (id: string, role: "user" | "admin") => {
+      const tokenFor = async (
+        id: string,
+        role: "user" | "admin" | "analyst"
+      ) => {
         const user = await query<{ email: string }>(
           "SELECT email FROM users WHERE id = $1",
           [id]
@@ -3316,6 +3406,14 @@ describe("atomic commerce orders and payments", () => {
         .set("authorization", `Bearer ${await tokenFor(userId, "user")}`)
         .send({ limit: 1 })
         .expect(403);
+      await request(app)
+        .post("/api/admin/commerce/close-expired")
+        .set(
+          "authorization",
+          `Bearer ${await tokenFor(analystId, "analyst")}`
+        )
+        .send({ limit: 1 })
+        .expect(403);
       const closed = await request(app)
         .post("/api/admin/commerce/close-expired")
         .set("authorization", `Bearer ${await tokenFor(adminId, "admin")}`)
@@ -3325,7 +3423,102 @@ describe("atomic commerce orders and payments", () => {
         closedCount: 1,
         closedOrderIds: [expiredOrder.id]
       });
+      const audit = await query<{
+        action: string;
+        detail: {
+          limit: number;
+          closedCount: number;
+          closedOrderIds: string[];
+        };
+      }>(
+        `SELECT action, detail
+         FROM admin_audit_logs
+         WHERE admin_user_id = $1
+           AND action = 'commerce.orders.close_expired'`,
+        [adminId]
+      );
+      expect(audit.rows).toEqual([
+        {
+          action: "commerce.orders.close_expired",
+          detail: {
+            limit: 1,
+            closedCount: 1,
+            closedOrderIds: [expiredOrder.id]
+          }
+        }
+      ]);
+
+      const rollbackOrder = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `admin-close-audit-rollback-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      await query(
+        `UPDATE orders
+         SET created_at = now() - interval '2 seconds',
+             expires_at = now() - interval '1 second'
+         WHERE id = $1`,
+        [rollbackOrder.id]
+      );
+      await query(`
+        CREATE OR REPLACE FUNCTION fail_commerce_close_audit_for_test()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+          IF NEW.action = 'commerce.orders.close_expired' THEN
+            RAISE EXCEPTION 'forced commerce close audit failure';
+          END IF;
+          RETURN NEW;
+        END
+        $$
+      `);
+      await query(`
+        CREATE TRIGGER fail_commerce_close_audit_for_test_trigger
+        BEFORE INSERT ON admin_audit_logs
+        FOR EACH ROW
+        EXECUTE FUNCTION fail_commerce_close_audit_for_test()
+      `);
+      auditFailureInstalled = true;
+      await request(app)
+        .post("/api/admin/commerce/close-expired")
+        .set("authorization", `Bearer ${await tokenFor(adminId, "admin")}`)
+        .send({ limit: 1 })
+        .expect(500);
+      const rolledBack = await query<{
+        status: string;
+        closed_at: Date | null;
+        audits: string;
+      }>(
+        `SELECT
+           status,
+           closed_at,
+           (
+             SELECT count(*)::text
+             FROM admin_audit_logs
+             WHERE admin_user_id = $2
+               AND action = 'commerce.orders.close_expired'
+           ) AS audits
+         FROM orders
+         WHERE id = $1`,
+        [rollbackOrder.id, adminId]
+      );
+      expect(rolledBack.rows[0]).toEqual({
+        status: "CREATED",
+        closed_at: null,
+        audits: "1"
+      });
     } finally {
+      if (auditFailureInstalled) {
+        await query(
+          "DROP TRIGGER IF EXISTS fail_commerce_close_audit_for_test_trigger ON admin_audit_logs"
+        );
+      }
+      await query(
+        "DROP FUNCTION IF EXISTS fail_commerce_close_audit_for_test()"
+      );
       await cleanupEntitlementTestUsers(userIds);
     }
   });
