@@ -54,7 +54,7 @@
 - `.env.example` — payment secrets and URLs.
 - `docker-compose.yml` — payment configuration and scheduled job entry.
 
-## Task 1: Add commerce persistence and seed the two active SKUs
+## Task 1: Add commerce persistence and seed the three site-scoped SKUs
 
 **Files:**
 - Create: `database/migrations/008_commerce.sql`
@@ -65,7 +65,7 @@
 - [ ] **Step 1: Write the failing catalog test**
 
 ```ts
-it("seeds the two active per-use products and their default prices", async () => {
+it("seeds the three site-scoped per-use products and their default prices", async () => {
   await seedPolicyFoundation();
   const result = await query<{ sku: string; amount_fen: string }>(
     `SELECT p.sku, pp.amount_fen
@@ -75,6 +75,7 @@ it("seeds the two active per-use products and their default prices", async () =>
       ORDER BY p.sku`
   );
   expect(result.rows).toEqual([
+    { sku: "AI_DOCUMENT_REVIEW", amount_fen: "2990" },
     { sku: "AI_SEVERANCE_ANALYSIS", amount_fen: "3990" },
     { sku: "POLICY_CALC", amount_fen: "990" }
   ]);
@@ -104,7 +105,7 @@ CREATE TABLE products (
   description TEXT NOT NULL,
   product_channel TEXT NOT NULL CHECK (product_channel IN ('main', 'ai', 'all')),
   fulfillment_type TEXT NOT NULL CHECK (
-    fulfillment_type IN ('policy_calculation', 'ai_analysis')
+    fulfillment_type IN ('policy_calculation', 'ai_analysis', 'document_review')
   ),
   status TEXT NOT NULL CHECK (status IN ('active', 'inactive')),
   entitlement_policy JSONB NOT NULL,
@@ -298,7 +299,8 @@ Create `server/modules/commerce/types.ts`:
 ```ts
 export const productSkus = [
   "POLICY_CALC",
-  "AI_SEVERANCE_ANALYSIS"
+  "AI_SEVERANCE_ANALYSIS",
+  "AI_DOCUMENT_REVIEW"
 ] as const;
 export type ProductSku = typeof productSkus[number];
 
@@ -312,7 +314,9 @@ export type PaymentChannel = "wechat_h5" | "alipay_wap" | "fake";
 
 - [ ] **Step 5: Seed products, prices and first-free promotion**
 
-Extend `seedPolicyFoundation()` with one transaction that upserts the two active products and inserts an open price only when one does not exist. Insert promotion `FIRST_POLICY_CALC` for `POLICY_CALC`, `grant_count = 1`, `trigger_type = first_verified_user`. Do not recreate the removed file-signing/document-review product.
+Extend `seedPolicyFoundation()` with one transaction that upserts the three products and inserts an open price only when one does not exist. `POLICY_CALC` belongs to `main`; `AI_SEVERANCE_ANALYSIS` and `AI_DOCUMENT_REVIEW` belong to `ai`. Insert promotion `FIRST_POLICY_CALC` for `POLICY_CALC`, `grant_count = 1`, `trigger_type = first_verified_user`.
+
+The file-signing/document-review product is AI-site only. Main-site APIs, navigation, copy, JavaScript and built artifacts must continue to exclude it.
 
 - [ ] **Step 6: Run the test**
 
