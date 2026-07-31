@@ -22,6 +22,7 @@ import {
   fulfillOrder,
   listOwnedOrders,
   markOrderPaid,
+  reconcileAndCloseExpiredOrders,
   startPayment
 } from "../modules/commerce/orders.js";
 import { seedPolicyFoundation } from "../modules/policy/seed.js";
@@ -2450,7 +2451,7 @@ describe("atomic commerce orders and payments", () => {
         attempt_status: "CLOSED"
       });
       await expect(start()).rejects.toMatchObject({
-        code: "ORDER_EXPIRED"
+        code: "ORDER_STATE_CONFLICT"
       });
       expect(createCalls).toBe(0);
     } finally {
@@ -2458,7 +2459,7 @@ describe("atomic commerce orders and payments", () => {
     }
   });
 
-  it("times out a hanging provider call and retries the same attempt", async () => {
+  it("aborts a timed out provider and delays prepay retry during grace", async () => {
     await seedPolicyFoundation();
     let userId: string | undefined;
     try {
@@ -2471,17 +2472,27 @@ describe("atomic commerce orders and payments", () => {
         businessDraftId: await insertPolicyDraft(userId)
       });
       const seenAttempts: string[] = [];
+      let timedOutSignal: AbortSignal | undefined;
+      let queryCalls = 0;
       let calls = 0;
       const provider = {
         channel: "fake" as const,
         async createPayment(input: {
           attemptId: string;
           orderNo: string;
+          signal: AbortSignal;
         }) {
           seenAttempts.push(input.attemptId);
           calls += 1;
           if (calls === 1) {
-            return await new Promise<never>(() => undefined);
+            timedOutSignal = input.signal;
+            return await new Promise<never>((_resolve, reject) => {
+              input.signal.addEventListener(
+                "abort",
+                () => reject(new Error("provider aborted")),
+                { once: true }
+              );
+            });
           }
           return {
             prepayId: `timeout-retry-${input.attemptId}`,
@@ -2489,7 +2500,9 @@ describe("atomic commerce orders and payments", () => {
             response: {}
           };
         },
-        async queryPayment() {
+        async queryPayment(_orderNo: string, signal: AbortSignal) {
+          expect(signal.aborted).toBe(false);
+          queryCalls += 1;
           return null;
         },
         async refund() {
@@ -2512,6 +2525,30 @@ describe("atomic commerce orders and payments", () => {
         code: "PAYMENT_PROVIDER_FAILED"
       });
       expect(Date.now() - startedAt).toBeLessThan(1_000);
+      expect(timedOutSignal?.aborted).toBe(true);
+      const timedOutAttempt = await query<{
+        error_code: string | null;
+        status: string;
+      }>(
+        `SELECT error_code, status
+         FROM payment_attempts
+         WHERE order_id = $1`,
+        [order.id]
+      );
+      expect(timedOutAttempt.rows[0]).toEqual({
+        error_code: "PAYMENT_PROVIDER_TIMEOUT",
+        status: "FAILED"
+      });
+      await expect(start()).rejects.toMatchObject({
+        code: "PAYMENT_INITIALIZING"
+      });
+      expect({ calls, queryCalls }).toEqual({ calls: 1, queryCalls: 1 });
+      await query(
+        `UPDATE payment_attempts
+         SET updated_at = now() - interval '121 seconds'
+         WHERE order_id = $1`,
+        [order.id]
+      );
       const retried = await start();
       expect(seenAttempts).toEqual([
         retried.paymentAttemptId,
@@ -2719,6 +2756,144 @@ describe("atomic commerce orders and payments", () => {
     }
   });
 
+  it("recovers paid CLOSED orders and preserves null or errored ones", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const paid = await createFailedPaymentOrder(userId, "closed-paid");
+      const unpaid = await createFailedPaymentOrder(userId, "closed-unpaid");
+      const errored = await createFailedPaymentOrder(
+        userId,
+        "closed-query-error"
+      );
+      await query(
+        `UPDATE orders
+         SET status = 'CLOSED',
+             closed_at = now()
+         WHERE id = ANY($1::uuid[])`,
+        [[paid.order.id, unpaid.order.id, errored.order.id]]
+      );
+      await query(
+        `UPDATE payment_attempts
+         SET status = 'CLOSED'
+         WHERE order_id = ANY($1::uuid[])`,
+        [[paid.order.id, unpaid.order.id, errored.order.id]]
+      );
+      let mode: "paid" | "null" | "error" = "paid";
+      let createCalls = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          createCalls += 1;
+          throw new Error("must not create");
+        },
+        async queryPayment(orderNo: string, signal: AbortSignal) {
+          expect(signal.aborted).toBe(false);
+          if (mode === "error") {
+            throw new Error("closed provider query secret");
+          }
+          if (mode === "null") return null;
+          return {
+            orderNo,
+            channel: "fake" as const,
+            channelTransactionId: `closed-paid-${randomUUID()}`,
+            amountFen: paid.order.amountFen,
+            currency: "CNY" as const,
+            paidAt: new Date().toISOString(),
+            raw: { source: "closed-recovery" }
+          };
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      const start = (orderId: string) =>
+        startPayment({
+          userId: userId!,
+          orderId,
+          provider,
+          clientIp: "127.0.0.1",
+          returnUrl: "http://peileme.test/return",
+          notifyUrl: "http://peileme.test/notify",
+          providerTimeoutMs: 100
+        });
+
+      await expect(start(paid.order.id)).resolves.toMatchObject({
+        status: "COMPLETED",
+        paymentAttemptId: paid.attemptId
+      });
+      mode = "null";
+      await expect(start(unpaid.order.id)).rejects.toMatchObject({
+        code: "ORDER_STATE_CONFLICT"
+      });
+      mode = "error";
+      await expect(start(errored.order.id)).rejects.toMatchObject({
+        code: "PAYMENT_PROVIDER_FAILED"
+      });
+      expect(createCalls).toBe(0);
+      const states = await query<{
+        id: string;
+        status: string;
+        transactions: string;
+        entitlements: string;
+      }>(
+        `SELECT
+           o.id,
+           o.status,
+           (
+             SELECT count(*)::text
+             FROM payment_transactions pt
+             WHERE pt.order_id = o.id
+           ) AS transactions,
+           (
+             SELECT count(*)::text
+             FROM entitlements e
+             WHERE e.source_id = o.id
+           ) AS entitlements
+         FROM orders o
+         WHERE o.id = ANY($1::uuid[])
+         ORDER BY o.id`,
+        [[paid.order.id, unpaid.order.id, errored.order.id]]
+      );
+      expect(
+        new Map(states.rows.map((row) => [row.id, row]))
+      ).toEqual(
+        new Map([
+          [
+            paid.order.id,
+            {
+              id: paid.order.id,
+              status: "COMPLETED",
+              transactions: "1",
+              entitlements: "1"
+            }
+          ],
+          [
+            unpaid.order.id,
+            {
+              id: unpaid.order.id,
+              status: "CLOSED",
+              transactions: "0",
+              entitlements: "0"
+            }
+          ],
+          [
+            errored.order.id,
+            {
+              id: errored.order.id,
+              status: "CLOSED",
+              transactions: "0",
+              entitlements: "0"
+            }
+          ]
+        ])
+      );
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
   it("allows one of two orders to own a concurrent provider transaction ID", async () => {
     await seedPolicyFoundation();
     const userIds: string[] = [];
@@ -2842,13 +3017,31 @@ describe("atomic commerce orders and payments", () => {
           raw: { source: "expiry-race" }
         }
       });
+      const cleanupProvider = {
+        channel: "fake" as const,
+        async createPayment() {
+          throw new Error("cleanup must not create");
+        },
+        async queryPayment() {
+          return null;
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      const close = () =>
+        reconcileAndCloseExpiredOrders({
+          provider: cleanupProvider,
+          limit: 10,
+          providerTimeoutMs: 100
+        });
       const outcomes = await Promise.allSettled([
         payment,
-        closeExpiredOrders()
+        close()
       ]);
       expect(outcomes[1].status).toBe("fulfilled");
       if (outcomes[0].status === "rejected") {
-        await closeExpiredOrders();
+        await close();
       }
 
       const persisted = await query<{
@@ -2892,6 +3085,140 @@ describe("atomic commerce orders and payments", () => {
       }
     } finally {
       if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("queries attempted expired orders before safe close and defers errors", async () => {
+    await seedPolicyFoundation();
+    const userIds: string[] = [];
+    try {
+      const userId = await createEntitlementTestUser(true);
+      userIds.push(userId);
+      const adminId = await createEntitlementTestUser(true);
+      userIds.push(adminId);
+      await query("UPDATE users SET role = 'admin' WHERE id = $1", [adminId]);
+      const admin = await query<{ email: string }>(
+        "SELECT email FROM users WHERE id = $1",
+        [adminId]
+      );
+      const adminToken = await signAccessToken({
+        id: adminId,
+        role: "admin",
+        email: admin.rows[0].email,
+        phone: null,
+        displayName: null,
+        status: "active"
+      });
+      const paid = await createFailedPaymentOrder(userId, "cleanup-paid");
+      const unpaid = await createFailedPaymentOrder(userId, "cleanup-unpaid");
+      const errored = await createFailedPaymentOrder(
+        userId,
+        "cleanup-error"
+      );
+      const noProvider = await createFailedPaymentOrder(
+        userId,
+        "cleanup-no-provider"
+      );
+      await query(
+        "UPDATE payment_attempts SET channel = 'wechat_h5' WHERE id = $1",
+        [noProvider.attemptId]
+      );
+      const created = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `cleanup-created-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      const allIds = [
+        paid.order.id,
+        unpaid.order.id,
+        errored.order.id,
+        noProvider.order.id,
+        created.id
+      ];
+      await query(
+        `UPDATE orders
+         SET created_at = now() - interval '2 minutes',
+             expires_at = now() - interval '1 minute'
+         WHERE id = ANY($1::uuid[])`,
+        [allIds]
+      );
+      const queryCalls: string[] = [];
+      let activeQueries = 0;
+      let maxActiveQueries = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          throw new Error("cleanup must not create");
+        },
+        async queryPayment(orderNo: string, signal: AbortSignal) {
+          expect(signal.aborted).toBe(false);
+          queryCalls.push(orderNo);
+          activeQueries += 1;
+          maxActiveQueries = Math.max(maxActiveQueries, activeQueries);
+          try {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            if (orderNo === errored.order.orderNo) {
+              throw new Error("cleanup query secret");
+            }
+            if (orderNo === unpaid.order.orderNo) return null;
+            return {
+              orderNo,
+              channel: "fake" as const,
+              channelTransactionId: `cleanup-paid-${randomUUID()}`,
+              amountFen: paid.order.amountFen,
+              currency: "CNY" as const,
+              paidAt: new Date(Date.now() - 120_000).toISOString(),
+              raw: { source: "cleanup-reconcile" }
+            };
+          } finally {
+            activeQueries -= 1;
+          }
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+
+      const app = createApp({ paymentProvider: provider });
+      const closed = await request(app)
+        .post("/api/admin/commerce/close-expired")
+        .set("authorization", `Bearer ${adminToken}`)
+        .send({ limit: 5 })
+        .expect(200);
+      expect(closed.body.closedOrderIds.sort()).toEqual(
+        [unpaid.order.id, created.id].sort()
+      );
+      expect(queryCalls.sort()).toEqual(
+        [
+          paid.order.orderNo,
+          unpaid.order.orderNo,
+          errored.order.orderNo
+        ].sort()
+      );
+      expect(maxActiveQueries).toBeGreaterThan(1);
+      expect(maxActiveQueries).toBeLessThanOrEqual(10);
+
+      const states = await query<{ id: string; status: string }>(
+        `SELECT id, status
+         FROM orders
+         WHERE id = ANY($1::uuid[])`,
+        [allIds]
+      );
+      expect(
+        new Map(states.rows.map((row) => [row.id, row.status]))
+      ).toEqual(
+        new Map([
+          [paid.order.id, "COMPLETED"],
+          [unpaid.order.id, "CLOSED"],
+          [errored.order.id, "PAYMENT_FAILED"],
+          [noProvider.order.id, "PAYMENT_FAILED"],
+          [created.id, "CLOSED"]
+        ])
+      );
+    } finally {
+      await cleanupEntitlementTestUsers(userIds);
     }
   });
 
@@ -2961,8 +3288,26 @@ describe("atomic commerce orders and payments", () => {
       await expect(closeExpiredOrders(501)).rejects.toMatchObject({
         code: "INVALID_COMMERCE_INPUT"
       });
-      const firstBatch = await closeExpiredOrders(1);
-      const secondBatch = await closeExpiredOrders(1);
+      const cleanupProvider = {
+        channel: "fake" as const,
+        async createPayment() {
+          throw new Error("cleanup must not create");
+        },
+        async queryPayment() {
+          return null;
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      const closeBatch = () =>
+        reconcileAndCloseExpiredOrders({
+          provider: cleanupProvider,
+          limit: 1,
+          providerTimeoutMs: 100
+        });
+      const firstBatch = await closeBatch();
+      const secondBatch = await closeBatch();
       expect([...firstBatch, ...secondBatch].sort()).toEqual(
         [pending.order.id, failed.order.id].sort()
       );

@@ -8,6 +8,7 @@ export type CreatePaymentInput = {
   clientIp: string;
   returnUrl: string;
   notifyUrl: string;
+  signal: AbortSignal;
 };
 
 export type CreatedPayment = {
@@ -29,7 +30,10 @@ export type VerifiedPayment = {
 export interface PaymentProvider {
   readonly channel: PaymentChannel;
   createPayment(input: CreatePaymentInput): Promise<CreatedPayment>;
-  queryPayment(orderNo: string): Promise<VerifiedPayment | null>;
+  queryPayment(
+    orderNo: string,
+    signal: AbortSignal
+  ): Promise<VerifiedPayment | null>;
   refund(input: {
     orderNo: string;
     refundNo: string;

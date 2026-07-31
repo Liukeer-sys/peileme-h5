@@ -113,7 +113,10 @@ export class FakePaymentProvider implements PaymentProvider {
     return verified;
   }
 
-  async queryPayment(orderNo: string) {
+  async queryPayment(orderNo: string, signal: AbortSignal) {
+    if (signal.aborted) {
+      throw new Error("Fake payment query aborted");
+    }
     return this.completed.get(orderNo) ?? null;
   }
 

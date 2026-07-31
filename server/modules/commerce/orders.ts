@@ -711,7 +711,12 @@ export const closeExpiredOrdersInTransaction = async (
     `SELECT id
      FROM orders
      WHERE expires_at <= now()
-       AND status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED')
+       AND status = 'CREATED'
+       AND NOT EXISTS (
+         SELECT 1
+         FROM payment_attempts
+         WHERE payment_attempts.order_id = orders.id
+       )
      ORDER BY expires_at, id
      LIMIT $1
      FOR UPDATE SKIP LOCKED`,
@@ -746,6 +751,51 @@ export const closeExpiredOrders = async (limit = 200) => {
   );
 };
 
+type ExpiredCloseCandidate = {
+  id: string;
+  status: OrderStatus;
+};
+
+const closeExpiredCandidatesInTransaction = async (
+  client: pg.PoolClient,
+  candidates: ExpiredCloseCandidate[]
+) => {
+  if (!candidates.length) return [];
+  const result = await client.query<{ id: string }>(
+    `WITH expected(id, status) AS (
+       SELECT *
+       FROM unnest($1::uuid[], $2::text[])
+     ),
+     locked AS (
+       SELECT o.id
+       FROM orders o
+       JOIN expected e
+         ON e.id = o.id
+        AND e.status = o.status
+       WHERE o.expires_at <= now()
+       FOR UPDATE OF o SKIP LOCKED
+     ),
+     closed_attempts AS (
+       UPDATE payment_attempts
+       SET status = 'CLOSED',
+           updated_at = now()
+       WHERE order_id IN (SELECT id FROM locked)
+         AND status IN ('CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED')
+     )
+     UPDATE orders
+     SET status = 'CLOSED',
+         closed_at = now(),
+         updated_at = now()
+     WHERE id IN (SELECT id FROM locked)
+     RETURNING id`,
+    [
+      candidates.map((candidate) => candidate.id),
+      candidates.map((candidate) => candidate.status)
+    ]
+  );
+  return result.rows.map((row) => row.id);
+};
+
 export type PaymentStartResult = {
   orderId: string;
   orderNo: string;
@@ -769,27 +819,166 @@ type FailedPaymentRecovery = {
   orderId: string;
   orderNo: string;
   attemptId: string;
-  expiresAt: Date;
+  orderStatus: OrderStatus;
+  attemptErrorCode: string | null;
+  attemptUpdatedAt: Date;
 };
 
+class PaymentProviderTimeoutError extends Error {
+  constructor() {
+    super("Payment provider timeout");
+    this.name = "PaymentProviderTimeoutError";
+  }
+}
+
 const withPaymentProviderTimeout = async <T>(
-  operation: Promise<T>,
+  operation: (signal: AbortSignal) => Promise<T>,
   timeoutMs: number
 ) => {
+  const controller = new AbortController();
   let timer: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([
-      operation,
+      operation(controller.signal),
       new Promise<T>((_resolve, reject) => {
-        timer = setTimeout(
-          () => reject(new Error("Payment provider timeout")),
-          timeoutMs
-        );
+        timer = setTimeout(() => {
+          reject(new PaymentProviderTimeoutError());
+          controller.abort();
+        }, timeoutMs);
       })
     ]);
   } finally {
     if (timer) clearTimeout(timer);
   }
+};
+
+export const reconcileAndCloseExpiredOrders = async (input: {
+  provider?: PaymentProvider;
+  limit?: number;
+  providerTimeoutMs?: number;
+  onClosed?: (
+    client: pg.PoolClient,
+    closedOrderIds: string[]
+  ) => Promise<void>;
+}) => {
+  const limit = input.limit ?? 200;
+  const providerTimeoutMs = input.providerTimeoutMs ?? 15_000;
+  if (
+    !Number.isInteger(limit) ||
+    limit < 1 ||
+    limit > 500 ||
+    !Number.isInteger(providerTimeoutMs) ||
+    providerTimeoutMs < 1 ||
+    providerTimeoutMs > 60_000
+  ) {
+    throw new CommerceError("INVALID_COMMERCE_INPUT");
+  }
+  const candidates = await query<{
+    id: string;
+    order_no: string;
+    status: OrderStatus;
+    attempt_id: string | null;
+    attempt_channel: PaymentChannel | null;
+  }>(
+    `SELECT
+       o.id,
+       o.order_no,
+       o.status,
+       attempt.id AS attempt_id,
+       attempt.channel AS attempt_channel
+     FROM orders o
+     LEFT JOIN LATERAL (
+       SELECT id, channel
+       FROM payment_attempts
+       WHERE order_id = o.id
+       ORDER BY created_at DESC, id DESC
+       LIMIT 1
+     ) attempt ON true
+     WHERE o.expires_at <= now()
+       AND o.status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED')
+       AND (
+         ($2::text IS NULL AND attempt.id IS NULL)
+         OR (
+           $2::text IS NOT NULL
+           AND (attempt.id IS NULL OR attempt.channel = $2)
+         )
+       )
+     ORDER BY o.expires_at, o.id
+     LIMIT $1`,
+    [limit, input.provider?.channel ?? null]
+  );
+  const reconciled = new Array<ExpiredCloseCandidate | undefined>(
+    candidates.rows.length
+  );
+  let nextCandidateIndex = 0;
+  const reconcileCandidate = async (candidateIndex: number) => {
+    const candidate = candidates.rows[candidateIndex];
+    if (!candidate.attempt_id) {
+      if (candidate.status === "CREATED") {
+        reconciled[candidateIndex] = {
+          id: candidate.id,
+          status: candidate.status
+        };
+      }
+      return;
+    }
+    if (
+      !input.provider ||
+      candidate.attempt_channel !== input.provider.channel
+    ) {
+      return;
+    }
+    let verified: VerifiedPayment | null;
+    try {
+      verified = await withPaymentProviderTimeout(
+        (signal) =>
+          input.provider!.queryPayment(candidate.order_no, signal),
+        providerTimeoutMs
+      );
+    } catch {
+      return;
+    }
+    if (verified) {
+      try {
+        await markOrderPaid({
+          orderId: candidate.id,
+          paymentAttemptId: candidate.attempt_id,
+          verified
+        });
+      } catch {
+        // A callback or another reconciliation may have won the race.
+      }
+      return;
+    }
+    reconciled[candidateIndex] = {
+      id: candidate.id,
+      status: candidate.status
+    };
+  };
+  const workers = Array.from(
+    { length: Math.min(10, candidates.rows.length) },
+    async () => {
+      while (nextCandidateIndex < candidates.rows.length) {
+        const candidateIndex = nextCandidateIndex;
+        nextCandidateIndex += 1;
+        await reconcileCandidate(candidateIndex);
+      }
+    }
+  );
+  await Promise.all(workers);
+  const safeToClose = reconciled.filter(
+    (candidate): candidate is ExpiredCloseCandidate =>
+      candidate !== undefined
+  );
+
+  return withTransaction(async (client) => {
+    const closedOrderIds =
+      await closeExpiredCandidatesInTransaction(client, safeToClose);
+    if (input.onClosed) {
+      await input.onClosed(client, closedOrderIds);
+    }
+    return closedOrderIds;
+  });
 };
 
 const getFailedPaymentRecovery = async (
@@ -801,16 +990,20 @@ const getFailedPaymentRecovery = async (
     id: string;
     order_no: string;
     attempt_id: string;
-    expires_at: Date;
+    status: OrderStatus;
+    error_code: string | null;
+    attempt_updated_at: Date;
   }>(
     `SELECT
        o.id,
        o.order_no,
        attempt.id AS attempt_id,
-       o.expires_at
+       o.status,
+       attempt.error_code,
+       attempt.updated_at AS attempt_updated_at
      FROM orders o
      JOIN LATERAL (
-       SELECT id
+       SELECT id, error_code, updated_at
        FROM payment_attempts
        WHERE order_id = o.id
          AND channel = $3
@@ -819,7 +1012,7 @@ const getFailedPaymentRecovery = async (
      ) attempt ON true
      WHERE o.id = $1
        AND o.user_id = $2
-       AND o.status = 'PAYMENT_FAILED'`,
+       AND o.status IN ('PAYMENT_FAILED', 'CLOSED')`,
     [orderId, userId, channel]
   );
   const row = result.rows[0];
@@ -828,7 +1021,9 @@ const getFailedPaymentRecovery = async (
         orderId: row.id,
         orderNo: row.order_no,
         attemptId: row.attempt_id,
-        expiresAt: row.expires_at
+        orderStatus: row.status,
+        attemptErrorCode: row.error_code,
+        attemptUpdatedAt: row.attempt_updated_at
       }
     : undefined;
 };
@@ -1026,7 +1221,11 @@ export const startPayment = async (
     let verified: VerifiedPayment | null;
     try {
       verified = await withPaymentProviderTimeout(
-        input.provider.queryPayment(failedRecovery.orderNo),
+        (signal) =>
+          input.provider.queryPayment(
+            failedRecovery.orderNo,
+            signal
+          ),
         providerTimeoutMs
       );
     } catch {
@@ -1047,6 +1246,16 @@ export const startPayment = async (
         expiresAt: completed.expiresAt
       };
     }
+    if (failedRecovery.orderStatus === "CLOSED") {
+      throw new CommerceError("ORDER_STATE_CONFLICT");
+    }
+    if (
+      failedRecovery.attemptErrorCode === "PAYMENT_PROVIDER_TIMEOUT" &&
+      failedRecovery.attemptUpdatedAt.getTime() >
+        Date.now() - 120_000
+    ) {
+      throw new CommerceError("PAYMENT_INITIALIZING");
+    }
   }
   const prepared = await preparePayment(
     userId,
@@ -1060,15 +1269,17 @@ export const startPayment = async (
 
   try {
     const created = await withPaymentProviderTimeout(
-      input.provider.createPayment({
-        attemptId: prepared.attemptId,
-        orderNo: prepared.order.orderNo,
-        description: prepared.order.productName,
-        amountFen: prepared.order.amountFen,
-        clientIp: input.clientIp,
-        returnUrl: input.returnUrl,
-        notifyUrl: input.notifyUrl
-      }),
+      (signal) =>
+        input.provider.createPayment({
+          attemptId: prepared.attemptId,
+          orderNo: prepared.order.orderNo,
+          description: prepared.order.productName,
+          amountFen: prepared.order.amountFen,
+          clientIp: input.clientIp,
+          returnUrl: input.returnUrl,
+          notifyUrl: input.notifyUrl,
+          signal
+        }),
       providerTimeoutMs
     );
     if (!created.launchUrl.trim()) {
@@ -1146,12 +1357,14 @@ export const startPayment = async (
       };
     });
   } catch (error) {
+    const providerTimedOut =
+      error instanceof PaymentProviderTimeoutError;
     await withTransaction(async (client) => {
       await client.query(
         `WITH failed_attempt AS (
            UPDATE payment_attempts
            SET status = 'FAILED',
-               error_code = 'PAYMENT_PROVIDER_FAILED',
+               error_code = $3,
                error_message = '支付渠道暂时不可用',
                updated_at = now()
            WHERE id = $1
@@ -1164,7 +1377,13 @@ export const startPayment = async (
              updated_at = now()
          WHERE id IN (SELECT order_id FROM failed_attempt)
            AND status = 'PAYING'`,
-        [prepared.attemptId, prepared.generation]
+        [
+          prepared.attemptId,
+          prepared.generation,
+          providerTimedOut
+            ? "PAYMENT_PROVIDER_TIMEOUT"
+            : "PAYMENT_PROVIDER_FAILED"
+        ]
       );
     });
     if (error instanceof CommerceError) throw error;

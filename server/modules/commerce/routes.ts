@@ -3,7 +3,7 @@ import { z } from "zod";
 import { writeAdminAudit } from "../../audit.js";
 import { ApiError } from "../../errors.js";
 import { getConfig } from "../../config.js";
-import { query, withTransaction } from "../../db.js";
+import { query } from "../../db.js";
 import {
   requireAdmin,
   requireAuth,
@@ -12,12 +12,12 @@ import {
 import { getActiveCatalog } from "./catalog.js";
 import {
   closeExpiredOrders,
-  closeExpiredOrdersInTransaction,
   createInvoiceRequest,
   createOrder,
   getOwnedOrder,
   listOwnedOrders,
   markOrderPaid,
+  reconcileAndCloseExpiredOrders,
   startPayment
 } from "./orders.js";
 import {
@@ -292,24 +292,23 @@ export const createCommerceRouters = (
           })
           .strict()
           .parse(request.body);
-        const closedOrderIds = await withTransaction(async (client) => {
-          const ids = await closeExpiredOrdersInTransaction(
-            client,
-            body.limit
-          );
-          await writeAdminAudit(
-            request,
-            "commerce.orders.close_expired",
-            "orders",
-            undefined,
-            {
-              limit: body.limit,
-              closedCount: ids.length,
-              closedOrderIds: ids
-            },
-            client
-          );
-          return ids;
+        const closedOrderIds = await reconcileAndCloseExpiredOrders({
+          provider: paymentProvider,
+          limit: body.limit,
+          onClosed: async (client, ids) => {
+            await writeAdminAudit(
+              request,
+              "commerce.orders.close_expired",
+              "orders",
+              undefined,
+              {
+                limit: body.limit,
+                closedCount: ids.length,
+                closedOrderIds: ids
+              },
+              client
+            );
+          }
         });
         response.json({
           closedCount: closedOrderIds.length,
