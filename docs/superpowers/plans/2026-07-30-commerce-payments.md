@@ -16,7 +16,7 @@
 
 ### Create
 
-- `database/migrations/003_commerce.sql` — catalog, prices, promotions, orders, payment attempts, transactions, refunds, entitlements, reconciliation and invoices.
+- `database/migrations/008_commerce.sql` — catalog, prices, promotions, orders, payment attempts, transactions, refunds, entitlements, reconciliation and invoices.
 - `server/modules/commerce/types.ts` — SKU, order, entitlement and channel contracts.
 - `server/modules/commerce/catalog.ts` — effective price and product availability.
 - `server/modules/commerce/entitlements.ts` — grant, reserve, consume, release and free-use eligibility.
@@ -41,7 +41,7 @@
 ### Modify
 
 - `package.json` / `package-lock.json` — Alipay SDK and commerce scripts.
-- `database/migrations/002_policy_foundation.sql` — no edit after application; Plan 2 uses migration 003 only.
+- `database/migrations/007_policy_rule_regressions.sql` — no edit after application; Plan 2 starts with migration 008 only.
 - `server/config.ts` — channel credentials, callback URLs and payment mode.
 - `server/app.ts` — raw webhook mounting and commerce routers.
 - `server/modules/policy/routes.ts` — entitlement gate before calculation.
@@ -54,10 +54,10 @@
 - `.env.example` — payment secrets and URLs.
 - `docker-compose.yml` — payment configuration and scheduled job entry.
 
-## Task 1: Add commerce persistence and seed the three SKUs
+## Task 1: Add commerce persistence and seed the two active SKUs
 
 **Files:**
-- Create: `database/migrations/003_commerce.sql`
+- Create: `database/migrations/008_commerce.sql`
 - Create: `server/modules/commerce/types.ts`
 - Modify: `server/modules/policy/seed.ts`
 - Test: `server/tests/commerce.test.ts`
@@ -65,7 +65,7 @@
 - [ ] **Step 1: Write the failing catalog test**
 
 ```ts
-it("seeds the three per-use products and their default prices", async () => {
+it("seeds the two active per-use products and their default prices", async () => {
   await seedPolicyFoundation();
   const result = await query<{ sku: string; amount_fen: string }>(
     `SELECT p.sku, pp.amount_fen
@@ -75,7 +75,6 @@ it("seeds the three per-use products and their default prices", async () => {
       ORDER BY p.sku`
   );
   expect(result.rows).toEqual([
-    { sku: "AI_DOCUMENT_REVIEW", amount_fen: "2990" },
     { sku: "AI_SEVERANCE_ANALYSIS", amount_fen: "3990" },
     { sku: "POLICY_CALC", amount_fen: "990" }
   ]);
@@ -95,7 +94,7 @@ Expected: FAIL because `products` does not exist.
 
 - [ ] **Step 3: Create the migration**
 
-Create `database/migrations/003_commerce.sql`:
+Create `database/migrations/008_commerce.sql`:
 
 ```sql
 CREATE TABLE products (
@@ -105,7 +104,7 @@ CREATE TABLE products (
   description TEXT NOT NULL,
   product_channel TEXT NOT NULL CHECK (product_channel IN ('main', 'ai', 'all')),
   fulfillment_type TEXT NOT NULL CHECK (
-    fulfillment_type IN ('policy_calculation', 'ai_analysis', 'document_review')
+    fulfillment_type IN ('policy_calculation', 'ai_analysis')
   ),
   status TEXT NOT NULL CHECK (status IN ('active', 'inactive')),
   entitlement_policy JSONB NOT NULL,
@@ -299,8 +298,7 @@ Create `server/modules/commerce/types.ts`:
 ```ts
 export const productSkus = [
   "POLICY_CALC",
-  "AI_SEVERANCE_ANALYSIS",
-  "AI_DOCUMENT_REVIEW"
+  "AI_SEVERANCE_ANALYSIS"
 ] as const;
 export type ProductSku = typeof productSkus[number];
 
@@ -314,7 +312,7 @@ export type PaymentChannel = "wechat_h5" | "alipay_wap" | "fake";
 
 - [ ] **Step 5: Seed products, prices and first-free promotion**
 
-Extend `seedPolicyFoundation()` with one transaction that upserts the three products and inserts an open price only when one does not exist. Insert promotion `FIRST_POLICY_CALC` for `POLICY_CALC`, `grant_count = 1`, `trigger_type = first_verified_user`.
+Extend `seedPolicyFoundation()` with one transaction that upserts the two active products and inserts an open price only when one does not exist. Insert promotion `FIRST_POLICY_CALC` for `POLICY_CALC`, `grant_count = 1`, `trigger_type = first_verified_user`. Do not recreate the removed file-signing/document-review product.
 
 - [ ] **Step 6: Run the test**
 
@@ -329,7 +327,7 @@ Expected: catalog seed test passes.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add database/migrations/003_commerce.sql server/modules/commerce server/modules/policy/seed.ts server/tests/commerce.test.ts
+git add database/migrations/008_commerce.sql server/modules/commerce server/modules/policy/seed.ts server/tests/commerce.test.ts
 git commit -m "feat: add per-use commerce schema and catalog"
 ```
 
