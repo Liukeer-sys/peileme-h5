@@ -8,6 +8,12 @@ type TruncatedEvidence = {
   _sha256: string;
 };
 
+type OmittedEvidence = {
+  _truncated: true;
+  _reason: "evidence_limits_exceeded";
+  _digest_status: "omitted_safety_limit";
+};
+
 const hashOf = (input: unknown) => {
   const sanitized = sanitizePaymentEvidence(input);
   expect(sanitized).toMatchObject({
@@ -22,6 +28,16 @@ const expectDistinctStableHashes = (left: unknown, right: unknown) => {
   const first = hashOf(left);
   expect(hashOf(left)).toBe(first);
   expect(hashOf(right)).not.toBe(first);
+};
+
+const expectDigestOmitted = (input: unknown) => {
+  const sanitized = sanitizePaymentEvidence(input);
+  expect(sanitized).toEqual({
+    _truncated: true,
+    _reason: "evidence_limits_exceeded",
+    _digest_status: "omitted_safety_limit"
+  } satisfies OmittedEvidence);
+  expect(sanitized).not.toHaveProperty("_sha256");
 };
 
 describe("payment evidence full-content digest", () => {
@@ -539,6 +555,18 @@ describe("payment evidence full-content digest", () => {
       identity_no: "identity-secret",
       passphrase: "passphrase-secret",
       cvv: "cvv-secret",
+      clientIPAddress: "client-ip-secret",
+      spbillCreateIPAddress: "spbill-ip-secret",
+      card_no: "card-no-secret",
+      cardNo: "camel-card-no-secret",
+      pan: "pan-secret",
+      bankcardno: "bank-card-no-secret",
+      bankCardNo: "camel-bank-card-no-secret",
+      acct_no: "acct-no-secret",
+      acctNo: "camel-acct-no-secret",
+      account: "account-secret",
+      account_id: "account-id-secret",
+      user_account: "user-account-secret",
       microphone_status: "enabled",
       tokenization_status: "complete",
       name: "provider-audit",
@@ -551,6 +579,131 @@ describe("payment evidence full-content digest", () => {
       name: "provider-audit",
       key: "provider-audit-key"
     });
+  });
+
+  it("redacts sensitive values before hashing without reading accessors", () => {
+    const withCvv = (cvv: string, status = "accepted") => ({
+      oversized: "x".repeat(5_000),
+      nested: { cvv, status }
+    });
+
+    expect(hashOf(withCvv("cvv123"))).toBe(hashOf(withCvv("cvv124")));
+    expect(hashOf(withCvv("cvv123", "accepted"))).not.toBe(
+      hashOf(withCvv("cvv123", "declined"))
+    );
+
+    let getterCalls = 0;
+    const nested = { status: "accepted" } as Record<string, unknown>;
+    Object.defineProperty(nested, "cvv", {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        return "must-never-be-read";
+      }
+    });
+    hashOf({ oversized: "x".repeat(5_000), nested });
+    expect(getterCalls).toBe(0);
+  });
+
+  it("hashes every one of 6001 own keys without sampling", () => {
+    const makeEvidence = (middle: string) =>
+      Object.fromEntries(
+        Array.from({ length: 6_001 }, (_, index) => [
+          `field${String(index).padStart(4, "0")}`,
+          index === 3_000 ? middle : index
+        ])
+      );
+
+    expectDistinctStableHashes(makeEvidence("A"), makeEvidence("B"));
+  });
+
+  it("hashes every one of 5001 Map entries without sampling", () => {
+    const makeEvidence = (last: string) =>
+      new Map(
+        Array.from({ length: 5_001 }, (_, index) => [
+          `entry${String(index).padStart(4, "0")}`,
+          index === 5_000 ? last : index
+        ])
+      );
+
+    expectDistinctStableHashes(makeEvidence("A"), makeEvidence("B"));
+  });
+
+  it("hashes every one of 5001 actually-present sparse indices", () => {
+    const makeEvidence = (middle: string) => {
+      const evidence = new Array<unknown>(10_001);
+      for (let ordinal = 0; ordinal < 5_001; ordinal += 1) {
+        evidence[ordinal * 2] = ordinal === 2_500 ? middle : ordinal;
+      }
+      return evidence;
+    };
+
+    expectDistinctStableHashes(makeEvidence("A"), makeEvidence("B"));
+  });
+
+  it("omits digests at explicit string and binary safety limits", () => {
+    expectDigestOmitted({ message: "x".repeat(262_145) });
+    expectDigestOmitted({
+      oversized: "x".repeat(5_000),
+      bytes: new Uint8Array(1_048_577)
+    });
+    expectDigestOmitted({
+      oversized: "x".repeat(5_000),
+      bytes: new ArrayBuffer(1_048_577)
+    });
+  });
+
+  it("omits digests at explicit byte, node and depth safety limits", () => {
+    expectDigestOmitted({
+      chunks: [
+        "a".repeat(200_000),
+        "b".repeat(200_000),
+        "c".repeat(200_000)
+      ]
+    });
+    expectDigestOmitted({
+      values: Array.from({ length: 100_001 }, () => null)
+    });
+
+    const deep: Record<string, unknown> = {};
+    let cursor = deep;
+    for (let depth = 0; depth < 65; depth += 1) {
+      const next: Record<string, unknown> = {};
+      cursor.next = next;
+      cursor = next;
+    }
+    expectDigestOmitted(deep);
+  });
+
+  it("preserves every normalized key collision with conflict-free suffixes", () => {
+    const evidence = Object.create(null) as Record<string, unknown>;
+    for (const [key, value] of [
+      ["collision\0key", "nul"],
+      ["collision\ud800key", "surrogate"],
+      ["collision�key", "replacement"],
+      ["collision�key~normalized-2", "pre-existing-suffix"],
+      ["__proto__", "prototype-safe"]
+    ] as const) {
+      Object.defineProperty(evidence, key, { value, enumerable: true });
+    }
+
+    const sanitized = sanitizePaymentEvidence(evidence) as Record<
+      string,
+      unknown
+    >;
+    expect(Object.getPrototypeOf(sanitized)).toBeNull();
+    expect(Object.values(sanitized)).toHaveLength(5);
+    expect(new Set(Object.values(sanitized))).toEqual(
+      new Set([
+        "nul",
+        "surrogate",
+        "replacement",
+        "pre-existing-suffix",
+        "prototype-safe"
+      ])
+    );
+    expect(Object.prototype.polluted).toBeUndefined();
+    expect(sanitizePaymentEvidence(evidence)).toEqual(sanitized);
   });
 
   it("does not execute getters on proxy-provided descriptor objects", () => {

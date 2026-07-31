@@ -83,9 +83,11 @@ const MAX_OBJECT_KEYS = 100;
 const MAX_STRING_BYTES = 2_048;
 const MAX_NODES = 1_000;
 const MAX_JSON_BYTES = 32_768;
-const MAX_HASH_STEPS = 100_000;
-const MAX_HASH_OWN_KEYS = 5_000;
-const MAX_HASH_COLLECTION_ITEMS = 5_000;
+const MAX_DIGEST_BYTES = 1_048_576;
+const MAX_DIGEST_NODES = 100_000;
+const MAX_DIGEST_DEPTH = 64;
+const MAX_DIGEST_STRING_CODE_UNITS = 262_144;
+const MAX_DIGEST_BINARY_BYTES = 1_048_576;
 
 const sensitiveKeySegments = new Set([
   "authorization",
@@ -111,7 +113,9 @@ const sensitiveKeySegments = new Set([
   "cvc",
   "cvc2",
   "pin",
-  "passphrase"
+  "passphrase",
+  "pan",
+  "account"
 ]);
 
 const sensitiveKeySequences = [
@@ -130,6 +134,9 @@ const sensitiveKeySequences = [
   ["id", "no"],
   ["bank", "card"],
   ["card", "number"],
+  ["card", "no"],
+  ["bank", "card", "no"],
+  ["acct", "no"],
   ["account", "number"],
   ["account", "no"],
   ["private", "certificate"],
@@ -143,7 +150,9 @@ const sensitiveKeySequences = [
   ["cert", "no"],
   ["cert", "number"],
   ["client", "ip"],
-  ["spbill", "create", "ip"]
+  ["client", "ip", "address"],
+  ["spbill", "create", "ip"],
+  ["spbill", "create", "ip", "address"]
 ] as const;
 
 const compactSensitiveKeys = new Set(
@@ -215,16 +224,18 @@ const isOpaqueProxy = (value: object) => {
   }
 };
 
-const hashEvidence = (input: unknown) => {
+const hashEvidenceUnchecked = (input: unknown): string | null => {
   const hash = createHash("sha256");
   const seen = new WeakMap<object, number>();
   let nextObjectId = 0;
-  let hashSteps = 0;
+  let digestBytes = 0;
+  let digestNodes = 0;
+  let safetyLimitExceeded = false;
 
   type HashBytes = string | Uint8Array;
   type OwnPropertyMode = "all" | "array-properties" | "typed-array-extras";
   type HashTask =
-    | { kind: "value"; value: unknown }
+    | { kind: "value"; value: unknown; depth: number }
     | { kind: "token"; tag: string; data?: HashBytes }
     | {
         kind: "own-properties";
@@ -232,15 +243,27 @@ const hashEvidence = (input: unknown) => {
         objectId: number;
         mode: OwnPropertyMode;
         indexedLength: number;
+        depth: number;
       };
 
   const writeToken = (tag: string, data: HashBytes = "") => {
+    if (safetyLimitExceeded) return;
     const tagBytes = Buffer.byteLength(tag, "utf8");
+    const dataBytes =
+      typeof data === "string" ? data.length * 2 : data.byteLength;
+    if (
+      (typeof data === "string" &&
+        data.length > MAX_DIGEST_STRING_CODE_UNITS) ||
+      (typeof data !== "string" &&
+        data.byteLength > MAX_DIGEST_BINARY_BYTES) ||
+      digestBytes + tagBytes + dataBytes > MAX_DIGEST_BYTES
+    ) {
+      safetyLimitExceeded = true;
+      return;
+    }
+    digestBytes += tagBytes + dataBytes;
     const encodedData =
-      typeof data === "string"
-        ? Buffer.from(data, "utf16le")
-        : data;
-    const dataBytes = encodedData.byteLength;
+      typeof data === "string" ? Buffer.from(data, "utf16le") : data;
     hash.update(`T${tagBytes}:`, "utf8");
     hash.update(tag, "utf8");
     hash.update(`D${dataBytes}:`, "utf8");
@@ -252,20 +275,26 @@ const hashEvidence = (input: unknown) => {
     tag,
     data
   });
-  const valueTask = (value: unknown): HashTask => ({ kind: "value", value });
+  const valueTask = (value: unknown, depth: number): HashTask => ({
+    kind: "value",
+    value,
+    depth
+  });
   const ownPropertiesTask = (
     value: object,
     objectId: number,
     mode: OwnPropertyMode = "all",
-    indexedLength = 0
+    indexedLength = 0,
+    depth = 0
   ): HashTask => ({
     kind: "own-properties",
     value,
     objectId,
     mode,
-    indexedLength
+    indexedLength,
+    depth
   });
-  const tasks: HashTask[] = [valueTask(input)];
+  const tasks: HashTask[] = [valueTask(input, 0)];
 
   const readOwnDataValue = (
     container: unknown,
@@ -302,7 +331,8 @@ const hashEvidence = (input: unknown) => {
     value: object,
     objectId: number,
     mode: OwnPropertyMode,
-    indexedLength: number
+    indexedLength: number,
+    depth: number
   ) => {
     let ownKeys: PropertyKey[];
     try {
@@ -316,19 +346,11 @@ const hashEvidence = (input: unknown) => {
       if (mode === "all") return true;
       return !isProcessedIndexKey(key, indexedLength);
     });
-    let budgetedKeys = filteredKeys;
-    if (filteredKeys.length > MAX_HASH_OWN_KEYS) {
-      const halfBudget = Math.floor(MAX_HASH_OWN_KEYS / 2);
-      budgetedKeys = [
-        ...filteredKeys.slice(0, halfBudget),
-        ...filteredKeys.slice(-halfBudget)
-      ];
-      writeToken(
-        "own-properties-budget-exceeded",
-        `${objectId}:${filteredKeys.length}`
-      );
+    if (filteredKeys.length > MAX_DIGEST_NODES) {
+      safetyLimitExceeded = true;
+      return;
     }
-    const sortedKeys = budgetedKeys
+    const sortedKeys = filteredKeys
       .map((key, ordinal) => ({
         key,
         ordinal,
@@ -344,11 +366,15 @@ const hashEvidence = (input: unknown) => {
       );
     writeToken(
       "own-properties-start",
-      `${objectId}:${filteredKeys.length}:${sortedKeys.length}`
+      `${objectId}:${filteredKeys.length}`
     );
     tasks.push(token("own-properties-end"));
     for (let index = sortedKeys.length - 1; index >= 0; index -= 1) {
       const { key, label } = sortedKeys[index];
+      if (typeof key === "string" && isSensitiveKey(key)) {
+        tasks.push(token("property-redacted", `${label}:REDACTED`));
+        continue;
+      }
       let descriptor: PropertyDescriptor | undefined;
       try {
         descriptor = Object.getOwnPropertyDescriptor(value, key);
@@ -361,7 +387,7 @@ const hashEvidence = (input: unknown) => {
         continue;
       }
       if ("value" in descriptor) {
-        tasks.push(valueTask(descriptor.value));
+        tasks.push(valueTask(descriptor.value, depth + 1));
         tasks.push(token("property-key", label));
       } else {
         tasks.push(
@@ -374,12 +400,7 @@ const hashEvidence = (input: unknown) => {
     }
   };
 
-  while (tasks.length > 0) {
-    hashSteps += 1;
-    if (hashSteps > MAX_HASH_STEPS) {
-      writeToken("hash-step-budget-exceeded", String(tasks.length));
-      break;
-    }
+  while (tasks.length > 0 && !safetyLimitExceeded) {
     const task = tasks.pop()!;
     if (task.kind === "token") {
       writeToken(task.tag, task.data);
@@ -390,11 +411,20 @@ const hashEvidence = (input: unknown) => {
         task.value,
         task.objectId,
         task.mode,
-        task.indexedLength
+        task.indexedLength,
+        task.depth
       );
       continue;
     }
     const value = task.value;
+    digestNodes += 1;
+    if (
+      digestNodes > MAX_DIGEST_NODES ||
+      task.depth > MAX_DIGEST_DEPTH
+    ) {
+      safetyLimitExceeded = true;
+      continue;
+    }
     if (value === null) {
       writeToken("null");
       continue;
@@ -452,16 +482,19 @@ const hashEvidence = (input: unknown) => {
 
     const mapSize = probeIntrinsic<number>(mapSizeIntrinsic, value);
     if (mapSize.matched) {
+      if (mapSize.value > MAX_DIGEST_NODES) {
+        safetyLimitExceeded = true;
+        continue;
+      }
       writeToken("map-start", `${objectId}:${mapSize.value}`);
-      const entries: Array<[unknown, unknown]> = [];
+      const entries: Array<
+        | { key: unknown; value: unknown; redacted: false }
+        | { key: string; redacted: true }
+      > = [];
       let collectionReadable = true;
       try {
         const iterator = callIntrinsic<object>(mapEntriesIntrinsic, value);
-        const itemBudget = Math.min(
-          mapSize.value,
-          MAX_HASH_COLLECTION_ITEMS
-        );
-        for (let index = 0; index < itemBudget; index += 1) {
+        for (let index = 0; index < mapSize.value; index += 1) {
           const step = callIntrinsic<object>(mapIteratorNextIntrinsic, iterator);
           const done = readOwnDataValue(step, "done");
           if (!done.ok) {
@@ -475,30 +508,45 @@ const hashEvidence = (input: unknown) => {
             break;
           }
           const keyResult = readOwnDataValue(pairResult.value, "0");
-          const valueResult = readOwnDataValue(pairResult.value, "1");
-          if (!keyResult.ok || !valueResult.ok) {
+          if (!keyResult.ok) {
             collectionReadable = false;
             break;
           }
-          entries.push([keyResult.value, valueResult.value]);
+          if (
+            typeof keyResult.value === "string" &&
+            isSensitiveKey(keyResult.value)
+          ) {
+            entries.push({ key: keyResult.value, redacted: true });
+            continue;
+          }
+          const valueResult = readOwnDataValue(pairResult.value, "1");
+          if (!valueResult.ok) {
+            collectionReadable = false;
+            break;
+          }
+          entries.push({
+            key: keyResult.value,
+            value: valueResult.value,
+            redacted: false
+          });
         }
       } catch {
         collectionReadable = false;
       }
       tasks.push(token("map-end"));
-      tasks.push(ownPropertiesTask(value, objectId));
+      tasks.push(ownPropertiesTask(value, objectId, "all", 0, task.depth));
       if (!collectionReadable) {
         tasks.push(token("map-iterator-unreadable"));
-      } else if (mapSize.value > MAX_HASH_COLLECTION_ITEMS) {
-        tasks.push(
-          token("map-item-budget-exceeded", String(mapSize.value))
-        );
       }
       for (let index = entries.length - 1; index >= 0; index -= 1) {
-        const [entryKey, entryValue] = entries[index];
+        const entry = entries[index];
         tasks.push(token("map-entry-end", String(index)));
-        tasks.push(valueTask(entryValue));
-        tasks.push(valueTask(entryKey));
+        if (entry.redacted) {
+          tasks.push(token("map-entry-redacted", "REDACTED"));
+        } else {
+          tasks.push(valueTask(entry.value, task.depth + 1));
+        }
+        tasks.push(valueTask(entry.key, task.depth + 1));
         tasks.push(token("map-entry-start", String(index)));
       }
       continue;
@@ -506,16 +554,16 @@ const hashEvidence = (input: unknown) => {
 
     const setSize = probeIntrinsic<number>(setSizeIntrinsic, value);
     if (setSize.matched) {
+      if (setSize.value > MAX_DIGEST_NODES) {
+        safetyLimitExceeded = true;
+        continue;
+      }
       writeToken("set-start", `${objectId}:${setSize.value}`);
       const entries: unknown[] = [];
       let collectionReadable = true;
       try {
         const iterator = callIntrinsic<object>(setValuesIntrinsic, value);
-        const itemBudget = Math.min(
-          setSize.value,
-          MAX_HASH_COLLECTION_ITEMS
-        );
-        for (let index = 0; index < itemBudget; index += 1) {
+        for (let index = 0; index < setSize.value; index += 1) {
           const step = callIntrinsic<object>(setIteratorNextIntrinsic, iterator);
           const done = readOwnDataValue(step, "done");
           if (!done.ok) {
@@ -534,17 +582,13 @@ const hashEvidence = (input: unknown) => {
         collectionReadable = false;
       }
       tasks.push(token("set-end"));
-      tasks.push(ownPropertiesTask(value, objectId));
+      tasks.push(ownPropertiesTask(value, objectId, "all", 0, task.depth));
       if (!collectionReadable) {
         tasks.push(token("set-iterator-unreadable"));
-      } else if (setSize.value > MAX_HASH_COLLECTION_ITEMS) {
-        tasks.push(
-          token("set-item-budget-exceeded", String(setSize.value))
-        );
       }
       for (let index = entries.length - 1; index >= 0; index -= 1) {
         tasks.push(token("set-entry-end", String(index)));
-        tasks.push(valueTask(entries[index]));
+        tasks.push(valueTask(entries[index], task.depth + 1));
         tasks.push(token("set-entry-start", String(index)));
       }
       continue;
@@ -559,7 +603,7 @@ const hashEvidence = (input: unknown) => {
             ? "[Invalid Date]"
             : callIntrinsic<string>(dateToISOStringIntrinsic, value)
         );
-        tasks.push(ownPropertiesTask(value, objectId));
+        tasks.push(ownPropertiesTask(value, objectId, "all", 0, task.depth));
         continue;
       } catch {
         // Continue to the remaining brands and ordinary own-key handling.
@@ -613,6 +657,10 @@ const hashEvidence = (input: unknown) => {
           );
           viewName = callIntrinsic<string>(typedArrayTagIntrinsic, value);
         }
+        if (byteLength > MAX_DIGEST_BINARY_BYTES) {
+          safetyLimitExceeded = true;
+          continue;
+        }
         const viewBytes = new Uint8Array(
           viewBuffer,
           byteOffset,
@@ -625,7 +673,8 @@ const hashEvidence = (input: unknown) => {
             value,
             objectId,
             indexedLength > 0 ? "typed-array-extras" : "all",
-            indexedLength
+            indexedLength,
+            task.depth
           )
         );
         continue;
@@ -639,6 +688,10 @@ const hashEvidence = (input: unknown) => {
       value
     );
     if (arrayBufferByteLength.matched) {
+      if (arrayBufferByteLength.value > MAX_DIGEST_BINARY_BYTES) {
+        safetyLimitExceeded = true;
+        continue;
+      }
       try {
         const bufferBytes = new Uint8Array(
           value as ArrayBuffer,
@@ -646,7 +699,7 @@ const hashEvidence = (input: unknown) => {
           arrayBufferByteLength.value
         );
         writeToken("array-buffer", bufferBytes);
-        tasks.push(ownPropertiesTask(value, objectId));
+        tasks.push(ownPropertiesTask(value, objectId, "all", 0, task.depth));
         continue;
       } catch {
         // Continue to the remaining brands and ordinary own-key handling.
@@ -658,6 +711,10 @@ const hashEvidence = (input: unknown) => {
       value
     );
     if (sharedArrayBufferByteLength.matched) {
+      if (sharedArrayBufferByteLength.value > MAX_DIGEST_BINARY_BYTES) {
+        safetyLimitExceeded = true;
+        continue;
+      }
       try {
         const bufferBytes = new Uint8Array(
           value as SharedArrayBuffer,
@@ -665,7 +722,7 @@ const hashEvidence = (input: unknown) => {
           sharedArrayBufferByteLength.value
         );
         writeToken("shared-array-buffer", bufferBytes);
-        tasks.push(ownPropertiesTask(value, objectId));
+        tasks.push(ownPropertiesTask(value, objectId, "all", 0, task.depth));
         continue;
       } catch {
         // Continue to ordinary own-key handling.
@@ -703,21 +760,44 @@ const hashEvidence = (input: unknown) => {
       writeToken("array-start", `${objectId}:${arrayLength}`);
       tasks.push(token("array-end"));
       tasks.push(
-        ownPropertiesTask(value, objectId, "array-properties", arrayLength)
+        ownPropertiesTask(
+          value,
+          objectId,
+          "array-properties",
+          arrayLength,
+          task.depth
+        )
       );
       continue;
     }
     writeToken("object", String(objectId));
-    tasks.push(ownPropertiesTask(value, objectId));
+    tasks.push(ownPropertiesTask(value, objectId, "all", 0, task.depth));
   }
-  return hash.digest("hex");
+  return safetyLimitExceeded ? null : hash.digest("hex");
 };
 
-const truncatedEvidence = (input: unknown) => ({
-  _truncated: true,
-  _reason: "evidence_limits_exceeded",
-  _sha256: hashEvidence(input)
-});
+const hashEvidence = (input: unknown): string | null => {
+  try {
+    return hashEvidenceUnchecked(input);
+  } catch {
+    return null;
+  }
+};
+
+const truncatedEvidence = (input: unknown) => {
+  const digest = hashEvidence(input);
+  return digest === null
+    ? {
+        _truncated: true as const,
+        _reason: "evidence_limits_exceeded" as const,
+        _digest_status: "omitted_safety_limit" as const
+      }
+    : {
+        _truncated: true as const,
+        _reason: "evidence_limits_exceeded" as const,
+        _sha256: digest
+      };
+};
 
 export const sanitizePaymentEvidence = (input: unknown): unknown => {
   const seen = new WeakSet<object>();
@@ -733,7 +813,10 @@ export const sanitizePaymentEvidence = (input: unknown): unknown => {
     if (value === null) return null;
     switch (typeof value) {
       case "string":
-        if (Buffer.byteLength(value, "utf8") > MAX_STRING_BYTES) {
+        if (
+          value.length > MAX_DIGEST_STRING_CODE_UNITS ||
+          Buffer.byteLength(value, "utf8") > MAX_STRING_BYTES
+        ) {
           limitExceeded = true;
           return null;
         }
@@ -889,10 +972,33 @@ export const sanitizePaymentEvidence = (input: unknown): unknown => {
       limitExceeded = true;
       return null;
     }
+    const safeEntries = keys
+      .filter((key) => !isSensitiveKey(key))
+      .map((key) => ({ key, baseKey: sanitizePostgresText(key) }));
+    const reservedBaseKeys = new Set(
+      safeEntries.map(({ baseKey }) => baseKey)
+    );
+    const assignedKeys = new Set<string>();
+    const allocateSafeKey = (baseKey: string) => {
+      if (!assignedKeys.has(baseKey)) {
+        assignedKeys.add(baseKey);
+        return baseKey;
+      }
+      let ordinal = 2;
+      let candidate = `${baseKey}~normalized-${ordinal}`;
+      while (
+        assignedKeys.has(candidate) ||
+        reservedBaseKeys.has(candidate)
+      ) {
+        ordinal += 1;
+        candidate = `${baseKey}~normalized-${ordinal}`;
+      }
+      assignedKeys.add(candidate);
+      return candidate;
+    };
     const sanitized = Object.create(null) as Record<string, unknown>;
-    for (const key of keys) {
-      if (isSensitiveKey(key)) continue;
-      const safeKey = sanitizePostgresText(key);
+    for (const { key, baseKey } of safeEntries) {
+      const safeKey = allocateSafeKey(baseKey);
       let descriptor: PropertyDescriptor | undefined;
       try {
         descriptor = Object.getOwnPropertyDescriptor(value, key);

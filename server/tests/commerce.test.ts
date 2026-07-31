@@ -270,7 +270,19 @@ const paymentSensitiveSentinels = () => ({
   passphrase: `Passphrase-${randomUUID()}`,
   certNumber: `CertNumber-${randomUUID()}`,
   clientIp: `ClientIp-${randomUUID()}`,
-  spbillCreateIp: `SpbillCreateIp-${randomUUID()}`
+  spbillCreateIp: `SpbillCreateIp-${randomUUID()}`,
+  clientIPAddress: `ClientIPAddress-${randomUUID()}`,
+  spbillCreateIPAddress: `SpbillCreateIPAddress-${randomUUID()}`,
+  cardNo: `CardNo-${randomUUID()}`,
+  cardNoCamel: `CardNoCamel-${randomUUID()}`,
+  pan: `Pan-${randomUUID()}`,
+  bankcardno: `Bankcardno-${randomUUID()}`,
+  bankCardNo: `BankCardNo-${randomUUID()}`,
+  acctNo: `AcctNo-${randomUUID()}`,
+  acctNoCamel: `AcctNoCamel-${randomUUID()}`,
+  account: `Account-${randomUUID()}`,
+  accountId: `AccountId-${randomUUID()}`,
+  userAccount: `UserAccount-${randomUUID()}`
 });
 
 const paymentSensitiveFields = (
@@ -324,7 +336,19 @@ const paymentSensitiveFields = (
   passphrase: sentinels.passphrase,
   cert_number: sentinels.certNumber,
   client_ip: sentinels.clientIp,
-  spbill_create_ip: sentinels.spbillCreateIp
+  spbill_create_ip: sentinels.spbillCreateIp,
+  clientIPAddress: sentinels.clientIPAddress,
+  spbillCreateIPAddress: sentinels.spbillCreateIPAddress,
+  card_no: sentinels.cardNo,
+  cardNo: sentinels.cardNoCamel,
+  pan: sentinels.pan,
+  bankcardno: sentinels.bankcardno,
+  bankCardNo: sentinels.bankCardNo,
+  acct_no: sentinels.acctNo,
+  acctNo: sentinels.acctNoCamel,
+  account: sentinels.account,
+  account_id: sentinels.accountId,
+  user_account: sentinels.userAccount
 });
 
 const paymentAuditFields = (prefix: "create" | "verify") => ({
@@ -2850,6 +2874,100 @@ describe("atomic commerce orders and payments", () => {
       }
     } finally {
       if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("persists create and verified digests without sensitive raw values", async () => {
+    await seedPolicyFoundation();
+    const userIds: string[] = [];
+    try {
+      const createDigests: string[] = [];
+      const verifiedDigests: string[] = [];
+      for (const cvv of ["cvv123", "cvv124"]) {
+        const createUserId = await createEntitlementTestUser(true);
+        userIds.push(createUserId);
+        const createdOrder = await createOrder({
+          userId: createUserId,
+          sku: "POLICY_CALC",
+          channel: "main",
+          idempotencyKey: `create-redacted-digest-${randomUUID()}`,
+          businessDraftId: await insertPolicyDraft(createUserId)
+        });
+        await startPayment({
+          userId: createUserId,
+          orderId: createdOrder.id,
+          productChannel: "main",
+          clientIp: "127.0.0.1",
+          returnUrl: "https://peileme.test/return",
+          notifyUrl: "https://peileme.test/notify",
+          provider: paymentProviderWithResponse({
+            oversized: "x".repeat(5_000),
+            nested: { cvv, status: "accepted" }
+          })
+        });
+        const created = await query<{
+          response_snapshot: { _sha256?: string };
+        }>(
+          `SELECT response_snapshot
+             FROM payment_attempts
+            WHERE order_id = $1`,
+          [createdOrder.id]
+        );
+        expect(JSON.stringify(created.rows[0].response_snapshot)).not.toContain(
+          cvv
+        );
+        createDigests.push(created.rows[0].response_snapshot._sha256 ?? "");
+
+        const verifiedUserId = await createEntitlementTestUser(true);
+        userIds.push(verifiedUserId);
+        const verifiedOrder = await createOrder({
+          userId: verifiedUserId,
+          sku: "POLICY_CALC",
+          channel: "main",
+          idempotencyKey: `verified-redacted-digest-${randomUUID()}`,
+          businessDraftId: await insertPolicyDraft(verifiedUserId)
+        });
+        const attempt = await insertIdentityAwarePaymentAttempt({
+          orderId: verifiedOrder.id,
+          channel: "wechat_h5",
+          status: "PENDING"
+        });
+        await markOrderPaid({
+          orderId: verifiedOrder.id,
+          paymentAttemptId: attempt.id,
+          verified: {
+            providerOrderNo: attempt.providerOrderNo,
+            channel: "wechat_h5",
+            channelTransactionId: `redacted-digest-${randomUUID()}`,
+            amountFen: verifiedOrder.amountFen,
+            currency: "CNY",
+            paidAt: new Date().toISOString(),
+            raw: {
+              oversized: "x".repeat(5_000),
+              nested: { cvv, status: "accepted" }
+            }
+          }
+        });
+        const verified = await query<{
+          verified_payload: { _sha256?: string };
+        }>(
+          `SELECT verified_payload
+             FROM payment_transactions
+            WHERE order_id = $1`,
+          [verifiedOrder.id]
+        );
+        expect(JSON.stringify(verified.rows[0].verified_payload)).not.toContain(
+          cvv
+        );
+        verifiedDigests.push(verified.rows[0].verified_payload._sha256 ?? "");
+      }
+
+      expect(createDigests[0]).toMatch(/^[0-9a-f]{64}$/);
+      expect(createDigests[1]).toBe(createDigests[0]);
+      expect(verifiedDigests[0]).toMatch(/^[0-9a-f]{64}$/);
+      expect(verifiedDigests[1]).toBe(verifiedDigests[0]);
+    } finally {
+      await cleanupEntitlementTestUsers(userIds);
     }
   });
 
