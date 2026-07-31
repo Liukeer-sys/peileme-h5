@@ -16,84 +16,194 @@ const isSensitiveKey = (key: string) =>
 const hashEvidence = (input: unknown) => {
   const hash = createHash("sha256");
   const seen = new WeakMap<object, number>();
-  let objectId = 0;
-  let nodes = 0;
+  let nextObjectId = 0;
 
-  const update = (value: unknown, depth: number): void => {
-    nodes += 1;
-    if (nodes > 4_000 || depth > 16) {
-      hash.update("[hash-budget]");
-      return;
+  type HashBytes = string | Uint8Array;
+  type HashTask =
+    | { kind: "value"; value: unknown }
+    | { kind: "token"; tag: string; data?: HashBytes };
+
+  const writeToken = (tag: string, data: HashBytes = "") => {
+    const tagBytes = Buffer.byteLength(tag, "utf8");
+    const dataBytes =
+      typeof data === "string"
+        ? Buffer.byteLength(data, "utf8")
+        : data.byteLength;
+    hash.update(`T${tagBytes}:`, "utf8");
+    hash.update(tag, "utf8");
+    hash.update(`D${dataBytes}:`, "utf8");
+    hash.update(data);
+  };
+
+  const token = (tag: string, data?: HashBytes): HashTask => ({
+    kind: "token",
+    tag,
+    data
+  });
+  const valueTask = (value: unknown): HashTask => ({ kind: "value", value });
+  const tasks: HashTask[] = [valueTask(input)];
+
+  while (tasks.length > 0) {
+    const task = tasks.pop()!;
+    if (task.kind === "token") {
+      writeToken(task.tag, task.data);
+      continue;
     }
+    const value = task.value;
     if (value === null) {
-      hash.update("null;");
-      return;
+      writeToken("null");
+      continue;
     }
     switch (typeof value) {
       case "string":
-        hash.update(`string:${Buffer.byteLength(value, "utf8")}:`);
-        hash.update(value.slice(0, 65_536));
-        return;
+        writeToken("string", value);
+        continue;
       case "number":
-        hash.update(`number:${String(value)};`);
-        return;
+        writeToken(
+          "number",
+          Object.is(value, -0) ? "-0" : String(value)
+        );
+        continue;
       case "bigint":
-        hash.update(`bigint:${value.toString()};`);
-        return;
+        writeToken("bigint", value.toString());
+        continue;
       case "boolean":
-        hash.update(`boolean:${String(value)};`);
-        return;
+        writeToken("boolean", String(value));
+        continue;
       case "undefined":
+        writeToken("undefined");
+        continue;
       case "symbol":
-      case "function":
-        hash.update(`${typeof value};`);
-        return;
+        writeToken(
+          "symbol",
+          `${Symbol.keyFor(value) ?? ""}:${value.description ?? ""}`
+        );
+        continue;
+      case "function": {
+        let source: string;
+        try {
+          source = Function.prototype.toString.call(value);
+        } catch {
+          source = "[Unreadable Function]";
+        }
+        writeToken("function", source);
+        continue;
+      }
     }
 
     const priorId = seen.get(value);
     if (priorId !== undefined) {
-      hash.update(`circular:${priorId};`);
-      return;
+      writeToken("reference", String(priorId));
+      continue;
     }
-    const currentId = objectId;
-    objectId += 1;
-    seen.set(value, currentId);
+    const objectId = nextObjectId;
+    nextObjectId += 1;
+    seen.set(value, objectId);
+
     if (value instanceof Date) {
-      hash.update(`date:${value.toISOString()};`);
-      return;
+      const time = value.getTime();
+      writeToken(
+        "date",
+        Number.isNaN(time) ? "[Invalid Date]" : value.toISOString()
+      );
+      continue;
     }
     if (ArrayBuffer.isView(value)) {
-      hash.update(`binary:${value.byteLength};`);
-      return;
+      let viewName = "ArrayBufferView";
+      try {
+        viewName = Object.prototype.toString.call(value);
+      } catch {
+        viewName = "[Unreadable ArrayBufferView]";
+      }
+      writeToken("binary-view-type", viewName);
+      writeToken(
+        "binary-view-bytes",
+        new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+      );
+      continue;
+    }
+    if (value instanceof ArrayBuffer) {
+      writeToken("array-buffer", new Uint8Array(value));
+      continue;
     }
     if (Array.isArray(value)) {
-      hash.update(`array:${value.length};`);
-      for (const item of value.slice(0, 256)) update(item, depth + 1);
-      return;
+      writeToken("array-start", `${objectId}:${value.length}`);
+      tasks.push(token("array-end"));
+      for (let index = value.length - 1; index >= 0; index -= 1) {
+        let descriptor: PropertyDescriptor | undefined;
+        try {
+          descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        } catch {
+          tasks.push(token("array-item-unreadable", String(index)));
+          continue;
+        }
+        if (!descriptor) {
+          tasks.push(token("array-hole", String(index)));
+          continue;
+        }
+        if ("value" in descriptor) {
+          tasks.push(valueTask(descriptor.value));
+          tasks.push(token("array-index", String(index)));
+        } else {
+          tasks.push(
+            token(
+              "array-accessor",
+              `${index}:get=${Boolean(descriptor.get)}:set=${Boolean(descriptor.set)}`
+            )
+          );
+        }
+      }
+      continue;
     }
-    let keys: string[];
+
+    let ownKeys: PropertyKey[];
     try {
-      keys = Object.keys(value).sort();
+      ownKeys = Reflect.ownKeys(value);
     } catch {
-      hash.update("unreadable-object;");
-      return;
+      writeToken("unreadable-object", String(objectId));
+      continue;
     }
-    hash.update(`object:${keys.length};`);
-    for (const key of keys.slice(0, 256)) {
-      hash.update(`key:${key};`);
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (descriptor && "value" in descriptor) {
-        update(descriptor.value, depth + 1);
+    const sortedKeys = ownKeys
+      .map((key, ordinal) => ({
+        key,
+        ordinal,
+        label:
+          typeof key === "symbol"
+            ? `symbol:${Symbol.keyFor(key) ?? ""}:${key.description ?? ""}`
+            : `string:${String(key)}`
+      }))
+      .sort(
+        (left, right) =>
+          (left.label < right.label ? -1 : left.label > right.label ? 1 : 0) ||
+          left.ordinal - right.ordinal
+      );
+    writeToken("object-start", `${objectId}:${sortedKeys.length}`);
+    tasks.push(token("object-end"));
+    for (let index = sortedKeys.length - 1; index >= 0; index -= 1) {
+      const { key, label } = sortedKeys[index];
+      let descriptor: PropertyDescriptor | undefined;
+      try {
+        descriptor = Object.getOwnPropertyDescriptor(value, key);
+      } catch {
+        tasks.push(token("property-unreadable", label));
+        continue;
+      }
+      if (!descriptor) {
+        tasks.push(token("property-missing", label));
+        continue;
+      }
+      if ("value" in descriptor) {
+        tasks.push(valueTask(descriptor.value));
+        tasks.push(token("property-key", label));
       } else {
-        hash.update("accessor;");
+        tasks.push(
+          token(
+            "property-accessor",
+            `${label}:get=${Boolean(descriptor.get)}:set=${Boolean(descriptor.set)}`
+          )
+        );
       }
     }
-  };
-
-  try {
-    update(input, 0);
-  } catch {
-    hash.update("unhashable;");
   }
   return hash.digest("hex");
 };
