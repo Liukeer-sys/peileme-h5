@@ -2,6 +2,17 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { closePool, query } from "../db.js";
 import { runMigrations } from "../migrate.js";
+import {
+  getActiveCatalog,
+  getEffectivePrice,
+  getProductBySku
+} from "../modules/commerce/catalog.js";
+import {
+  consumeEntitlement,
+  getAvailableEntitlements,
+  releaseEntitlement,
+  reserveEntitlement
+} from "../modules/commerce/entitlements.js";
 import { seedPolicyFoundation } from "../modules/policy/seed.js";
 
 type CatalogRow = {
@@ -12,6 +23,52 @@ type CatalogRow = {
   entitlement_policy: unknown;
   amount_fen: string;
   currency: string;
+};
+
+const createEntitlementTestUser = async (verified: boolean) => {
+  const marker = randomUUID().replaceAll("-", "");
+  const user = await query<{ id: string }>(
+    `INSERT INTO users(email, email_verified_at)
+     VALUES ($1, CASE WHEN $2 THEN now() ELSE NULL END)
+     RETURNING id`,
+    [`task2-${marker}@peileme.test`, verified]
+  );
+  return user.rows[0].id;
+};
+
+const cleanupEntitlementTestUsers = async (userIds: string[]) => {
+  if (userIds.length === 0) return;
+  await query(
+    "DELETE FROM entitlement_usages WHERE user_id = ANY($1::uuid[])",
+    [userIds]
+  );
+  await query("DELETE FROM entitlements WHERE user_id = ANY($1::uuid[])", [
+    userIds
+  ]);
+  await query("DELETE FROM users WHERE id = ANY($1::uuid[])", [userIds]);
+};
+
+const insertAdminEntitlement = async (
+  userId: string,
+  sku: string,
+  totalUses: number
+) => {
+  const entitlement = await query<{ id: string }>(
+    `INSERT INTO entitlements(
+       user_id,
+       product_id,
+       source_type,
+       total_uses,
+       remaining_uses,
+       status
+     )
+     SELECT $1, id, 'admin', $3, $3, 'active'
+       FROM products
+      WHERE sku = $2
+     RETURNING id`,
+    [userId, sku, totalUses]
+  );
+  return entitlement.rows[0].id;
 };
 
 beforeAll(async () => {
@@ -754,5 +811,567 @@ describe("commerce catalog foundation", () => {
         data_type: "bigint"
       }
     ]);
+  });
+});
+
+describe("effective commerce catalog", () => {
+  it("returns only active channel and all-channel products with effective prices", async () => {
+    await seedPolicyFoundation();
+    const marker = randomUUID().replaceAll("-", "").toUpperCase();
+    const allSku = `QUALITY_ALL_${marker}`;
+    const inactiveSku = `QUALITY_INACTIVE_${marker}`;
+    try {
+      await query(
+        `WITH inserted AS (
+           INSERT INTO products(
+             sku,
+             name,
+             description,
+             product_channel,
+             fulfillment_type,
+             status,
+             entitlement_policy
+           )
+           VALUES
+             ($1, '全渠道商品', '目录过滤测试', 'all', 'ai_analysis', 'active', '{}'),
+             ($2, '停用商品', '目录过滤测试', 'main', 'policy_calculation', 'inactive', '{}')
+           RETURNING id
+         )
+         INSERT INTO product_prices(product_id, amount_fen, effective_from)
+         SELECT id, 1234, now() - interval '1 day'
+           FROM inserted`,
+        [allSku, inactiveSku]
+      );
+
+      const [mainCatalog, aiCatalog] = await Promise.all([
+        getActiveCatalog("main"),
+        getActiveCatalog("ai")
+      ]);
+      expect(mainCatalog.map((item) => item.sku)).toEqual([
+        "POLICY_CALC",
+        allSku
+      ].sort());
+      expect(aiCatalog.map((item) => item.sku)).toEqual([
+        "AI_DOCUMENT_REVIEW",
+        "AI_SEVERANCE_ANALYSIS",
+        allSku
+      ].sort());
+      expect(
+        mainCatalog.find((item) => item.sku === allSku)
+      ).toMatchObject({
+        amountFen: "1234",
+        currency: "CNY",
+        productChannel: "all"
+      });
+      expect(
+        mainCatalog.some((item) => item.sku === inactiveSku)
+      ).toBe(false);
+    } finally {
+      await query("DELETE FROM products WHERE sku = ANY($1::text[])", [
+        [allSku, inactiveSku]
+      ]);
+    }
+  });
+
+  it("uses half-open price periods and preserves BIGINT amounts as strings", async () => {
+    const marker = randomUUID().replaceAll("-", "").toUpperCase();
+    const sku = `QUALITY_TIME_${marker}`;
+    const product = await query<{ id: string }>(
+      `INSERT INTO products(
+         sku,
+         name,
+         description,
+         product_channel,
+         fulfillment_type,
+         status,
+         entitlement_policy
+       )
+       VALUES ($1, '时间价格商品', '时间边界测试', 'ai', 'ai_analysis', 'active', '{}')
+       RETURNING id`,
+      [sku]
+    );
+    const productId = product.rows[0].id;
+    try {
+      await query(
+        `INSERT INTO product_prices(
+           product_id, amount_fen, effective_from, effective_to
+         )
+         VALUES
+           (
+             $1, 9007199254740993,
+             TIMESTAMPTZ '2026-01-01 00:00:00+08',
+             TIMESTAMPTZ '2026-02-01 00:00:00+08'
+           ),
+           (
+             $1, 9007199254740995,
+             TIMESTAMPTZ '2026-02-01 00:00:00+08',
+             TIMESTAMPTZ '2026-03-01 00:00:00+08'
+           )`,
+        [productId]
+      );
+
+      await expect(
+        getEffectivePrice(productId, new Date("2025-12-31T16:00:00.000Z"))
+      ).resolves.toMatchObject({ amountFen: "9007199254740993" });
+      await expect(
+        getEffectivePrice(productId, new Date("2026-01-31T15:59:59.999Z"))
+      ).resolves.toMatchObject({ amountFen: "9007199254740993" });
+      await expect(
+        getEffectivePrice(productId, new Date("2026-01-31T16:00:00.000Z"))
+      ).resolves.toMatchObject({ amountFen: "9007199254740995" });
+      await expect(
+        getEffectivePrice(productId, new Date("2026-02-28T16:00:00.000Z"))
+      ).resolves.toBeNull();
+    } finally {
+      await query("DELETE FROM products WHERE id = $1", [productId]);
+    }
+  });
+
+  it("rejects an unverified user's first-free reservation", async () => {
+    await seedPolicyFoundation();
+    const marker = randomUUID().replaceAll("-", "");
+    let userId: string | undefined;
+    try {
+      const user = await query<{ id: string }>(
+        `INSERT INTO users(email)
+         VALUES ($1)
+         RETURNING id`,
+        [`task2-unverified-${marker}@peileme.test`]
+      );
+      userId = user.rows[0].id;
+
+      await expect(
+        reserveEntitlement(userId, "POLICY_CALC", randomUUID())
+      ).rejects.toMatchObject({
+        code: "IDENTITY_VERIFICATION_REQUIRED"
+      });
+      const persisted = await query<{ entitlements: string; usages: string }>(
+        `SELECT
+           (
+             SELECT count(*)::text
+               FROM entitlements
+              WHERE user_id = $1
+           ) AS entitlements,
+           (
+             SELECT count(*)::text
+               FROM entitlement_usages
+              WHERE user_id = $1
+           ) AS usages`,
+        [userId]
+      );
+      expect(persisted.rows[0]).toEqual({
+        entitlements: "0",
+        usages: "0"
+      });
+    } finally {
+      if (userId) {
+        await query("DELETE FROM entitlement_usages WHERE user_id = $1", [
+          userId
+        ]);
+        await query("DELETE FROM entitlements WHERE user_id = $1", [userId]);
+        await query("DELETE FROM users WHERE id = $1", [userId]);
+      }
+    }
+  });
+
+  it("grants one first-free use for two concurrent business reservations", async () => {
+    await seedPolicyFoundation();
+    const marker = randomUUID().replaceAll("-", "");
+    let userId: string | undefined;
+    try {
+      const user = await query<{ id: string }>(
+        `INSERT INTO users(email, email_verified_at)
+         VALUES ($1, now())
+         RETURNING id`,
+        [`task2-race-${marker}@peileme.test`]
+      );
+      userId = user.rows[0].id;
+
+      const attempts = await Promise.allSettled([
+        reserveEntitlement(userId, "POLICY_CALC", randomUUID()),
+        reserveEntitlement(userId, "POLICY_CALC", randomUUID())
+      ]);
+      expect(
+        attempts.filter((attempt) => attempt.status === "fulfilled")
+      ).toHaveLength(1);
+      expect(
+        attempts.filter((attempt) => attempt.status === "rejected")
+      ).toEqual([
+        expect.objectContaining({
+          reason: expect.objectContaining({
+            code: "ENTITLEMENT_NOT_AVAILABLE"
+          }),
+          status: "rejected"
+        })
+      ]);
+
+      const persisted = await query<{
+        entitlements: string;
+        remaining_uses: string;
+        usages: string;
+      }>(
+        `SELECT
+           count(DISTINCT e.id)::text AS entitlements,
+           max(e.remaining_uses)::text AS remaining_uses,
+           count(eu.id)::text AS usages
+         FROM entitlements e
+         LEFT JOIN entitlement_usages eu ON eu.entitlement_id = e.id
+         WHERE e.user_id = $1
+           AND e.source_type = 'first_free'`,
+        [userId]
+      );
+      expect(persisted.rows[0]).toEqual({
+        entitlements: "1",
+        remaining_uses: "0",
+        usages: "1"
+      });
+    } finally {
+      if (userId) {
+        await query("DELETE FROM entitlement_usages WHERE user_id = $1", [
+          userId
+        ]);
+        await query("DELETE FROM entitlements WHERE user_id = $1", [userId]);
+        await query("DELETE FROM users WHERE id = $1", [userId]);
+      }
+    }
+  });
+});
+
+describe("atomic commerce entitlements", () => {
+  it("rejects invalid channels, SKUs and identifiers with closed safe codes", async () => {
+    await expect(getActiveCatalog("admin" as never)).rejects.toMatchObject({
+      code: "INVALID_COMMERCE_CHANNEL"
+    });
+    await expect(getProductBySku("policy_calc")).rejects.toMatchObject({
+      code: "INVALID_PRODUCT_SKU"
+    });
+    await expect(
+      reserveEntitlement("not-a-user", "POLICY_CALC", randomUUID())
+    ).rejects.toMatchObject({
+      code: "INVALID_COMMERCE_INPUT"
+    });
+    await expect(
+      reserveEntitlement(randomUUID(), "UNKNOWN_SKU", randomUUID())
+    ).rejects.toMatchObject({
+      code: "INVALID_PRODUCT_SKU"
+    });
+  });
+
+  it.each(["disabled", "expired"] as const)(
+    "does not grant first-free use from a %s promotion",
+    async (promotionState) => {
+      await seedPolicyFoundation();
+      let userId: string | undefined;
+      try {
+        userId = await createEntitlementTestUser(true);
+        if (promotionState === "disabled") {
+          await query(
+            `UPDATE promotion_rules
+                SET status = 'inactive',
+                    starts_at = NULL,
+                    ends_at = NULL
+              WHERE code = 'FIRST_POLICY_CALC'`
+          );
+        } else {
+          await query(
+            `UPDATE promotion_rules
+                SET status = 'active',
+                    starts_at = now() - interval '2 days',
+                    ends_at = now() - interval '1 day'
+              WHERE code = 'FIRST_POLICY_CALC'`
+          );
+        }
+
+        await expect(
+          reserveEntitlement(userId, "POLICY_CALC", randomUUID())
+        ).rejects.toMatchObject({
+          code: "ENTITLEMENT_NOT_AVAILABLE"
+        });
+        const persisted = await query<{ entitlements: string; usages: string }>(
+          `SELECT
+             (SELECT count(*)::text FROM entitlements WHERE user_id = $1)
+               AS entitlements,
+             (SELECT count(*)::text FROM entitlement_usages WHERE user_id = $1)
+               AS usages`,
+          [userId]
+        );
+        expect(persisted.rows[0]).toEqual({
+          entitlements: "0",
+          usages: "0"
+        });
+      } finally {
+        await query(
+          `UPDATE promotion_rules
+              SET status = 'active',
+                  starts_at = NULL,
+                  ends_at = NULL,
+                  updated_at = now()
+            WHERE code = 'FIRST_POLICY_CALC'`
+        );
+        if (userId) await cleanupEntitlementTestUsers([userId]);
+      }
+    }
+  );
+
+  it("returns one reservation for concurrent retries of the same business", async () => {
+    await seedPolicyFoundation();
+    const userId = await createEntitlementTestUser(true);
+    const businessId = randomUUID();
+    try {
+      const reservations = await Promise.all([
+        reserveEntitlement(userId, "POLICY_CALC", businessId),
+        reserveEntitlement(userId, "POLICY_CALC", businessId)
+      ]);
+      expect(reservations[1]).toEqual(reservations[0]);
+
+      const state = await query<{
+        usages: string;
+        remaining_uses: number;
+      }>(
+        `SELECT
+           count(eu.id)::text AS usages,
+           max(e.remaining_uses)::integer AS remaining_uses
+         FROM entitlements e
+         LEFT JOIN entitlement_usages eu ON eu.entitlement_id = e.id
+         WHERE e.user_id = $1`,
+        [userId]
+      );
+      expect(state.rows[0]).toEqual({
+        usages: "1",
+        remaining_uses: 0
+      });
+    } finally {
+      await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("does not reuse one business ID across users or SKUs", async () => {
+    await seedPolicyFoundation();
+    const userA = await createEntitlementTestUser(true);
+    const userB = await createEntitlementTestUser(true);
+    const businessId = randomUUID();
+    try {
+      await insertAdminEntitlement(userA, "AI_SEVERANCE_ANALYSIS", 1);
+      await reserveEntitlement(userA, "POLICY_CALC", businessId);
+
+      await expect(
+        reserveEntitlement(userB, "POLICY_CALC", businessId)
+      ).rejects.toMatchObject({
+        code: "BUSINESS_ID_CONFLICT"
+      });
+      await expect(
+        reserveEntitlement(userA, "AI_SEVERANCE_ANALYSIS", businessId)
+      ).rejects.toMatchObject({
+        code: "BUSINESS_ID_CONFLICT"
+      });
+
+      const state = await query<{
+        ai_remaining: number;
+        user_b_entitlements: string;
+      }>(
+        `SELECT
+           (
+             SELECT remaining_uses
+               FROM entitlements e
+               JOIN products p ON p.id = e.product_id
+              WHERE e.user_id = $1
+                AND p.sku = 'AI_SEVERANCE_ANALYSIS'
+           ) AS ai_remaining,
+           (
+             SELECT count(*)::text
+               FROM entitlements
+              WHERE user_id = $2
+           ) AS user_b_entitlements`,
+        [userA, userB]
+      );
+      expect(state.rows[0]).toEqual({
+        ai_remaining: 1,
+        user_b_entitlements: "0"
+      });
+    } finally {
+      await cleanupEntitlementTestUsers([userA, userB]);
+    }
+  });
+
+  it("lets two verified users each receive the first-free promotion", async () => {
+    await seedPolicyFoundation();
+    const userA = await createEntitlementTestUser(true);
+    const userB = await createEntitlementTestUser(true);
+    try {
+      const reservations = await Promise.all([
+        reserveEntitlement(userA, "POLICY_CALC", randomUUID()),
+        reserveEntitlement(userB, "POLICY_CALC", randomUUID())
+      ]);
+      expect(reservations.map((item) => item.sourceType)).toEqual([
+        "first_free",
+        "first_free"
+      ]);
+      const grants = await query<{ user_id: string; count: string }>(
+        `SELECT user_id, count(*)::text AS count
+           FROM entitlements
+          WHERE user_id = ANY($1::uuid[])
+            AND source_type = 'first_free'
+          GROUP BY user_id
+          ORDER BY user_id`,
+        [[userA, userB]]
+      );
+      expect(grants.rows).toEqual(
+        [userA, userB]
+          .sort()
+          .map((userId) => ({ user_id: userId, count: "1" }))
+      );
+    } finally {
+      await cleanupEntitlementTestUsers([userA, userB]);
+    }
+  });
+
+  it("keeps multi-use reserve, consume and release transitions atomic and idempotent", async () => {
+    await seedPolicyFoundation();
+    const userId = await createEntitlementTestUser(false);
+    const entitlementId = await insertAdminEntitlement(
+      userId,
+      "AI_SEVERANCE_ANALYSIS",
+      2
+    );
+    const businessA = randomUUID();
+    const businessB = randomUUID();
+    const businessC = randomUUID();
+    try {
+      const [reservationA, reservationB] = await Promise.all([
+        reserveEntitlement(
+          userId,
+          "AI_SEVERANCE_ANALYSIS",
+          businessA
+        ),
+        reserveEntitlement(
+          userId,
+          "AI_SEVERANCE_ANALYSIS",
+          businessB
+        )
+      ]);
+      await expect(
+        reserveEntitlement(userId, "AI_SEVERANCE_ANALYSIS", randomUUID())
+      ).rejects.toMatchObject({
+        code: "ENTITLEMENT_NOT_AVAILABLE"
+      });
+
+      const consumedA = await consumeEntitlement(reservationA.usageId);
+      await expect(
+        consumeEntitlement(reservationA.usageId)
+      ).resolves.toEqual(consumedA);
+      await expect(
+        releaseEntitlement(reservationA.usageId)
+      ).rejects.toMatchObject({
+        code: "ENTITLEMENT_USAGE_CLOSED"
+      });
+
+      const releasedB = await releaseEntitlement(reservationB.usageId);
+      await expect(
+        releaseEntitlement(reservationB.usageId)
+      ).resolves.toEqual(releasedB);
+      await expect(
+        consumeEntitlement(reservationB.usageId)
+      ).rejects.toMatchObject({
+        code: "ENTITLEMENT_USAGE_CLOSED"
+      });
+
+      await expect(
+        getAvailableEntitlements(userId, "AI_SEVERANCE_ANALYSIS")
+      ).resolves.toEqual([
+        expect.objectContaining({
+          id: entitlementId,
+          remainingUses: 1,
+          status: "active"
+        })
+      ]);
+
+      const reservationC = await reserveEntitlement(
+        userId,
+        "AI_SEVERANCE_ANALYSIS",
+        businessC
+      );
+      await consumeEntitlement(reservationC.usageId);
+
+      const entitlement = await query<{
+        remaining_uses: number;
+        status: string;
+      }>(
+        `SELECT remaining_uses, status
+           FROM entitlements
+          WHERE id = $1`,
+        [entitlementId]
+      );
+      expect(entitlement.rows[0]).toEqual({
+        remaining_uses: 0,
+        status: "consumed"
+      });
+      const usages = await query<{ status: string; count: string }>(
+        `SELECT status, count(*)::text AS count
+           FROM entitlement_usages
+          WHERE entitlement_id = $1
+          GROUP BY status
+          ORDER BY status`,
+        [entitlementId]
+      );
+      expect(usages.rows).toEqual([
+        { status: "consumed", count: "2" },
+        { status: "released", count: "1" }
+      ]);
+    } finally {
+      await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("rolls back first-free grant when usage persistence fails", async () => {
+    await seedPolicyFoundation();
+    const userId = await createEntitlementTestUser(true);
+    let triggerInstalled = false;
+    try {
+      await query(`
+        CREATE OR REPLACE FUNCTION fail_entitlement_usage_for_task2()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+          RAISE EXCEPTION 'forced entitlement usage failure';
+        END
+        $$
+      `);
+      await query(`
+        CREATE TRIGGER fail_entitlement_usage_for_task2_trigger
+        BEFORE INSERT ON entitlement_usages
+        FOR EACH ROW
+        EXECUTE FUNCTION fail_entitlement_usage_for_task2()
+      `);
+      triggerInstalled = true;
+
+      await expect(
+        reserveEntitlement(userId, "POLICY_CALC", randomUUID())
+      ).rejects.toMatchObject({
+        code: "P0001"
+      });
+      const persisted = await query<{ entitlements: string; usages: string }>(
+        `SELECT
+           (SELECT count(*)::text FROM entitlements WHERE user_id = $1)
+             AS entitlements,
+           (SELECT count(*)::text FROM entitlement_usages WHERE user_id = $1)
+             AS usages`,
+        [userId]
+      );
+      expect(persisted.rows[0]).toEqual({
+        entitlements: "0",
+        usages: "0"
+      });
+    } finally {
+      if (triggerInstalled) {
+        await query(
+          "DROP TRIGGER IF EXISTS fail_entitlement_usage_for_task2_trigger ON entitlement_usages"
+        );
+      }
+      await query(
+        "DROP FUNCTION IF EXISTS fail_entitlement_usage_for_task2()"
+      );
+      await cleanupEntitlementTestUsers([userId]);
+    }
   });
 });

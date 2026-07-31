@@ -231,7 +231,7 @@ CREATE TABLE entitlements (
 );
 
 CREATE UNIQUE INDEX entitlements_source_unique_idx
-  ON entitlements(source_type, source_id, product_id)
+  ON entitlements(user_id, product_id, source_type, source_id)
   WHERE source_id IS NOT NULL;
 
 CREATE UNIQUE INDEX entitlements_first_free_unique_idx

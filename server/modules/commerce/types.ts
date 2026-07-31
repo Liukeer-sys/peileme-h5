@@ -63,3 +63,27 @@ export type InvoiceRequestStatus =
   | "PROCESSING"
   | "ISSUED"
   | "REJECTED";
+
+export const commerceErrorCodes = [
+  "INVALID_COMMERCE_CHANNEL",
+  "INVALID_COMMERCE_INPUT",
+  "INVALID_PRODUCT_SKU",
+  "PRODUCT_NOT_FOUND",
+  "PRODUCT_INACTIVE",
+  "IDENTITY_VERIFICATION_REQUIRED",
+  "ENTITLEMENT_NOT_AVAILABLE",
+  "BUSINESS_ID_CONFLICT",
+  "ENTITLEMENT_USAGE_NOT_FOUND",
+  "ENTITLEMENT_USAGE_CLOSED"
+] as const;
+export type CommerceErrorCode = (typeof commerceErrorCodes)[number];
+
+export class CommerceError extends Error {
+  readonly code: CommerceErrorCode;
+
+  constructor(code: CommerceErrorCode) {
+    super(code);
+    this.name = "CommerceError";
+    this.code = code;
+  }
+}
