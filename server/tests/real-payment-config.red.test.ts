@@ -1,16 +1,42 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { getConfig, resetConfigForTests } from "../config.js";
 
+const paymentEnvironmentNames = [
+  "PAYMENT_MODE",
+  "PAYMENT_PROVIDERS",
+  "PAYMENT_NOTIFY_ORIGIN",
+  "WECHAT_PAY_APP_ID",
+  "WECHAT_PAY_MCH_ID",
+  "WECHAT_PAY_MERCHANT_SERIAL_NO",
+  "WECHAT_PAY_PRIVATE_KEY_FILE",
+  "WECHAT_PAY_PRIVATE_KEY_SECRET_REF",
+  "WECHAT_PAY_API_V3_KEY_FILE",
+  "WECHAT_PAY_API_V3_KEY_SECRET_REF",
+  "WECHAT_PAY_PUBLIC_KEYS_FILE",
+  "WECHAT_PAY_PUBLIC_KEYS_SECRET_REF",
+  "ALIPAY_APP_ID",
+  "ALIPAY_SELLER_ID",
+  "ALIPAY_PRIVATE_KEY_FILE",
+  "ALIPAY_PRIVATE_KEY_SECRET_REF",
+  "ALIPAY_PUBLIC_KEY_FILE",
+  "ALIPAY_PUBLIC_KEY_SECRET_REF"
+] as const;
+
 const withEnvironment = async (
   values: Record<string, string | undefined>,
   callback: () => void | Promise<void>
 ) => {
   const previous = new Map<string, string | undefined>();
-  for (const [name, value] of Object.entries(values)) {
+  const names = new Set<string>([
+    ...paymentEnvironmentNames,
+    ...Object.keys(values)
+  ]);
+  for (const name of names) {
+    const value = values[name];
     previous.set(name, process.env[name]);
     if (value === undefined) delete process.env[name];
     else process.env[name] = value;
@@ -38,6 +64,41 @@ const productionFoundation = {
   OTP_SECRET: "production-otp-secret-that-is-at-least-thirty-two-characters",
   CSRF_SECRET: "production-csrf-secret-that-is-at-least-thirty-two-characters"
 } as const;
+
+const createReadOnlySecretFile = async (
+  directory: string,
+  filename: string,
+  value: string
+) => {
+  const file = path.join(directory, filename);
+  await writeFile(file, value, { encoding: "utf8", mode: 0o400 });
+  await chmod(file, 0o400);
+  return file;
+};
+
+const validWechatEnvironment = async (directory: string) => ({
+  PAYMENT_MODE: "live",
+  PAYMENT_PROVIDERS: "wechat_h5",
+  PAYMENT_NOTIFY_ORIGIN: "https://peileme.art",
+  WECHAT_PAY_APP_ID: "wx-production-app-id",
+  WECHAT_PAY_MCH_ID: "1900000001",
+  WECHAT_PAY_MERCHANT_SERIAL_NO: "MERCHANT-SERIAL-001",
+  WECHAT_PAY_PRIVATE_KEY_FILE: await createReadOnlySecretFile(
+    directory,
+    "wechat-private.pem",
+    "readable-private-key-placeholder\n"
+  ),
+  WECHAT_PAY_API_V3_KEY_FILE: await createReadOnlySecretFile(
+    directory,
+    "wechat-api-v3-key",
+    "12345678901234567890123456789012\n"
+  ),
+  WECHAT_PAY_PUBLIC_KEYS_FILE: await createReadOnlySecretFile(
+    directory,
+    "wechat-public-keys.json",
+    '{"PUBLIC-SERIAL":"public-key-placeholder"}\n'
+  )
+});
 
 describe("Task 4 payment configuration and registry contract (RED)", () => {
   it.each(["test", "production"])(
@@ -75,6 +136,121 @@ describe("Task 4 payment configuration and registry contract (RED)", () => {
         expect(() => getConfig()).toThrow(/WECHAT_PAY_APP_ID/);
       }
     );
+  });
+
+  it("fails fast when live mode has no provider", async () => {
+    await withEnvironment(
+      {
+        PAYMENT_MODE: "live",
+        PAYMENT_PROVIDERS: "",
+        PAYMENT_NOTIFY_ORIGIN: "https://peileme.art"
+      },
+      () => {
+        expect(() => getConfig()).toThrow(
+          /PAYMENT_PROVIDERS.*(?:at least one|wechat_h5|alipay_wap)/i
+        );
+      }
+    );
+  });
+
+  it("fails fast when an enabled provider secret file is missing", async () => {
+    const secretDirectory = await mkdtemp(
+      path.join(tmpdir(), "peileme-payment-config-")
+    );
+    try {
+      const environment = await validWechatEnvironment(secretDirectory);
+      environment.WECHAT_PAY_PRIVATE_KEY_FILE = path.join(
+        secretDirectory,
+        "missing-private-key.pem"
+      );
+      await withEnvironment(environment, () => {
+        expect(() => getConfig()).toThrow(
+          /WECHAT_PAY_PRIVATE_KEY.*(?:missing|read|regular file)/i
+        );
+      });
+    } finally {
+      await rm(secretDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { mode: 0o000, description: "unreadable" },
+    { mode: 0o600, description: "writable" }
+  ])(
+    "rejects a $description payment secret file",
+    async ({ mode }) => {
+      const secretDirectory = await mkdtemp(
+        path.join(tmpdir(), "peileme-payment-config-")
+      );
+      try {
+        const environment = await validWechatEnvironment(secretDirectory);
+        await chmod(environment.WECHAT_PAY_PRIVATE_KEY_FILE, mode);
+        await withEnvironment(environment, () => {
+          expect(() => getConfig()).toThrow(
+            /WECHAT_PAY_PRIVATE_KEY.*(?:readable|read-only|permission)/i
+          );
+        });
+      } finally {
+        await rm(secretDirectory, { recursive: true, force: true });
+      }
+    }
+  );
+
+  it("requires an exact 32-byte WeChat APIv3 key", async () => {
+    const secretDirectory = await mkdtemp(
+      path.join(tmpdir(), "peileme-payment-config-")
+    );
+    try {
+      const environment = await validWechatEnvironment(secretDirectory);
+      await chmod(environment.WECHAT_PAY_API_V3_KEY_FILE, 0o600);
+      await writeFile(
+        environment.WECHAT_PAY_API_V3_KEY_FILE,
+        "1234567890123456789012345678901\n",
+        "utf8"
+      );
+      await chmod(environment.WECHAT_PAY_API_V3_KEY_FILE, 0o400);
+      await withEnvironment(environment, () => {
+        expect(() => getConfig()).toThrow(
+          /WECHAT_PAY_API_V3_KEY.*32 bytes/i
+        );
+      });
+    } finally {
+      await rm(secretDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts named env secret references without returning secret values", async () => {
+    const secretDirectory = await mkdtemp(
+      path.join(tmpdir(), "peileme-payment-config-")
+    );
+    const secretName = "PEILEME_TEST_WECHAT_API_V3_KEY";
+    const secretValue = "12345678901234567890123456789012";
+    try {
+      const environment = await validWechatEnvironment(secretDirectory);
+      const previous = process.env[secretName];
+      process.env[secretName] = secretValue;
+      try {
+        await withEnvironment(
+          {
+            ...environment,
+            WECHAT_PAY_API_V3_KEY_FILE: undefined,
+            WECHAT_PAY_API_V3_KEY_SECRET_REF: `env:${secretName}`
+          },
+          () => {
+            const config = getConfig();
+            expect(config.WECHAT_PAY_API_V3_KEY_SECRET_REF).toBe(
+              `env:${secretName}`
+            );
+            expect(JSON.stringify(config)).not.toContain(secretValue);
+          }
+        );
+      } finally {
+        if (previous === undefined) delete process.env[secretName];
+        else process.env[secretName] = previous;
+      }
+    } finally {
+      await rm(secretDirectory, { recursive: true, force: true });
+    }
   });
 
   it("requires a canonical HTTPS notification origin in live mode", async () => {
@@ -139,5 +315,57 @@ describe("Task 4 payment configuration and registry contract (RED)", () => {
     expect(() => registry.require("alipay_wap")).toThrow(
       "PAYMENT_PROVIDER_UNAVAILABLE"
     );
+    expect(JSON.stringify(registry)).not.toMatch(
+      /private|secret|credential|api.?v3/i
+    );
+  });
+
+  it("fails registry construction when a configured provider has no factory", async () => {
+    const moduleUrl = pathToFileURL(
+      path.resolve("server/modules/payments/registry.ts")
+    ).href;
+    const registryModule = await import(/* @vite-ignore */ moduleUrl);
+
+    expect(() =>
+      registryModule.createPaymentProviderRegistry(
+        {
+          PAYMENT_MODE: "live",
+          PAYMENT_PROVIDERS: ["wechat_h5"]
+        },
+        {}
+      )
+    ).toThrow(/wechat_h5.*(?:factory|configured|available)/i);
+  });
+
+  it("does not perform network I/O while validating or constructing providers", async () => {
+    const secretDirectory = await mkdtemp(
+      path.join(tmpdir(), "peileme-payment-config-")
+    );
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = (() => {
+      fetchCalls += 1;
+      throw new Error("network is forbidden during payment construction");
+    }) as typeof fetch;
+    try {
+      const environment = await validWechatEnvironment(secretDirectory);
+      await withEnvironment(environment, async () => {
+        const config = getConfig();
+        const registryModule = await import(
+          /* @vite-ignore */ pathToFileURL(
+            path.resolve("server/modules/payments/registry.ts")
+          ).href
+        );
+        const provider = { channel: "wechat_h5" as const };
+        const registry = registryModule.createPaymentProviderRegistry(config, {
+          wechatFactory: () => provider
+        });
+        expect(registry.require("wechat_h5")).toBe(provider);
+      });
+      expect(fetchCalls).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+      await rm(secretDirectory, { recursive: true, force: true });
+    }
   });
 });

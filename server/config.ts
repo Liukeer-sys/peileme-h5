@@ -5,6 +5,11 @@ import {
   normalizeProductHost,
   parseProductHostAllowlist
 } from "./product-host.js";
+import { loadPaymentSecret } from "./modules/payments/secret-loader.js";
+import {
+  isRealPaymentChannel,
+  type RealPaymentChannel
+} from "./modules/payments/provider.js";
 
 const booleanValue = z
   .string()
@@ -84,9 +89,46 @@ const corsOriginList = z
     }
   });
 
+const paymentProviderList = z
+  .string()
+  .default("")
+  .transform((value, context): RealPaymentChannel[] => {
+    if (!value.trim()) return [];
+    const providers = value.split(",").map((entry) => entry.trim());
+    if (
+      providers.some((entry) => !isRealPaymentChannel(entry)) ||
+      new Set(providers).size !== providers.length
+    ) {
+      context.addIssue({
+        code: "custom",
+        message:
+          "PAYMENT_PROVIDERS must contain unique wechat_h5/alipay_wap entries"
+      });
+      return z.NEVER;
+    }
+    return providers as RealPaymentChannel[];
+  });
+
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
-  PAYMENT_MODE: z.enum(["disabled", "fake"]).default("disabled"),
+  PAYMENT_MODE: z.enum(["disabled", "live", "fake"]).default("disabled"),
+  PAYMENT_PROVIDERS: paymentProviderList,
+  PAYMENT_NOTIFY_ORIGIN: z.string().optional(),
+  WECHAT_PAY_APP_ID: z.string().optional(),
+  WECHAT_PAY_MCH_ID: z.string().optional(),
+  WECHAT_PAY_MERCHANT_SERIAL_NO: z.string().optional(),
+  WECHAT_PAY_PRIVATE_KEY_FILE: z.string().optional(),
+  WECHAT_PAY_PRIVATE_KEY_SECRET_REF: z.string().optional(),
+  WECHAT_PAY_API_V3_KEY_FILE: z.string().optional(),
+  WECHAT_PAY_API_V3_KEY_SECRET_REF: z.string().optional(),
+  WECHAT_PAY_PUBLIC_KEYS_FILE: z.string().optional(),
+  WECHAT_PAY_PUBLIC_KEYS_SECRET_REF: z.string().optional(),
+  ALIPAY_APP_ID: z.string().optional(),
+  ALIPAY_SELLER_ID: z.string().optional(),
+  ALIPAY_PRIVATE_KEY_FILE: z.string().optional(),
+  ALIPAY_PRIVATE_KEY_SECRET_REF: z.string().optional(),
+  ALIPAY_PUBLIC_KEY_FILE: z.string().optional(),
+  ALIPAY_PUBLIC_KEY_SECRET_REF: z.string().optional(),
   PORT: z.coerce.number().int().positive().default(3001),
   DATABASE_URL: z.string().min(1).default("postgresql://peileme:peileme@127.0.0.1:5432/peileme"),
   APP_ORIGIN: corsOriginList,
@@ -135,6 +177,100 @@ const envSchema = z.object({
 
 export type AppConfig = z.infer<typeof envSchema>;
 
+const requirePaymentValue = (
+  config: AppConfig,
+  name:
+    | "WECHAT_PAY_APP_ID"
+    | "WECHAT_PAY_MCH_ID"
+    | "WECHAT_PAY_MERCHANT_SERIAL_NO"
+    | "ALIPAY_APP_ID"
+    | "ALIPAY_SELLER_ID"
+) => {
+  const value = config[name]?.trim();
+  if (!value) throw new Error(`${name} must be configured in live mode`);
+  return value;
+};
+
+const validatePaymentSecret = (
+  config: AppConfig,
+  name: string,
+  file: string | undefined,
+  secretRef: string | undefined
+) =>
+  loadPaymentSecret({
+    name,
+    file,
+    secretRef
+  });
+
+const validateLivePaymentConfig = (config: AppConfig) => {
+  if (!config.PAYMENT_PROVIDERS.length) {
+    throw new Error(
+      "PAYMENT_PROVIDERS must configure at least one of wechat_h5/alipay_wap"
+    );
+  }
+  let notificationOrigin: string;
+  try {
+    notificationOrigin = parseHttpOrigin(
+      config.PAYMENT_NOTIFY_ORIGIN ?? "",
+      "PAYMENT_NOTIFY_ORIGIN"
+    );
+  } catch {
+    throw new Error(
+      "PAYMENT_NOTIFY_ORIGIN must be a single canonical HTTPS origin in live mode"
+    );
+  }
+  if (!notificationOrigin.startsWith("https://")) {
+    throw new Error(
+      "PAYMENT_NOTIFY_ORIGIN must be a single canonical HTTPS origin in live mode"
+    );
+  }
+
+  for (const channel of config.PAYMENT_PROVIDERS) {
+    if (channel === "wechat_h5") {
+      requirePaymentValue(config, "WECHAT_PAY_APP_ID");
+      requirePaymentValue(config, "WECHAT_PAY_MCH_ID");
+      requirePaymentValue(config, "WECHAT_PAY_MERCHANT_SERIAL_NO");
+      validatePaymentSecret(
+        config,
+        "WECHAT_PAY_PRIVATE_KEY",
+        config.WECHAT_PAY_PRIVATE_KEY_FILE,
+        config.WECHAT_PAY_PRIVATE_KEY_SECRET_REF
+      );
+      const apiV3Key = validatePaymentSecret(
+        config,
+        "WECHAT_PAY_API_V3_KEY",
+        config.WECHAT_PAY_API_V3_KEY_FILE,
+        config.WECHAT_PAY_API_V3_KEY_SECRET_REF
+      );
+      if (Buffer.byteLength(apiV3Key, "utf8") !== 32) {
+        throw new Error("WECHAT_PAY_API_V3_KEY must contain exactly 32 bytes");
+      }
+      validatePaymentSecret(
+        config,
+        "WECHAT_PAY_PUBLIC_KEYS",
+        config.WECHAT_PAY_PUBLIC_KEYS_FILE,
+        config.WECHAT_PAY_PUBLIC_KEYS_SECRET_REF
+      );
+    } else {
+      requirePaymentValue(config, "ALIPAY_APP_ID");
+      requirePaymentValue(config, "ALIPAY_SELLER_ID");
+      validatePaymentSecret(
+        config,
+        "ALIPAY_PRIVATE_KEY",
+        config.ALIPAY_PRIVATE_KEY_FILE,
+        config.ALIPAY_PRIVATE_KEY_SECRET_REF
+      );
+      validatePaymentSecret(
+        config,
+        "ALIPAY_PUBLIC_KEY",
+        config.ALIPAY_PUBLIC_KEY_FILE,
+        config.ALIPAY_PUBLIC_KEY_SECRET_REF
+      );
+    }
+  }
+};
+
 let cachedConfig: AppConfig | undefined;
 
 export const getConfig = () => {
@@ -152,6 +288,11 @@ export const getConfig = () => {
       }
     }
     const parsedConfig = envSchema.parse(process.env);
+    if (parsedConfig.PAYMENT_MODE === "fake") {
+      throw new Error(
+        `PAYMENT_MODE=fake is forbidden in ${parsedConfig.NODE_ENV}`
+      );
+    }
     const resolveProductHost = createProductHostResolver(
       parsedConfig.MAIN_PRODUCT_HOSTS,
       parsedConfig.AI_PRODUCT_HOSTS
@@ -177,9 +318,6 @@ export const getConfig = () => {
       }
     }
     if (parsedConfig.NODE_ENV === "production") {
-      if (parsedConfig.PAYMENT_MODE === "fake") {
-        throw new Error("PAYMENT_MODE=fake is forbidden in production");
-      }
       if (parsedConfig.JWT_SECRET.startsWith("development-only")) {
         throw new Error("JWT_SECRET must be configured in production");
       }
@@ -189,6 +327,9 @@ export const getConfig = () => {
       if (parsedConfig.CSRF_SECRET.startsWith("development-only")) {
         throw new Error("CSRF_SECRET must be configured in production");
       }
+    }
+    if (parsedConfig.PAYMENT_MODE === "live") {
+      validateLivePaymentConfig(parsedConfig);
     }
     cachedConfig = parsedConfig;
   }
