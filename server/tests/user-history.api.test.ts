@@ -169,7 +169,11 @@ describe("current-user unified history", () => {
               title: "离职赔偿完整分析",
               occurredAt: new Date(),
               updatedAt: new Date(),
-              metadata: { reportReady: true, requestedLimit: limit }
+              metadata: {
+                reportReady: true,
+                requestedLimit: limit,
+                internalOwnerId: users.other.id
+              }
             }
           ]
         };
@@ -193,6 +197,41 @@ describe("current-user unified history", () => {
     ]);
     expect(response.body.items.every((item: { occurredAt?: string }) => item.occurredAt)).toBe(true);
     expect(JSON.stringify(response.body)).not.toContain(users.other.id);
+    expect(JSON.stringify(response.body)).not.toContain("requestedLimit");
+  });
+
+  it("includes persisted AI jobs without an injected history source", async () => {
+    const inserted = await query<{ id: string }>(
+      `INSERT INTO ai_jobs(
+         user_id, kind, status, progress, idempotency_key, input_hash,
+         input_metadata, upload_metadata, completed_at
+       ) VALUES (
+         $1, 'severance_analysis', 'COMPLETED', 100, 'history-default-ai',
+         repeat('a', 64), '{}'::jsonb, '[]'::jsonb, now()
+       ) RETURNING id`,
+      [users.owner.id]
+    );
+    try {
+      const response = await request(createApp())
+        .get("/api/me/history?page=1&pageSize=10")
+        .set("host", "ai.peileme.art")
+        .set(authHeader(ownerToken))
+        .expect(200);
+
+      expect(response.body.pagination.total).toBe(4);
+      expect(response.body.items).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: inserted.rows[0].id,
+            source: "ai",
+            kind: "ai_analysis",
+            title: "赔了么 AI 分析"
+          })
+        ])
+      );
+    } finally {
+      await query("DELETE FROM ai_jobs WHERE id = $1", [inserted.rows[0].id]);
+    }
   });
 
   it("keeps the deprecated account-history alias owner-scoped and channel-scoped", async () => {
@@ -212,7 +251,7 @@ describe("current-user unified history", () => {
       policy_calculations: "available",
       orders: "available",
       uploads: "not_applicable",
-      ai_tasks: "not_registered"
+      ai_tasks: "available"
     });
 
     const ai = await request(createApp())

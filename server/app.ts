@@ -18,6 +18,7 @@ import { query, withTransaction } from "./db.js";
 import { ApiError } from "./errors.js";
 import { createCommerceRouters } from "./modules/commerce/routes.js";
 import { createAiRouter } from "./modules/ai/routes.js";
+import { listOwnedAiJobs } from "./modules/ai/repository.js";
 import type { AiProvider } from "./modules/llm/types.js";
 import type { PaymentProvider } from "./modules/payments/provider.js";
 import { getChannelStatus } from "./notifier.js";
@@ -202,6 +203,23 @@ const removeUploadedFiles = (files: Express.Multer.File[]) => {
   });
 };
 
+const persistedAiHistorySource: AiHistorySource = async ({ userId, limit }) => {
+  const result = await listOwnedAiJobs(userId, limit, 0);
+  return {
+    total: result.total,
+    items: result.items.map((job) => ({
+      id: job.id,
+      source: "ai",
+      kind: "ai_analysis",
+      status: job.status,
+      title: job.kind === "document_review" ? "文件签署分析" : "赔了么 AI 分析",
+      occurredAt: job.completedAt ?? job.updatedAt ?? job.createdAt,
+      updatedAt: job.updatedAt,
+      metadata: { reportReady: Boolean(job.report) }
+    }))
+  };
+};
+
 export const createApp = (
   options: {
     policyCalculate?: (input: unknown) => PolicyOutput;
@@ -211,6 +229,7 @@ export const createApp = (
   } = {}
 ) => {
   const config = getConfig();
+  const aiHistorySource = options.aiHistorySource ?? persistedAiHistorySource;
   const { uploadDir, middleware: upload } = uploadConfig();
   const app = express();
 
@@ -543,7 +562,7 @@ export const createApp = (
       channel: request.productChannel!,
       page: params.page,
       pageSize: params.pageSize,
-      aiHistorySource: options.aiHistorySource
+      aiHistorySource
     });
     response.json({ channel: request.productChannel, ...history });
   });
@@ -556,7 +575,7 @@ export const createApp = (
       channel,
       page: params.page,
       pageSize: params.pageSize,
-      aiHistorySource: options.aiHistorySource,
+      aiHistorySource,
       includePolicy: channel === "main"
     });
     response.set("deprecation", "true");
@@ -579,7 +598,7 @@ export const createApp = (
         policy_calculations: channel === "main" ? "available" : "not_applicable",
         orders: "available",
         uploads: channel === "ai" ? "available" : "not_applicable",
-        ai_tasks: options.aiHistorySource ? "available" : "not_registered"
+        ai_tasks: "available"
       }
     });
   });

@@ -229,6 +229,53 @@ describe("OTP transaction integrity", () => {
     expect(stored.rows[0].count).toBe("1");
   });
 
+  it("allows an immediate retry after a delivery failure", async () => {
+    await query(
+      `INSERT INTO otp_codes(
+         channel, target, purpose, code_hash, delivery_status, expires_at, error_message
+       ) VALUES (
+         'email', $1, 'register', $2, 'failed', now() + interval '10 minutes', 'provider down'
+       )`,
+      [emailTarget, hashOtpCode(emailTarget, "register", validCode)]
+    );
+
+    await expect(sendOtp(emailTarget, "register", "127.0.0.1"))
+      .resolves.toMatchObject({ channel: "email" });
+
+    const statuses = await query<{ delivery_status: string }>(
+      `SELECT delivery_status
+         FROM otp_codes
+        WHERE target = $1 AND purpose = 'register'
+        ORDER BY created_at`,
+      [emailTarget]
+    );
+    expect(statuses.rows.map((row) => row.delivery_status)).toEqual([
+      "failed",
+      "sent"
+    ]);
+  });
+
+  it("uses the latest delivered code when a newer delivery failed", async () => {
+    await insertUser(emailTarget);
+    await insertOtp(emailTarget, "login");
+    await query(
+      `INSERT INTO otp_codes(
+         channel, target, purpose, code_hash, delivery_status, expires_at, created_at
+       ) VALUES (
+         'email', $1, 'login', $2, 'failed', now() + interval '10 minutes', now() + interval '1 second'
+       )`,
+      [emailTarget, hashOtpCode(emailTarget, "login", wrongCode)]
+    );
+
+    await expect(verifyCodeLogin(emailTarget, validCode)).resolves.toBeTruthy();
+    const failed = await query<{ attempts: number }>(
+      `SELECT attempts FROM otp_codes
+        WHERE target = $1 AND purpose = 'login' AND delivery_status = 'failed'`,
+      [emailTarget]
+    );
+    expect(failed.rows[0].attempts).toBe(0);
+  });
+
   it("persists reset-password failures through the HTTP transaction boundary", async () => {
     await insertUser(emailTarget);
     await insertOtp(emailTarget, "reset_password", { maxAttempts: 2 });

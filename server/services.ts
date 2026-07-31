@@ -74,6 +74,7 @@ export const sendOtp = async (
         FROM otp_codes
         WHERE target = $1
           AND purpose = $2
+          AND delivery_status IN ('pending', 'sent')
           AND created_at > now() - interval '1 minute'`,
       [target, purpose]
     );
@@ -134,6 +135,7 @@ export const consumeOtp = async (
        FROM otp_codes
       WHERE target = $1
         AND purpose = $2
+        AND delivery_status = 'sent'
         AND consumed_at IS NULL
         AND expires_at > now()
       ORDER BY created_at DESC

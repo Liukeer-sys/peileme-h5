@@ -170,10 +170,49 @@ const listUploadHistory = async (
   };
 };
 
-const toTimestamp = (value: Date) => {
-  const timestamp = value instanceof Date ? value.getTime() : Number.NaN;
-  return Number.isFinite(timestamp) ? timestamp : 0;
-};
+const isValidDate = (value: Date) =>
+  value instanceof Date && Number.isFinite(value.getTime());
+
+const toTimestamp = (value: Date) => isValidDate(value) ? value.getTime() : 0;
+
+const sanitizeAiHistorySource = (
+  result: UserHistorySourceResult
+): UserHistorySourceResult => ({
+  total:
+    Number.isSafeInteger(result.total) && result.total >= 0
+      ? result.total
+      : 0,
+  items: result.items.flatMap((item) => {
+    if (
+      typeof item.id !== "string" ||
+      item.id.length < 1 ||
+      item.id.length > 200 ||
+      typeof item.status !== "string" ||
+      item.status.length < 1 ||
+      item.status.length > 64 ||
+      typeof item.title !== "string" ||
+      item.title.length < 1 ||
+      item.title.length > 200 ||
+      !isValidDate(item.occurredAt) ||
+      !isValidDate(item.updatedAt)
+    ) {
+      return [];
+    }
+    const reportReady = item.metadata?.reportReady;
+    return [{
+      id: item.id,
+      source: "ai" as const,
+      kind: "ai_analysis" as const,
+      status: item.status,
+      title: item.title,
+      occurredAt: item.occurredAt,
+      updatedAt: item.updatedAt,
+      ...(typeof reportReady === "boolean"
+        ? { metadata: { reportReady } }
+        : {})
+    }];
+  })
+});
 
 export const listUserHistory = async (input: {
   userId: string;
@@ -192,7 +231,10 @@ export const listUserHistory = async (input: {
   if (input.channel === "ai") {
     sources.push(listUploadHistory(input.userId, limit));
     if (input.aiHistorySource) {
-      sources.push(input.aiHistorySource({ userId: input.userId, limit }));
+      sources.push(
+        input.aiHistorySource({ userId: input.userId, limit })
+          .then(sanitizeAiHistorySource)
+      );
     }
   }
   const results = await Promise.all(sources);
