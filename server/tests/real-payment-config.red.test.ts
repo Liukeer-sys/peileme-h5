@@ -261,6 +261,29 @@ describe("Task 4 payment configuration and registry contract (RED)", () => {
     }
   });
 
+  it("rejects a BOM-prefixed WeChat APIv3 key", async () => {
+    const secretDirectory = await mkdtemp(
+      path.join(tmpdir(), "peileme-payment-config-")
+    );
+    try {
+      const environment = await validWechatEnvironment(secretDirectory);
+      await chmod(environment.WECHAT_PAY_API_V3_KEY_FILE, 0o600);
+      await writeFile(
+        environment.WECHAT_PAY_API_V3_KEY_FILE,
+        Buffer.concat([
+          Buffer.from([0xef, 0xbb, 0xbf]),
+          Buffer.from("12345678901234567890123456789012\n", "ascii")
+        ])
+      );
+      await chmod(environment.WECHAT_PAY_API_V3_KEY_FILE, 0o400);
+      await withEnvironment(environment, () => {
+        expect(() => getConfig()).toThrow(/WECHAT_PAY_API_V3_KEY.*BOM|BOM/i);
+      });
+    } finally {
+      await rm(secretDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("deep-freezes cached payment configuration", async () => {
     const secretDirectory = await mkdtemp(
       path.join(tmpdir(), "peileme-payment-config-")

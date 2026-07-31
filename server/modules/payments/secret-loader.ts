@@ -3,7 +3,7 @@ import {
   constants,
   fstatSync,
   openSync,
-  readFileSync
+  readSync
 } from "node:fs";
 import { TextDecoder } from "node:util";
 
@@ -31,6 +31,9 @@ const removeOneLineEnding = (value: string) =>
 const validateSecretValue = (name: string, value: string) => {
   const normalized = removeOneLineEnding(value);
   if (!normalized.length) throw secretError(name, "is missing or empty");
+  if (normalized.startsWith("\ufeff")) {
+    throw secretError(name, "must not contain a UTF-8 BOM");
+  }
   if (normalized.includes("\0")) {
     throw secretError(name, "must not contain NUL control characters");
   }
@@ -44,6 +47,14 @@ const validateSecretBytes = (name: string, value: Buffer) => {
   if (value.byteLength > paymentSecretMaximumBytes + 2) {
     throw secretError(name, "secret file exceeds the maximum allowed size");
   }
+  if (
+    value.byteLength >= 3 &&
+    value[0] === 0xef &&
+    value[1] === 0xbb &&
+    value[2] === 0xbf
+  ) {
+    throw secretError(name, "must not contain a UTF-8 BOM");
+  }
   let decoded: string;
   try {
     decoded = utf8Decoder.decode(value);
@@ -51,6 +62,42 @@ const validateSecretBytes = (name: string, value: Buffer) => {
     throw secretError(name, "must contain valid UTF-8 text");
   }
   return validateSecretValue(name, decoded);
+};
+
+const readBoundedSecretFile = (
+  name: string,
+  descriptor: number,
+  reportedSize: number
+) => {
+  const maximumRawBytes = paymentSecretMaximumBytes + 2;
+  if (reportedSize > maximumRawBytes) {
+    throw secretError(name, "secret file exceeds the maximum allowed size");
+  }
+  const buffer = Buffer.allocUnsafe(maximumRawBytes + 1);
+  let offset = 0;
+  while (offset < buffer.byteLength) {
+    let bytesRead: number;
+    try {
+      bytesRead = readSync(
+        descriptor,
+        buffer,
+        offset,
+        buffer.byteLength - offset,
+        null
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | undefined)?.code === "EINTR") {
+        continue;
+      }
+      throw error;
+    }
+    if (bytesRead === 0) break;
+    offset += bytesRead;
+  }
+  if (offset > maximumRawBytes) {
+    throw secretError(name, "secret file exceeds the maximum allowed size");
+  }
+  return validateSecretBytes(name, buffer.subarray(0, offset));
 };
 
 const loadSecretFile = (name: string, file: string) => {
@@ -72,7 +119,7 @@ const loadSecretFile = (name: string, file: string) => {
     if ((status.mode & 0o222) !== 0) {
       throw secretError(name, "secret file must be read-only");
     }
-    return validateSecretBytes(name, readFileSync(descriptor));
+    return readBoundedSecretFile(name, descriptor, status.size);
   } catch (error) {
     if (error instanceof Error && error.message.startsWith(`${name} `)) {
       throw error;

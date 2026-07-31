@@ -1,5 +1,12 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdtemp,
+  rm,
+  symlink,
+  truncate,
+  writeFile
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -123,6 +130,34 @@ describe("payment secret loader", () => {
     }
   });
 
+  it("rejects a UTF-8 BOM instead of silently stripping raw key bytes", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "peileme-secret-"));
+    const file = path.join(directory, "bom-secret");
+    try {
+      await writeFile(
+        file,
+        Buffer.concat([
+          Buffer.from([0xef, 0xbb, 0xbf]),
+          Buffer.from("secret-value", "utf8")
+        ]),
+        { mode: 0o400 }
+      );
+      await chmod(file, 0o400);
+      expect(() =>
+        loadPaymentSecret({ name: "TEST_PAYMENT_SECRET", file })
+      ).toThrow(/BOM/i);
+      expect(() =>
+        loadPaymentSecret({
+          name: "ENV_PAYMENT_SECRET",
+          secretRef: "env:PAYMENT_SECRET_VALUE",
+          environment: { PAYMENT_SECRET_VALUE: "\ufeffsecret-value" }
+        })
+      ).toThrow(/BOM/i);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("rejects NUL in file and env secret values", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "peileme-secret-"));
     const file = path.join(directory, "nul-secret");
@@ -141,6 +176,49 @@ describe("payment secret loader", () => {
           environment: { PAYMENT_SECRET_VALUE: "before\0after" }
         })
       ).toThrow(/NUL|control/i);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an oversized sparse file without reading it into memory", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "peileme-secret-"));
+    const file = path.join(directory, "oversized-secret");
+    try {
+      await writeFile(file, "", { mode: 0o400 });
+      await truncate(file, 64 * 1024 * 1024);
+      await chmod(file, 0o400);
+      const moduleUrl = pathToFileURL(
+        path.resolve("server/modules/payments/secret-loader.ts")
+      ).href;
+      const script = `
+        import { readFileSync } from "node:fs";
+        import { loadPaymentSecret } from ${JSON.stringify(moduleUrl)};
+        const rss = () => Number(/VmRSS:\\s+(\\d+)/.exec(
+          readFileSync("/proc/self/status", "utf8")
+        )?.[1] ?? 0);
+        const before = rss();
+        let message = "";
+        try {
+          loadPaymentSecret({ name: "TEST_PAYMENT_SECRET", file: ${JSON.stringify(file)} });
+        } catch (error) {
+          message = String(error);
+        }
+        console.log(JSON.stringify({ deltaKib: rss() - before, message }));
+      `;
+      const result = spawnSync(
+        path.resolve("node_modules/.bin/tsx"),
+        ["-e", script],
+        { encoding: "utf8", timeout: 3_000 }
+      );
+
+      expect(result.status).toBe(0);
+      const measurement = JSON.parse(result.stdout.trim()) as {
+        deltaKib: number;
+        message: string;
+      };
+      expect(measurement.message).toMatch(/maximum|exceeds/i);
+      expect(measurement.deltaKib).toBeLessThan(16 * 1024);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
