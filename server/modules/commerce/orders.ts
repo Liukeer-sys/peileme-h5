@@ -5,6 +5,7 @@ import type {
   PaymentProvider,
   VerifiedPayment
 } from "../payments/provider.js";
+import { enableIdentityPaymentWrites } from "../payments/write-contract.js";
 import { parseProductSku } from "./catalog.js";
 import {
   CommerceError,
@@ -222,9 +223,6 @@ const makeProviderOrderNo = (channel: PaymentChannel) => {
     .slice(0, 20)
     .toUpperCase()}`;
 };
-
-const enableIdentityPaymentWrites = (client: pg.PoolClient) =>
-  client.query("SET LOCAL peileme.payment_write_contract = 'identity_v1'");
 
 const assertOwnedBusinessDraft = async (
   client: pg.PoolClient,
@@ -833,6 +831,76 @@ type MarkOrderPaidInTransactionOutcome =
   | { anomaly: PaymentAnomalyKind }
   | { changedState: true };
 
+const persistVerifiedPaymentTransactionInTransaction = async (
+  client: pg.PoolClient,
+  input: {
+    orderId: string;
+    paymentAttemptId: string;
+    verified: VerifiedPayment;
+    amountFen: string;
+    paidAt: Date;
+  }
+) => {
+  const inserted = await client.query(
+    `INSERT INTO payment_transactions(
+       order_id,
+       payment_attempt_id,
+       channel,
+       channel_transaction_id,
+       amount_fen,
+       currency,
+       status,
+       verified_payload,
+       paid_at
+     )
+     VALUES ($1, $2, $3, $4, $5, $6, 'SUCCESS', $7::jsonb, $8)
+     ON CONFLICT (channel, channel_transaction_id) DO NOTHING`,
+    [
+      input.orderId,
+      input.paymentAttemptId,
+      input.verified.channel,
+      input.verified.channelTransactionId,
+      input.amountFen,
+      input.verified.currency,
+      JSON.stringify(input.verified.raw),
+      input.paidAt.toISOString()
+    ]
+  );
+  if (inserted.rowCount === 1) return true;
+
+  const existing = await client.query<{
+    order_id: string;
+    payment_attempt_id: string | null;
+    channel: PaymentChannel;
+    amount_fen: string;
+    currency: Currency;
+    status: string;
+  }>(
+    `SELECT
+       order_id,
+       payment_attempt_id,
+       channel,
+       amount_fen,
+       currency,
+       status
+     FROM payment_transactions
+     WHERE channel = $1
+       AND channel_transaction_id = $2
+     FOR UPDATE`,
+    [input.verified.channel, input.verified.channelTransactionId]
+  );
+  const transaction = existing.rows[0];
+  return Boolean(
+    transaction &&
+      transaction.order_id === input.orderId &&
+      transaction.payment_attempt_id === input.paymentAttemptId &&
+      transaction.channel === input.verified.channel &&
+      normalizeAmount(transaction.amount_fen) === input.amountFen &&
+      transaction.currency === input.verified.currency &&
+      transaction.status === "SUCCESS"
+  );
+};
+
 const markOrderPaidInTransaction = async (
   client: pg.PoolClient,
   {
@@ -955,6 +1023,24 @@ const markOrderPaidInTransaction = async (
       anomalyKind = "PAYMENT_AFTER_EXPIRY";
     }
     if (anomalyKind) {
+      if (
+        (anomalyKind === "PAYMENT_AFTER_EXPIRY" ||
+          anomalyKind === "DUPLICATE_PAYMENT") &&
+        verifiedAmount !== null &&
+        paidAt !== null
+      ) {
+        const persisted =
+          await persistVerifiedPaymentTransactionInTransaction(client, {
+            orderId: order.id,
+            paymentAttemptId: selectedAttempt.id,
+            verified,
+            amountFen: verifiedAmount,
+            paidAt
+          });
+        if (!persisted) {
+          anomalyKind = "PAYMENT_VERIFICATION_FAILED";
+        }
+      }
       await recordPaymentAnomalyInTransaction(client, {
         order,
         paymentAttemptId: selectedAttempt.id,
@@ -976,74 +1062,26 @@ const markOrderPaidInTransaction = async (
       throw new CommerceError("PAYMENT_VERIFICATION_FAILED");
     }
 
-    const insertedTransaction = await client.query<{ id: string }>(
-      `INSERT INTO payment_transactions(
-         order_id,
-         payment_attempt_id,
-         channel,
-         channel_transaction_id,
-         amount_fen,
-         currency,
-         status,
-         verified_payload,
-         paid_at
-       )
-       VALUES ($1, $2, $3, $4, $5, $6, 'SUCCESS', $7::jsonb, $8)
-       ON CONFLICT (channel, channel_transaction_id) DO NOTHING
-       RETURNING id`,
-      [
-        order.id,
-        selectedAttempt.id,
-        verified.channel,
-        verified.channelTransactionId,
-        verifiedAmount,
-        verified.currency,
-        JSON.stringify(verified.raw),
-        paidAt.toISOString()
-      ]
-    );
-    if (!insertedTransaction.rowCount) {
-      const conflict = await client.query<{
-        order_id: string;
-        payment_attempt_id: string | null;
-        channel: PaymentChannel;
-        amount_fen: string;
-        currency: Currency;
-        status: string;
-      }>(
-        `SELECT
-           order_id,
-           payment_attempt_id,
-           channel,
-           amount_fen,
-           currency,
-           status
-         FROM payment_transactions
-         WHERE channel = $1
-           AND channel_transaction_id = $2
-         FOR UPDATE`,
-        [verified.channel, verified.channelTransactionId]
-      );
-      const owner = conflict.rows[0];
-      if (
-        !owner ||
-        owner.order_id !== order.id ||
-        owner.payment_attempt_id !== selectedAttempt.id ||
-        owner.channel !== verified.channel ||
-        normalizeAmount(owner.amount_fen) !== verifiedAmount ||
-        owner.currency !== verified.currency ||
-        owner.status !== "SUCCESS"
-      ) {
-        await recordPaymentAnomalyInTransaction(client, {
-          order,
-          paymentAttemptId: selectedAttempt.id,
-          attemptChannel: selectedAttempt.channel,
-          verified,
-          paidAt,
-          kind: "PAYMENT_VERIFICATION_FAILED"
-        });
-        return { anomaly: "PAYMENT_VERIFICATION_FAILED" as const };
+    const persisted = await persistVerifiedPaymentTransactionInTransaction(
+      client,
+      {
+        orderId: order.id,
+        paymentAttemptId: selectedAttempt.id,
+        verified,
+        amountFen: verifiedAmount,
+        paidAt
       }
+    );
+    if (!persisted) {
+      await recordPaymentAnomalyInTransaction(client, {
+        order,
+        paymentAttemptId: selectedAttempt.id,
+        attemptChannel: selectedAttempt.channel,
+        verified,
+        paidAt,
+        kind: "PAYMENT_VERIFICATION_FAILED"
+      });
+      return { anomaly: "PAYMENT_VERIFICATION_FAILED" as const };
     }
     await client.query(
       `UPDATE payment_attempts

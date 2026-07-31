@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import pg from "pg";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { enableIdentityPaymentWrites } from "../modules/payments/write-contract.js";
 
 const { Client } = pg;
 
@@ -549,9 +550,7 @@ describe("migration concurrency", () => {
             }
           ]);
           await verify.query("BEGIN");
-          await verify.query(
-            "SET LOCAL peileme.payment_write_contract = 'identity_v1'"
-          );
+          await enableIdentityPaymentWrites(verify);
           await verify.query(
             `UPDATE payment_attempts
              SET reconciliation_next_at = now() - interval '1 second'

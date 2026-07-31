@@ -7,6 +7,7 @@ import {
   reconcileAndCloseExpiredOrders,
   startPayment
 } from "../modules/commerce/orders.js";
+import { enableIdentityPaymentWrites } from "../modules/payments/write-contract.js";
 import {
   cleanupIdentityPaymentOrders,
   createIdentityPaymentOrder,
@@ -136,9 +137,7 @@ describe("Task 4 identity-aware payment service (RED)", () => {
     try {
       await withTransaction(async (client) => {
         await client.query("SET CONSTRAINTS ALL DEFERRED");
-        await client.query(
-          "SET LOCAL peileme.payment_write_contract = 'identity_v1'"
-        );
+        await enableIdentityPaymentWrites(client);
         await client.query(
           `UPDATE orders
               SET status = 'CLOSED',
@@ -224,6 +223,38 @@ describe("Task 4 identity-aware payment service (RED)", () => {
     }
   });
 
+  it("keeps an attempt_v1 owner locked when a legacy writer tries to mark it FAILED", async () => {
+    const fixture = await createIdentityPaymentOrder();
+    const wechat = new ScriptedRealPaymentProvider("wechat_h5");
+    const alipay = new ScriptedRealPaymentProvider("alipay_wap");
+    try {
+      const started = await start(fixture, wechat);
+      await expect(
+        withTransaction(async (client) => {
+          await enableIdentityPaymentWrites(client);
+          await client.query(
+            "UPDATE payment_attempts SET status = 'FAILED' WHERE id = $1",
+            [started.paymentAttemptId]
+          );
+        })
+      ).rejects.toMatchObject({
+        code: "23514",
+        constraint: "payment_attempts_attempt_v1_failed_forbidden"
+      });
+      await expect(start(fixture, alipay)).rejects.toMatchObject({
+        code: "PAYMENT_CHANNEL_LOCKED"
+      });
+      expect(alipay.createInputs).toHaveLength(0);
+      const persisted = await query<{ status: string }>(
+        "SELECT status FROM payment_attempts WHERE id = $1",
+        [started.paymentAttemptId]
+      );
+      expect(persisted.rows).toEqual([{ status: "REDIRECT_READY" }]);
+    } finally {
+      await cleanupIdentityPaymentOrders([fixture]);
+    }
+  });
+
   it("reuses a launch URL only while launch_expires_at is in the future", async () => {
     const fixture = await createIdentityPaymentOrder();
     const provider = new ScriptedRealPaymentProvider("wechat_h5");
@@ -234,9 +265,7 @@ describe("Task 4 identity-aware payment service (RED)", () => {
       expect(provider.createInputs).toHaveLength(1);
 
       await withTransaction(async (client) => {
-        await client.query(
-          "SET LOCAL peileme.payment_write_contract = 'identity_v1'"
-        );
+        await enableIdentityPaymentWrites(client);
         await client.query(
           `UPDATE payment_attempts
               SET launch_expires_at = now() - interval '1 second'

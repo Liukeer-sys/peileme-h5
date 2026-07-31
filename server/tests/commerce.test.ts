@@ -28,6 +28,7 @@ import {
   startPayment
 } from "../modules/commerce/orders.js";
 import { seedPolicyFoundation } from "../modules/policy/seed.js";
+import { enableIdentityPaymentWrites } from "../modules/payments/write-contract.js";
 import { signAccessToken } from "../security.js";
 import {
   insertIdentityAwarePaymentAttempt,
@@ -2546,7 +2547,7 @@ describe("atomic commerce orders and payments", () => {
     }
   });
 
-  it("rejects provider payments made after expiry without persisting settlement", async () => {
+  it("rejects provider payments made after expiry while preserving the payment fact", async () => {
     await seedPolicyFoundation();
     let userId: string | undefined;
     try {
@@ -2614,7 +2615,7 @@ describe("atomic commerce orders and payments", () => {
         order_status: "CLOSED",
         attempt_status: "CLOSED",
         anomalies: "1",
-        transactions: "0",
+        transactions: "1",
         entitlements: "0"
       });
 
@@ -3049,6 +3050,7 @@ describe("atomic commerce orders and payments", () => {
         [order.id]
       );
       let queryCalls = 0;
+      const lateTransactionId = `start-late-${randomUUID()}`;
       const provider = {
         channel: "wechat_h5" as const,
         async createPayment() {
@@ -3059,7 +3061,7 @@ describe("atomic commerce orders and payments", () => {
           return {
             providerOrderNo: orderNo,
             channel: "wechat_h5" as const,
-            channelTransactionId: `start-late-${randomUUID()}`,
+            channelTransactionId: lateTransactionId,
             amountFen: order.amountFen,
             currency: "CNY" as const,
             paidAt: new Date().toISOString(),
@@ -3097,6 +3099,11 @@ describe("atomic commerce orders and payments", () => {
         kind: string;
         anomalies: string;
         transactions: string;
+        transaction_attempt_id: string;
+        transaction_channel: string;
+        channel_transaction_id: string;
+        transaction_amount_fen: string;
+        transaction_currency: string;
         entitlements: string;
         serialized: string;
       }>(
@@ -3112,6 +3119,11 @@ describe("atomic commerce orders and payments", () => {
            (SELECT count(*)::text
               FROM payment_transactions
              WHERE order_id = o.id) AS transactions,
+           transaction.payment_attempt_id AS transaction_attempt_id,
+           transaction.channel AS transaction_channel,
+           transaction.channel_transaction_id,
+           transaction.amount_fen::text AS transaction_amount_fen,
+           transaction.currency AS transaction_currency,
            (SELECT count(*)::text
               FROM entitlements
              WHERE source_id = o.id) AS entitlements,
@@ -3120,6 +3132,10 @@ describe("atomic commerce orders and payments", () => {
          JOIN payment_attempts pa ON pa.id = $2
          JOIN payment_anomalies anomaly
            ON anomaly.payment_attempt_id = pa.id
+         JOIN payment_transactions transaction
+           ON transaction.order_id = o.id
+          AND transaction.payment_attempt_id = pa.id
+          AND transaction.status = 'SUCCESS'
          WHERE o.id = $1`,
         [order.id, attempt.id]
       );
@@ -3130,7 +3146,12 @@ describe("atomic commerce orders and payments", () => {
         reconciliation_last_result: "PAYMENT_AFTER_EXPIRY",
         kind: "PAYMENT_AFTER_EXPIRY",
         anomalies: "1",
-        transactions: "0",
+        transactions: "1",
+        transaction_attempt_id: attempt.id,
+        transaction_channel: "wechat_h5",
+        channel_transaction_id: lateTransactionId,
+        transaction_amount_fen: order.amountFen,
+        transaction_currency: "CNY",
         entitlements: "0"
       });
       expect(persisted.rows[0].serialized).not.toContain(
@@ -3288,7 +3309,8 @@ describe("atomic commerce orders and payments", () => {
           reconciliation_last_result: anomalyCase.kind,
           kind: anomalyCase.kind,
           anomalies: "1",
-          transactions: "0",
+          transactions:
+            anomalyCase.kind === "PAYMENT_AFTER_EXPIRY" ? "1" : "0",
           entitlements: "0"
         });
       }
@@ -3413,9 +3435,44 @@ describe("atomic commerce orders and payments", () => {
         kind: "DUPLICATE_PAYMENT",
         anomaly_status: "PENDING_REVIEW",
         anomalies: "1",
-        transactions: "1",
+        transactions: "2",
         entitlements: "1"
       });
+      const transactionFacts = await query<{
+        payment_attempt_id: string;
+        channel: string;
+        channel_transaction_id: string;
+        amount_fen: string;
+        currency: string;
+      }>(
+        `SELECT
+           payment_attempt_id,
+           channel,
+           channel_transaction_id,
+           amount_fen::text AS amount_fen,
+           currency
+         FROM payment_transactions
+         WHERE order_id = $1
+           AND status = 'SUCCESS'
+         ORDER BY channel, channel_transaction_id`,
+        [order.id]
+      );
+      expect(transactionFacts.rows).toEqual([
+        {
+          payment_attempt_id: secondAttempt.id,
+          channel: "alipay_wap",
+          channel_transaction_id: duplicateVerified.channelTransactionId,
+          amount_fen: order.amountFen,
+          currency: "CNY"
+        },
+        {
+          payment_attempt_id: firstAttempt.id,
+          channel: "wechat_h5",
+          channel_transaction_id: firstVerified.channelTransactionId,
+          amount_fen: order.amountFen,
+          currency: "CNY"
+        }
+      ]);
       expect(persisted.rows[0].serialized).not.toContain(rawSecret);
     } finally {
       if (userId) await cleanupEntitlementTestUsers([userId]);
@@ -3438,6 +3495,7 @@ describe("atomic commerce orders and payments", () => {
         orderId: order.id,
         channel: "alipay_wap",
         status: "FAILED",
+        origin: "legacy_order_no",
         requestSnapshot: { marker: "ordinary-alipay" }
       });
       const scheduledWechat = await insertIdentityAwarePaymentAttempt({
@@ -5741,6 +5799,7 @@ describe("atomic commerce orders and payments", () => {
         "closed-late-paid"
       );
       let queryCalls = 0;
+      const lateTransactionId = `closed-after-expiry-${randomUUID()}`;
       const provider = {
         channel: "wechat_h5" as const,
         async createPayment() {
@@ -5751,7 +5810,7 @@ describe("atomic commerce orders and payments", () => {
           return {
             providerOrderNo: orderNo,
             channel: "wechat_h5" as const,
-            channelTransactionId: `closed-after-expiry-${randomUUID()}`,
+            channelTransactionId: lateTransactionId,
             amountFen: closed.order.amountFen,
             currency: "CNY" as const,
             paidAt: new Date().toISOString(),
@@ -5790,6 +5849,9 @@ describe("atomic commerce orders and payments", () => {
         reconciliation_attempt_count: number;
         reconciliation_last_result: string;
         transactions: string;
+        transaction_attempt_id: string;
+        transaction_channel_id: string;
+        transaction_amount_fen: string;
         entitlements: string;
       }>(
         `SELECT
@@ -5800,11 +5862,18 @@ describe("atomic commerce orders and payments", () => {
            (SELECT count(*)::text
               FROM payment_transactions
              WHERE order_id = o.id) AS transactions,
+           transaction.payment_attempt_id AS transaction_attempt_id,
+           transaction.channel_transaction_id AS transaction_channel_id,
+           transaction.amount_fen::text AS transaction_amount_fen,
            (SELECT count(*)::text
               FROM entitlements
              WHERE source_id = o.id) AS entitlements
          FROM orders o
          JOIN payment_attempts pa ON pa.id = $2
+         JOIN payment_transactions transaction
+           ON transaction.order_id = o.id
+          AND transaction.payment_attempt_id = pa.id
+          AND transaction.status = 'SUCCESS'
          WHERE o.id = $1`,
         [closed.order.id, closed.attemptId]
       );
@@ -5813,7 +5882,10 @@ describe("atomic commerce orders and payments", () => {
         reconciliation_state: "TERMINAL",
         reconciliation_attempt_count: 1,
         reconciliation_last_result: "PAYMENT_AFTER_EXPIRY",
-        transactions: "0",
+        transactions: "1",
+        transaction_attempt_id: closed.attemptId,
+        transaction_channel_id: lateTransactionId,
+        transaction_amount_fen: closed.order.amountFen,
         entitlements: "0"
       });
     } finally {
@@ -6772,7 +6844,7 @@ describe("atomic commerce orders and payments", () => {
           : {
               status: "CLOSED",
               attempt_status: "CLOSED",
-              transactions: "0",
+              transactions: "1",
               entitlements: "0"
             }
       );
@@ -6806,9 +6878,7 @@ describe("atomic commerce orders and payments", () => {
             `ALTER TABLE payment_attempts
              DISABLE TRIGGER payment_attempt_provider_owner_guard_trigger`
           );
-          await client.query(
-            "SET LOCAL peileme.payment_write_contract = 'identity_v1'"
-          );
+          await enableIdentityPaymentWrites(client);
           await client.query(
             `WITH generated_orders AS (
              INSERT INTO orders(
@@ -6949,6 +7019,28 @@ describe("atomic commerce orders and payments", () => {
             `ALTER TABLE provider_payment_orders
              ENABLE TRIGGER provider_payment_owner_guard_trigger`
           );
+          const enabledGuards = await client.query<{
+            tgname: string;
+            tgenabled: string;
+          }>(
+            `SELECT tgname, tgenabled
+             FROM pg_trigger
+             WHERE tgname IN (
+               'provider_payment_owner_guard_trigger',
+               'payment_attempt_provider_owner_guard_trigger'
+             )
+             ORDER BY tgname`
+          );
+          expect(enabledGuards.rows).toEqual([
+            {
+              tgname: "payment_attempt_provider_owner_guard_trigger",
+              tgenabled: "O"
+            },
+            {
+              tgname: "provider_payment_owner_guard_trigger",
+              tgenabled: "O"
+            }
+          ]);
         });
         await query("ANALYZE orders, payment_attempts");
         const explained = await query<{ "QUERY PLAN": unknown }>(
@@ -7873,7 +7965,10 @@ describe("atomic commerce orders and payments", () => {
     let userId: string | undefined;
     try {
       userId = await createEntitlementTestUser(true);
-      const makeOrderWithAttempt = async (marker: string) => {
+      const makeOrderWithAttempt = async (
+        marker: string,
+        origin: "attempt_v1" | "legacy_order_no" = "attempt_v1"
+      ) => {
         const order = await createOrder({
           userId: userId!,
           sku: "POLICY_CALC",
@@ -7885,6 +7980,7 @@ describe("atomic commerce orders and payments", () => {
           orderId: order.id,
           channel: "wechat_h5",
           status: "REDIRECT_READY",
+          origin,
           launchUrl: "/pending",
           launchExpiresAt: new Date(Date.now() + 5 * 60_000)
         });
@@ -7896,7 +7992,10 @@ describe("atomic commerce orders and payments", () => {
       };
       const paid = await makeOrderWithAttempt("paid-expiry");
       const pending = await makeOrderWithAttempt("pending-expiry");
-      const failed = await makeOrderWithAttempt("failed-expiry");
+      const failed = await makeOrderWithAttempt(
+        "failed-expiry",
+        "legacy_order_no"
+      );
       await markOrderPaid({
         orderId: paid.order.id,
         paymentAttemptId: paid.attemptId,

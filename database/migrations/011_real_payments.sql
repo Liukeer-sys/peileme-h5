@@ -687,21 +687,34 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   identity_provider_order_no TEXT;
+  identity_origin TEXT;
+  expected_write_contract TEXT;
 BEGIN
   IF NEW.provider_payment_order_id IS NULL THEN
     RETURN NEW;
   END IF;
+  expected_write_contract :=
+    'identity_v1:' || txid_current()::text;
   IF current_setting('peileme.payment_write_contract', true)
-       IS DISTINCT FROM 'identity_v1' THEN
+       IS DISTINCT FROM expected_write_contract THEN
     RAISE EXCEPTION USING
       ERRCODE = '23514',
       CONSTRAINT = 'payment_attempts_write_contract_guard',
-      MESSAGE = 'identity_v1 payment write contract is required';
+      MESSAGE = 'transaction-bound identity_v1 payment write contract is required';
   END IF;
-  SELECT provider_order_no
-    INTO identity_provider_order_no
+  SELECT provider_order_no, origin
+    INTO identity_provider_order_no, identity_origin
     FROM provider_payment_orders
    WHERE id = NEW.provider_payment_order_id;
+  IF NEW.status = 'FAILED'
+     AND NEW.channel IN ('wechat_h5', 'alipay_wap')
+     AND NEW.provider_identity_role = 'canonical_owner'
+     AND identity_origin = 'attempt_v1' THEN
+    RAISE EXCEPTION USING
+      ERRCODE = '23514',
+      CONSTRAINT = 'payment_attempts_attempt_v1_failed_forbidden',
+      MESSAGE = 'attempt_v1 canonical owners cannot enter FAILED';
+  END IF;
   IF NEW.request_snapshot ->> 'providerOrderNo'
        IS DISTINCT FROM identity_provider_order_no THEN
     RAISE EXCEPTION USING

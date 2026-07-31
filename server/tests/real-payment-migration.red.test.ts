@@ -6,6 +6,7 @@ import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { closePool, query, withTransaction } from "../db.js";
 import { runMigrations } from "../migrate.js";
+import { enableIdentityPaymentWrites } from "../modules/payments/write-contract.js";
 
 const { Client } = pg;
 
@@ -105,9 +106,7 @@ const insertAttempt = (
     const attemptId = randomUUID();
     const providerPaymentOrderId = randomUUID();
     await client.query("SET CONSTRAINTS ALL DEFERRED");
-    await client.query(
-      "SET LOCAL peileme.payment_write_contract = 'identity_v1'"
-    );
+    await enableIdentityPaymentWrites(client);
     await client.query(
       `INSERT INTO provider_payment_orders(
          id,
@@ -166,9 +165,7 @@ const insertLegacyIdentityWithAlias = (
     const providerOrderNo =
       `LG${randomUUID().replaceAll("-", "").slice(0, 28).toUpperCase()}`;
     await client.query("SET CONSTRAINTS ALL DEFERRED");
-    await client.query(
-      "SET LOCAL peileme.payment_write_contract = 'identity_v1'"
-    );
+    await enableIdentityPaymentWrites(client);
     await client.query(
       `INSERT INTO provider_payment_orders(
          id,
@@ -246,9 +243,7 @@ const withIdentityWriteContract = <T>(
   callback: (client: pg.PoolClient) => Promise<T>
 ) =>
   withTransaction(async (client) => {
-    await client.query(
-      "SET LOCAL peileme.payment_write_contract = 'identity_v1'"
-    );
+    await enableIdentityPaymentWrites(client);
     return callback(client);
   });
 
@@ -1191,9 +1186,7 @@ describe("Task 4 real payment migration behavior (RED)", () => {
       const fakeIdentityId = randomUUID();
       await withTransaction(async (client) => {
         await client.query("SET CONSTRAINTS ALL DEFERRED");
-        await client.query(
-          "SET LOCAL peileme.payment_write_contract = 'identity_v1'"
-        );
+        await enableIdentityPaymentWrites(client);
         await client.query(
           `INSERT INTO provider_payment_orders(
              id,
@@ -1355,6 +1348,127 @@ describe("Task 4 real payment migration behavior (RED)", () => {
     }
   });
 
+  it("rejects a session-level static identity_v1 write contract", async () => {
+    const fixture = await createOrderFixture();
+    const connection = new Client({ connectionString: process.env.DATABASE_URL });
+    let connected = false;
+    try {
+      const attempt = await insertAttempt(
+        fixture.orderId,
+        "wechat_h5",
+        "CLOSED",
+        `WX${randomUUID().replaceAll("-", "").slice(0, 28).toUpperCase()}`
+      );
+      await connection.connect();
+      connected = true;
+      await connection.query(
+        "SET SESSION peileme.payment_write_contract = 'identity_v1'"
+      );
+      await connection.query("BEGIN");
+      await expect(
+        connection.query(
+          "UPDATE payment_attempts SET updated_at = now() WHERE id = $1",
+          [attempt.id]
+        )
+      ).rejects.toMatchObject({
+        code: "23514",
+        constraint: "payment_attempts_write_contract_guard"
+      });
+      await connection.query("ROLLBACK");
+    } finally {
+      if (connected) {
+        await connection.query("ROLLBACK").catch(() => undefined);
+        await connection
+          .query("RESET peileme.payment_write_contract")
+          .catch(() => undefined);
+        await connection.end();
+      }
+      await cleanupOrderFixture(fixture);
+    }
+  });
+
+  it("accepts a transaction token once and rejects it after the transaction changes", async () => {
+    const fixture = await createOrderFixture();
+    const connection = new Client({ connectionString: process.env.DATABASE_URL });
+    let connected = false;
+    try {
+      const attempt = await insertAttempt(
+        fixture.orderId,
+        "wechat_h5",
+        "CLOSED",
+        `WX${randomUUID().replaceAll("-", "").slice(0, 28).toUpperCase()}`
+      );
+      await connection.connect();
+      connected = true;
+      await connection.query("BEGIN");
+      await connection.query(
+        `SELECT set_config(
+           'peileme.payment_write_contract',
+           'identity_v1:' || txid_current()::text,
+           false
+         )`
+      );
+      await expect(
+        connection.query(
+          "UPDATE payment_attempts SET updated_at = now() WHERE id = $1",
+          [attempt.id]
+        )
+      ).resolves.toMatchObject({ rowCount: 1 });
+      await connection.query("COMMIT");
+
+      await connection.query("BEGIN");
+      await expect(
+        connection.query(
+          "UPDATE payment_attempts SET updated_at = now() WHERE id = $1",
+          [attempt.id]
+        )
+      ).rejects.toMatchObject({
+        code: "23514",
+        constraint: "payment_attempts_write_contract_guard"
+      });
+      await connection.query("ROLLBACK");
+    } finally {
+      if (connected) {
+        await connection.query("ROLLBACK").catch(() => undefined);
+        await connection
+          .query("RESET peileme.payment_write_contract")
+          .catch(() => undefined);
+        await connection.end();
+      }
+      await cleanupOrderFixture(fixture);
+    }
+  });
+
+  it("forbids a real attempt_v1 canonical owner from entering FAILED", async () => {
+    const fixture = await createOrderFixture();
+    try {
+      const attempt = await insertAttempt(
+        fixture.orderId,
+        "wechat_h5",
+        "REDIRECT_READY",
+        `WX${randomUUID().replaceAll("-", "").slice(0, 28).toUpperCase()}`
+      );
+      await expect(
+        withIdentityWriteContract((client) =>
+          client.query(
+            "UPDATE payment_attempts SET status = 'FAILED' WHERE id = $1",
+            [attempt.id]
+          )
+        )
+      ).rejects.toMatchObject({
+        code: "23514",
+        constraint: "payment_attempts_attempt_v1_failed_forbidden"
+      });
+      const persisted = await query<{ status: string }>(
+        "SELECT status FROM payment_attempts WHERE id = $1",
+        [attempt.id]
+      );
+      expect(persisted.rows).toEqual([{ status: "REDIRECT_READY" }]);
+    } finally {
+      await cleanupOrderFixture(fixture);
+    }
+  });
+
   it("forbids fake for a newly allocated attempt_v1 identity", async () => {
     const fixture = await createOrderFixture();
     try {
@@ -1363,9 +1477,7 @@ describe("Task 4 real payment migration behavior (RED)", () => {
           const attemptId = randomUUID();
           const identityId = randomUUID();
           await client.query("SET CONSTRAINTS ALL DEFERRED");
-          await client.query(
-            "SET LOCAL peileme.payment_write_contract = 'identity_v1'"
-          );
+          await enableIdentityPaymentWrites(client);
           await client.query(
             `INSERT INTO provider_payment_orders(
                id,
@@ -1427,9 +1539,7 @@ describe("Task 4 real payment migration behavior (RED)", () => {
       await expect(
         withTransaction(async (client) => {
           await client.query("SET CONSTRAINTS ALL DEFERRED");
-          await client.query(
-            "SET LOCAL peileme.payment_write_contract = 'identity_v1'"
-          );
+          await enableIdentityPaymentWrites(client);
           await client.query(
             `INSERT INTO provider_payment_orders(
                id,
@@ -1459,9 +1569,7 @@ describe("Task 4 real payment migration behavior (RED)", () => {
           const attemptId = randomUUID();
           const identityId = randomUUID();
           await client.query("SET CONSTRAINTS ALL DEFERRED");
-          await client.query(
-            "SET LOCAL peileme.payment_write_contract = 'identity_v1'"
-          );
+          await enableIdentityPaymentWrites(client);
           await client.query(
             `INSERT INTO provider_payment_orders(
                id,
@@ -2515,9 +2623,7 @@ describe("Task 4 real payment migration behavior (RED)", () => {
         const identityAwareUpdate = await client.query("BEGIN");
         expect(identityAwareUpdate.command).toBe("BEGIN");
         try {
-          await client.query(
-            "SET LOCAL peileme.payment_write_contract = 'identity_v1'"
-          );
+          await enableIdentityPaymentWrites(client);
           const updated = await client.query(
             `UPDATE payment_attempts
                 SET request_snapshot = jsonb_build_object(
@@ -2552,9 +2658,7 @@ describe("Task 4 real payment migration behavior (RED)", () => {
         ).rejects.toMatchObject({ code: "23514" });
         await client.query("BEGIN");
         try {
-          await client.query(
-            "SET LOCAL peileme.payment_write_contract = 'identity_v1'"
-          );
+          await enableIdentityPaymentWrites(client);
           await expect(
             client.query(
               `UPDATE payment_attempts

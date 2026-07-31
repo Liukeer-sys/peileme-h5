@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type pg from "pg";
 import { query, withTransaction } from "../../db.js";
 import { createOrder } from "../../modules/commerce/orders.js";
+import { enableIdentityPaymentWrites } from "../../modules/payments/write-contract.js";
 import { seedPolicyFoundation } from "../../modules/policy/seed.js";
 
 export type RealPaymentChannel = "wechat_h5" | "alipay_wap";
@@ -52,9 +53,7 @@ export const paymentWriteQuery = <Row extends pg.QueryResultRow = pg.QueryResult
   values?: unknown[]
 ) =>
   withTransaction(async (client) => {
-    await client.query(
-      "SET LOCAL peileme.payment_write_contract = 'identity_v1'"
-    );
+    await enableIdentityPaymentWrites(client);
     return client.query<Row>(text, values);
   });
 
@@ -63,6 +62,7 @@ export const insertIdentityAwarePaymentAttempt = async (input: {
   channel?: RealPaymentChannel;
   status: string;
   providerOrderNo?: string;
+  origin?: "attempt_v1" | "legacy_order_no";
   launchUrl?: string | null;
   launchExpiresAt?: Date | string | null;
   requestSnapshot?: Record<string, unknown>;
@@ -74,9 +74,7 @@ export const insertIdentityAwarePaymentAttempt = async (input: {
 }) =>
   withTransaction(async (client) => {
     await client.query("SET CONSTRAINTS ALL DEFERRED");
-    await client.query(
-      "SET LOCAL peileme.payment_write_contract = 'identity_v1'"
-    );
+    await enableIdentityPaymentWrites(client);
     const channel = input.channel ?? "wechat_h5";
     const attemptId = randomUUID();
     const identityId = randomUUID();
@@ -91,14 +89,15 @@ export const insertIdentityAwarePaymentAttempt = async (input: {
          id, order_id, channel, provider_order_no, origin, allocated_at,
          canonical_attempt_id, manual_review_required
        ) VALUES (
-         $1, $2, $3, $4, 'attempt_v1', COALESCE($5::timestamptz, now()),
-         $6, false
+         $1, $2, $3, $4, $5, COALESCE($6::timestamptz, now()),
+         $7, false
        )`,
       [
         identityId,
         input.orderId,
         channel,
         providerOrderNo,
+        input.origin ?? "attempt_v1",
         input.createdAt ?? null,
         attemptId
       ]

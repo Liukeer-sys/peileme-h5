@@ -161,7 +161,7 @@ ALIPAY_PUBLIC_KEY_FILE=/run/secrets/alipay_public_key.pem
 
 冲突诊断只在 stderr 输出一条稳定机器可读行：`PAYMENT_MIGRATION_DIAGNOSTIC {json}`，marker 与 JSON 之间为一个 ASCII 空格。preflight JSON 的键集合固定且仅为 `{code, orderIds, attemptIds, transactionIds, refundIds}`；四个 ID 数组按 UUID 文本升序排列并去重，精确包含该冲突实际相关记录。多一个 UUID、少一个 UUID、错分类、重复、乱序、额外键或虚构 UUID 都违反诊断契约。上述 preflight 在 identity 分配前终止，因此 JSON 中明确不存在 `identityIds` 键；只有后续阶段已真实插入 identity 后发生的冲突才能使用另一个版本化诊断 schema 输出真实 `identityIds`。任一冲突回滚验证对 `payment_attempts`、`payment_transactions`、`refunds` 使用稳定排序的整行 `to_jsonb(row)` 快照，证明全部旧字段不变。
 
-迁移后的 payment attempt 写入由 transaction-local contract 熔断：identity-aware 事务必须先执行 `SET LOCAL peileme.payment_write_contract='identity_v1'`，且 `request_snapshot.providerOrderNo` 必须等于所引 identity 的 `provider_order_no`；迁移事务只使用局部 migration contract。没有 GUC 的旧 `preparePayment` UPDATE、旧 reconciliation 状态 UPDATE 和旧形状 INSERT 均由 trigger 返回 `23514/23502`。数据库 kill-switch 只能阻断写入；旧 worker 可能发出的上游查单/关单由维护窗口停进程、撤销旧实例支付凭证和发布门禁共同隔离。
+迁移后的 payment attempt 写入由 transaction-local contract 熔断：identity-aware 事务通过统一 helper 写入 `identity_v1:<txid_current()>` 的 transaction-local token，且 `request_snapshot.providerOrderNo` 必须等于所引 identity 的 `provider_order_no`；静态 session token、跨事务复用的过期 token 和没有 token 的旧写入均由 trigger 返回 `23514/23502`，迁移事务只使用局部 migration contract。数据库 kill-switch 只能阻断写入；旧 worker 可能发出的上游查单/关单由维护窗口停进程、撤销旧实例支付凭证和发布门禁共同隔离。
 
 `provider_payment_orders.order_id` 与 `orders` 使用 `ON DELETE CASCADE`，双向 identity/attempt 外键为可延迟 `NO ACTION`，保证同一事务删除测试订单时 attempts 与 identities 一起清理且不遗留环形引用。生产财务订单、identity、transaction 和 refund 一律不物理删除；业务撤销使用状态、审计和依法配置的保留策略。
 
@@ -316,7 +316,7 @@ ALIPAY_PUBLIC_KEY_FILE=/run/secrets/alipay_public_key.pem
 - alias 强制 `CLOSED + TERMINAL + LEGACY_PROVIDER_IDENTITY_ALIAS` 且无 schedule/deadline；同 identity 全部 attempts 必须与 owner 同 order，必要 reconciliation 工作只归 owner；
 - 011 后每个新 attempt 一对一创建 `attempt_v1` identity，商户支付单号与 `orders.order_no` 分离且不可变；
 - owner 指针、identity 关联、channel、role、eligibility 和 identity 全字段具有数据库负例；旧版缺 identity 的 INSERT 在 011 后失败；冲突迁移断言 schema/data/version 全事务回滚；
-- transaction-local `identity_v1` GUC kill-switch 同时拒绝旧 preparePayment 与旧 reconciliation UPDATE；providerOrderNo 不匹配也拒绝；
+- transaction-local `identity_v1:<txid_current()>` GUC kill-switch 同时拒绝静态 session token、跨事务过期 token、旧 preparePayment 与旧 reconciliation UPDATE；providerOrderNo 不匹配也拒绝；
 - legacy real/fake refund 精确保留 refund_no 并绑定唯一一致 `SUCCESS` transaction；0/多 SUCCESS、空 attempt、不一致付款事实 fail-fast，冲突诊断逐一列出实际相关 order/attempt/transaction/refund id，三张旧表的整行 JSON 快照与 schema/version 一起回滚；
 - `UNIQUE(channel, provider_refund_no)` 拒绝同渠道重号并允许跨渠道同号；refund INSERT/UPDATE 均拒绝 `CLOSED|REFUND` transaction，已被 refund 引用的 `SUCCESS` transaction 关键财务字段不可修改；真实进行中 eligibility 必须为 true，fake/终态必须为 false；
 - 删除测试订单可在一个事务内清理 attempts/identities 且无环形 FK orphan；生产财务数据禁止物理删除；
