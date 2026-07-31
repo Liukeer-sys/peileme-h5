@@ -441,6 +441,7 @@ const announcementAuditSnapshot = (announcement: {
   status: string;
   starts_at: string | null;
   ends_at: string | null;
+  revision?: number;
   created_by?: string | null;
   created_at?: string;
   updated_at?: string;
@@ -452,6 +453,9 @@ const announcementAuditSnapshot = (announcement: {
   status: announcement.status,
   startsAt: announcement.starts_at,
   endsAt: announcement.ends_at,
+  ...(announcement.revision !== undefined
+    ? { revision: announcement.revision }
+    : {}),
   ...(announcement.created_by !== undefined
     ? { createdBy: announcement.created_by }
     : {}),
@@ -1833,6 +1837,7 @@ export class PolicyRepository {
       sourceUrl: string;
       sourcePublishedAt: string;
       status: "draft" | "verified" | "stale";
+      expectedRevision?: number;
     };
     request: Request;
   }) {
@@ -1852,10 +1857,10 @@ export class PolicyRepository {
           "所选地区当前不可用于政策参数"
         );
       }
-      const before = await client.query(
+      const before = await client.query<{ revision: number } & Record<string, unknown>>(
         `SELECT id, region_code, region_name, year, parameter_type,
                 amount_fen::text, source_name, source_url,
-                source_published_at::text, status, reviewed_by
+                source_published_at::text, status, reviewed_by, revision
            FROM regional_parameters
           WHERE region_code = $1
             AND year = $2
@@ -1863,6 +1868,17 @@ export class PolicyRepository {
           FOR UPDATE`,
         [input.regionCode, input.year, input.parameterType]
       );
+      if (
+        before.rows[0] &&
+        input.expectedRevision !== undefined &&
+        input.expectedRevision !== before.rows[0].revision
+      ) {
+        throw new ApiError(
+          409,
+          "VERSION_CONFLICT",
+          "区域参数已被其他管理员更新，请刷新后重试"
+        );
+      }
       const result = await client.query<{
         id: string;
         region_code: string;
@@ -1875,6 +1891,7 @@ export class PolicyRepository {
         source_published_at: string;
         status: "draft" | "verified" | "stale";
         reviewed_by: string;
+        revision: number;
       }>(
         `INSERT INTO regional_parameters(
            region_code, region_name, year, parameter_type, amount_fen,
@@ -1894,10 +1911,11 @@ export class PolicyRepository {
            status = EXCLUDED.status,
            reviewed_by = EXCLUDED.reviewed_by,
            reviewed_at = now(),
+           revision = regional_parameters.revision + 1,
            updated_at = now()
          RETURNING id, region_code, region_name, year, parameter_type,
                    amount_fen::text, source_name, source_url,
-                   source_published_at::text, status, reviewed_by`,
+                   source_published_at::text, status, reviewed_by, revision`,
         [
           input.regionCode,
           region.rows[0].name,
@@ -1943,7 +1961,8 @@ export class PolicyRepository {
         sourceUrl: row.source_url,
         sourcePublishedAt: row.source_published_at,
         status: row.status,
-        reviewedBy: row.reviewed_by
+        reviewedBy: row.reviewed_by,
+        revision: row.revision
       };
     });
   }
@@ -1998,6 +2017,7 @@ export class PolicyRepository {
         status: "draft" | "verified" | "stale";
         reviewed_by: string | null;
         reviewed_at: string | null;
+        revision: number;
         updated_at: string;
     };
     const result = await query<{
@@ -2017,7 +2037,8 @@ export class PolicyRepository {
                 rp.year, rp.parameter_type, rp.amount_fen::text,
                 rp.source_name, rp.source_url,
                 rp.source_published_at::text, rp.status,
-                rp.reviewed_by, rp.reviewed_at::text, rp.updated_at::text
+                rp.reviewed_by, rp.reviewed_at::text, rp.revision,
+                rp.updated_at::text
            FROM regional_parameters rp
            JOIN administrative_regions child ON child.code = rp.region_code
            LEFT JOIN administrative_regions parent
@@ -2058,6 +2079,7 @@ export class PolicyRepository {
         status: row.status,
         reviewedBy: row.reviewed_by,
         reviewedAt: row.reviewed_at,
+        revision: row.revision,
         updatedAt: row.updated_at
       })),
       pagination: {
@@ -2140,6 +2162,7 @@ export class PolicyRepository {
           source_published_at: string;
           status: "draft" | "verified" | "stale";
           reviewed_by: string;
+          revision: number;
         }>(
           `INSERT INTO regional_parameters(
              region_code, region_name, year, parameter_type, amount_fen,
@@ -2159,10 +2182,11 @@ export class PolicyRepository {
              status = EXCLUDED.status,
              reviewed_by = EXCLUDED.reviewed_by,
              reviewed_at = now(),
+             revision = regional_parameters.revision + 1,
              updated_at = now()
            RETURNING id, region_code, region_name, year, parameter_type,
                      amount_fen::text, source_name, source_url,
-                     source_published_at::text, status, reviewed_by`,
+                     source_published_at::text, status, reviewed_by, revision`,
           [
             input.regionCode,
             input.regionName,
@@ -2188,7 +2212,8 @@ export class PolicyRepository {
           sourceUrl: row.source_url,
           sourcePublishedAt: row.source_published_at,
           status: row.status,
-          reviewedBy: row.reviewed_by
+          reviewedBy: row.reviewed_by,
+          revision: row.revision
         });
       }
       const batchId = crypto.randomUUID();
@@ -2219,12 +2244,13 @@ export class PolicyRepository {
       status: "draft" | "published" | "archived";
       starts_at: string | null;
       ends_at: string | null;
+      revision: number;
       created_by: string | null;
       created_at: string;
       updated_at: string;
     }>(
       `SELECT id, title, body, placement, status,
-              starts_at::text, ends_at::text, created_by,
+              starts_at::text, ends_at::text, revision, created_by,
               created_at::text, updated_at::text
          FROM announcements
         ORDER BY updated_at DESC, id DESC`
@@ -2237,6 +2263,7 @@ export class PolicyRepository {
       status: row.status,
       startsAt: row.starts_at,
       endsAt: row.ends_at,
+      revision: row.revision,
       createdBy: row.created_by,
       createdAt: row.created_at,
       updatedAt: row.updated_at
@@ -2266,6 +2293,7 @@ export class PolicyRepository {
         status: "draft" | "published" | "archived";
         starts_at: string | null;
         ends_at: string | null;
+        revision: number;
         created_by: string;
         created_at: string;
         updated_at: string;
@@ -2275,7 +2303,7 @@ export class PolicyRepository {
          )
          VALUES ($1, $2, $3, $4, $5, $6, $7)
          RETURNING id, title, body, placement, status,
-                   starts_at::text, ends_at::text, created_by,
+                   starts_at::text, ends_at::text, revision, created_by,
                    created_at::text, updated_at::text`,
         [
           input.title,
@@ -2307,6 +2335,7 @@ export class PolicyRepository {
         status: row.status,
         startsAt: row.starts_at,
         endsAt: row.ends_at,
+        revision: row.revision,
         createdBy: row.created_by,
         createdAt: row.created_at,
         updatedAt: row.updated_at
@@ -2327,6 +2356,7 @@ export class PolicyRepository {
       status?: "draft" | "published" | "archived";
       startsAt?: string | null;
       endsAt?: string | null;
+      expectedRevision?: number;
     };
     request: Request;
   }) {
@@ -2339,9 +2369,10 @@ export class PolicyRepository {
         status: "draft" | "published" | "archived";
         starts_at: string | null;
         ends_at: string | null;
+        revision: number;
       }>(
         `SELECT id, title, body, placement, status,
-                starts_at::text, ends_at::text
+                starts_at::text, ends_at::text, revision
            FROM announcements
           WHERE id = $1
           FOR UPDATE`,
@@ -2353,6 +2384,16 @@ export class PolicyRepository {
           404,
           "ANNOUNCEMENT_NOT_FOUND",
           "公告不存在"
+        );
+      }
+      if (
+        input.expectedRevision !== undefined &&
+        input.expectedRevision !== before.revision
+      ) {
+        throw new ApiError(
+          409,
+          "VERSION_CONFLICT",
+          "公告已被其他管理员更新，请刷新后重试"
         );
       }
       const startsAt = Object.hasOwn(input, "startsAt")
@@ -2387,7 +2428,9 @@ export class PolicyRepository {
       } else if (
         before.status === "published" &&
         requestedStatus === "archived" &&
-        Object.keys(input).every((key) => key === "status")
+        Object.keys(input).every(
+          (key) => key === "status" || key === "expectedRevision"
+        )
       ) {
         // The only mutation allowed after publication is archival.
       } else {
@@ -2405,6 +2448,7 @@ export class PolicyRepository {
         status: "draft" | "published" | "archived";
         starts_at: string | null;
         ends_at: string | null;
+        revision: number;
         created_by: string | null;
         created_at: string;
         updated_at: string;
@@ -2416,10 +2460,11 @@ export class PolicyRepository {
                 status = $5,
                 starts_at = $6,
                 ends_at = $7,
+                revision = revision + 1,
                 updated_at = now()
           WHERE id = $1
           RETURNING id, title, body, placement, status,
-                    starts_at::text, ends_at::text, created_by,
+                    starts_at::text, ends_at::text, revision, created_by,
                     created_at::text, updated_at::text`,
         [
           id,
@@ -2451,6 +2496,7 @@ export class PolicyRepository {
         status: row.status,
         startsAt: row.starts_at,
         endsAt: row.ends_at,
+        revision: row.revision,
         createdBy: row.created_by,
         createdAt: row.created_at,
         updatedAt: row.updated_at

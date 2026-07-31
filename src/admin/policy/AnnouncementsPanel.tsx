@@ -10,6 +10,7 @@ type Announcement = {
   status: "draft" | "published" | "archived";
   startsAt: string | null;
   endsAt: string | null;
+  revision: number;
   updatedAt: string;
 };
 const announcementStatus = (status: Announcement["status"]) =>
@@ -144,8 +145,8 @@ export default function AnnouncementsPanel({
           auth: true,
           body:
             editingStatus === "published"
-              ? { status: form.status }
-              : editableBody
+              ? { status: form.status, expectedRevision: editingItem!.revision }
+              : { ...editableBody, expectedRevision: editingItem!.revision }
         });
         setMessage("公告已更新");
       } else {

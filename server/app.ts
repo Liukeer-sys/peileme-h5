@@ -16,6 +16,7 @@ import { writeAdminAudit as audit } from "./audit.js";
 import { getConfig } from "./config.js";
 import { query, withTransaction } from "./db.js";
 import { ApiError } from "./errors.js";
+import { parseClientEvent } from "./modules/analytics/catalog.js";
 import { createCommerceRouters } from "./modules/commerce/routes.js";
 import { createAiRouter } from "./modules/ai/routes.js";
 import { listOwnedAiJobs } from "./modules/ai/repository.js";
@@ -59,6 +60,7 @@ import {
   publicUser,
   requireAdmin,
   requireAuth,
+  requireCapability,
   requireSuperAdmin
 } from "./security.js";
 import {
@@ -303,6 +305,19 @@ export const createApp = (
     });
   });
 
+  app.get("/api/ready", async (_request, response) => {
+    const started = Date.now();
+    const database = await query<{ version: string }>(
+      "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1"
+    );
+    response.json({
+      status: "ready",
+      dependencies: { database: "ready" },
+      migration: database.rows[0]?.version ?? null,
+      checkedInMs: Date.now() - started
+    });
+  });
+
   app.get("/api/public/config", (request, response) => {
     response.json({
       registrationRequireInvite: config.REGISTRATION_REQUIRE_INVITE,
@@ -311,6 +326,20 @@ export const createApp = (
         ? { maxUploadMb: config.MAX_UPLOAD_MB }
         : {})
     });
+  });
+
+  app.get("/api/public/announcements", async (request, response) => {
+    const result = await query(
+      `SELECT id, title, body, placement, starts_at, ends_at, revision
+         FROM announcements
+        WHERE status = 'published'
+          AND placement IN ($1, 'all')
+          AND (starts_at IS NULL OR starts_at <= now())
+          AND (ends_at IS NULL OR ends_at >= now())
+        ORDER BY created_at DESC, id DESC`,
+      [request.productChannel!]
+    );
+    response.json({ items: result.rows });
   });
 
   const allowedOrigins = new Set(
@@ -715,20 +744,39 @@ export const createApp = (
     });
   });
 
-  const eventSchema = z.object({
-    name: z.string().trim().min(1).max(100),
-    path: z.string().max(500).optional(),
-    properties: z.record(z.string(), z.unknown()).default({}),
-    occurredAt: z.string().datetime().optional()
-  });
+  const eventSchema = z
+    .object({
+      name: z.string().trim().min(1).max(100),
+      path: z.string().max(500).optional(),
+      properties: z.unknown().optional(),
+      occurredAt: z.string().datetime().optional()
+    })
+    .strict()
+    .superRefine((event, context) => {
+      if (
+        event.occurredAt &&
+        Math.abs(Date.parse(event.occurredAt) - Date.now()) > 86_400_000
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["occurredAt"],
+          message: "事件时间超出允许范围"
+        });
+      }
+    });
 
   app.post("/api/events/batch", async (request, response) => {
     const body = z
       .object({ events: z.array(eventSchema).min(1).max(50) })
+      .strict()
       .parse(request.body);
+    const events = body.events.map((event) => ({
+      ...event,
+      ...parseClientEvent(event)
+    }));
     const identity = getRequestIdentity(request);
     await withTransaction(async (client) => {
-      const first = body.events[0];
+      const first = events[0];
       await client.query(
         `INSERT INTO visitor_sessions
            (session_id, visitor_id, user_id, entry_path, referrer, user_agent, ip)
@@ -746,11 +794,13 @@ export const createApp = (
           request.ip || null
         ]
       );
-      for (const event of body.events) {
+      for (const event of events) {
         await client.query(
           `INSERT INTO analytics_events
-             (event_name, visitor_id, session_id, user_id, path, properties, user_agent, ip, occurred_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9::timestamptz, now()))`,
+             (event_name, visitor_id, session_id, user_id, path, properties,
+              user_agent, ip, occurred_at, source, schema_version)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                   COALESCE($9::timestamptz, now()), 'client', 1)`,
           [
             event.name,
             identity.visitorId,
@@ -765,7 +815,7 @@ export const createApp = (
         );
       }
     });
-    response.status(202).json({ accepted: body.events.length });
+    response.status(202).json({ accepted: events.length });
   });
 
   app.post("/api/uploads", requireAuth, upload.array("files", 6), async (request, response) => {
@@ -850,7 +900,7 @@ export const createApp = (
     response.download(path.join(uploadDir, file.stored_name), file.original_name);
   });
 
-  app.get("/api/admin/overview", requireAdmin, async (request, response) => {
+  app.get("/api/admin/overview", requireCapability("analytics.read"), async (request, response) => {
     const days = Math.min(365, Math.max(1, Number(request.query.days) || 30));
     const interval = `${days} days`;
     const productChannel = request.productChannel!;
@@ -929,9 +979,19 @@ export const createApp = (
     });
   });
 
-  app.get("/api/admin/users", requireAdmin, async (request, response) => {
-    const { page, pageSize, offset } = parsePagination(request);
-    const search = String(request.query.search || "").trim();
+  app.get("/api/admin/users", requireCapability("users.read"), async (request, response) => {
+    const filters = z.object({
+      page: z.coerce.number().int().positive().default(1),
+      pageSize: z.coerce.number().int().positive().max(100).default(20),
+      search: z.string().trim().max(160).default(""),
+      role: z.enum([
+        "user", "admin", "policy_editor", "policy_reviewer", "operations",
+        "finance", "support", "ai_operator", "auditor", "analyst"
+      ]).optional(),
+      status: z.enum(["active", "disabled"]).optional()
+    }).strict().parse(request.query);
+    const { page, pageSize, search } = filters;
+    const offset = (page - 1) * pageSize;
     const [items, total] = await Promise.all([
       query(
         `SELECT u.id, u.email, u.phone, u.display_name, u.role, u.status,
@@ -945,18 +1005,29 @@ export const createApp = (
           WHERE ($1 = '' OR coalesce(u.email, '') ILIKE '%' || $1 || '%'
                        OR coalesce(u.phone, '') ILIKE '%' || $1 || '%'
                        OR coalesce(u.display_name, '') ILIKE '%' || $1 || '%')
+            AND ($5::text IS NULL OR u.role = $5)
+            AND ($6::text IS NULL OR u.status = $6)
           GROUP BY u.id
           ORDER BY u.created_at DESC
           LIMIT $2 OFFSET $3`,
-        [search, pageSize, offset, request.productChannel!]
+        [
+          search,
+          pageSize,
+          offset,
+          request.productChannel!,
+          filters.role ?? null,
+          filters.status ?? null
+        ]
       ),
       query<{ count: string }>(
         `SELECT count(*)::text AS count
            FROM users
           WHERE ($1 = '' OR coalesce(email, '') ILIKE '%' || $1 || '%'
                        OR coalesce(phone, '') ILIKE '%' || $1 || '%'
-                       OR coalesce(display_name, '') ILIKE '%' || $1 || '%')`,
-        [search]
+                       OR coalesce(display_name, '') ILIKE '%' || $1 || '%')
+            AND ($2::text IS NULL OR role = $2)
+            AND ($3::text IS NULL OR status = $3)`,
+        [search, filters.role ?? null, filters.status ?? null]
       )
     ]);
     response.json({
@@ -965,33 +1036,104 @@ export const createApp = (
     });
   });
 
-  app.patch("/api/admin/users/:id", requireSuperAdmin, async (request, response) => {
+  app.patch("/api/admin/users/:id", requireCapability("users.write"), async (request, response) => {
     const id = uuidSchema.parse(request.params.id);
     const body = z
       .object({
         status: z.enum(["active", "disabled"]).optional(),
-        role: z.enum(["user", "admin", "analyst"]).optional()
+        role: z.enum([
+          "user", "admin", "policy_editor", "policy_reviewer", "operations",
+          "finance", "support", "ai_operator", "auditor", "analyst"
+        ]).optional(),
+        expectedUpdatedAt: z.string().datetime({ offset: true })
       })
+      .strict()
       .refine((value) => value.status || value.role, { message: "没有需要更新的字段" })
       .parse(request.body);
     if (id === request.authUser!.id && body.status === "disabled") {
       throw new ApiError(400, "CANNOT_DISABLE_SELF", "不能停用当前管理员账号");
     }
-    const result = await query(
-      `UPDATE users
-          SET status = COALESCE($2, status),
-              role = COALESCE($3, role),
-              updated_at = now()
-        WHERE id = $1
-        RETURNING id, email, phone, display_name, role, status, updated_at`,
-      [id, body.status || null, body.role || null]
-    );
-    if (!result.rowCount) throw new ApiError(404, "USER_NOT_FOUND", "用户不存在");
-    await audit(request, "user.update", "user", id, body);
-    response.json(result.rows[0]);
+    if (id === request.authUser!.id && body.role && body.role !== "admin") {
+      throw new ApiError(400, "CANNOT_DEMOTE_SELF", "不能变更当前管理员账号的角色");
+    }
+    const updated = await withTransaction(async (client) => {
+      const activeAdmins = await client.query<{ id: string }>(
+        `SELECT id
+           FROM users
+          WHERE role = 'admin'
+            AND status = 'active'
+          ORDER BY id
+          FOR UPDATE`
+      );
+      const selected = await client.query<{
+        id: string;
+        email: string | null;
+        phone: string | null;
+        display_name: string | null;
+        role: typeof request.authUser.role;
+        status: "active" | "disabled";
+        updated_at: Date;
+      }>(
+        `SELECT id, email, phone, display_name, role, status, updated_at
+           FROM users
+          WHERE id = $1
+          FOR UPDATE`,
+        [id]
+      );
+      const before = selected.rows[0];
+      if (!before) throw new ApiError(404, "USER_NOT_FOUND", "用户不存在");
+      if (before.updated_at.toISOString() !== body.expectedUpdatedAt) {
+        throw new ApiError(409, "VERSION_CONFLICT", "账号已被其他管理员更新，请刷新后重试");
+      }
+      const nextRole = body.role ?? before.role;
+      const nextStatus = body.status ?? before.status;
+      const removesActiveAdmin =
+        before.role === "admin" &&
+        before.status === "active" &&
+        (nextRole !== "admin" || nextStatus !== "active");
+      if (removesActiveAdmin && activeAdmins.rows.length <= 1) {
+        throw new ApiError(
+          409,
+          "LAST_ACTIVE_ADMIN",
+          "至少需要保留一个启用中的管理员账号"
+        );
+      }
+      const result = await client.query(
+        `UPDATE users
+            SET status = $2,
+                role = $3,
+                updated_at = now()
+          WHERE id = $1
+          RETURNING id, email, phone, display_name, role, status, updated_at`,
+        [id, nextStatus, nextRole]
+      );
+      const after = result.rows[0] as Record<string, unknown>;
+      if (nextStatus === "disabled" && before.status !== "disabled") {
+        await client.query(
+          `UPDATE refresh_sessions
+              SET revoked_at = now()
+            WHERE user_id = $1
+              AND revoked_at IS NULL`,
+          [id]
+        );
+      }
+      await audit(
+        request,
+        "user.update",
+        "user",
+        id,
+        {
+          before: { role: before.role, status: before.status },
+          after: { role: after.role, status: after.status }
+        },
+        client
+      );
+      return after;
+    });
+    response.json(updated);
   });
 
-  app.get("/api/admin/assessments", requireAdmin, async (request, response) => {
+  app.get("/api/admin/assessments", requireCapability("assessments.read"), async (request, response) => {
     const { page, pageSize, offset } = parsePagination(request);
     const status = String(request.query.status || "");
     const [items, total] = await Promise.all([
@@ -1018,7 +1160,7 @@ export const createApp = (
     });
   });
 
-  app.get("/api/admin/invites", requireAdmin, async (_request, response) => {
+  app.get("/api/admin/invites", requireCapability("invites.read"), async (_request, response) => {
     const result = await query(
       `SELECT i.id, i.code, i.description, i.max_uses, i.used_count, i.grants,
               i.enabled, i.expires_at, i.created_at, i.updated_at,
@@ -1036,7 +1178,7 @@ export const createApp = (
     });
   });
 
-  app.post("/api/admin/invites", requireSuperAdmin, async (request, response) => {
+  app.post("/api/admin/invites", requireCapability("invites.write"), async (request, response) => {
     const body = z
       .object({
         code: z.string().trim().min(4).max(80).optional(),
@@ -1071,7 +1213,7 @@ export const createApp = (
     response.status(201).json(result.rows[0]);
   });
 
-  app.patch("/api/admin/invites/:id", requireSuperAdmin, async (request, response) => {
+  app.patch("/api/admin/invites/:id", requireCapability("invites.write"), async (request, response) => {
     const id = uuidSchema.parse(request.params.id);
     const body = z
       .object({
@@ -1105,7 +1247,7 @@ export const createApp = (
     response.json(result.rows[0]);
   });
 
-  app.get("/api/admin/events", requireAdmin, async (request, response) => {
+  app.get("/api/admin/events", requireCapability("analytics.read"), async (request, response) => {
     const days = Math.min(365, Math.max(1, Number(request.query.days) || 30));
     const includeMaterialEvents = request.productChannel === "ai";
     const result = await query(
@@ -1129,7 +1271,7 @@ export const createApp = (
     response.json({ days, items: result.rows });
   });
 
-  app.get("/api/admin/audit-logs", requireAdmin, async (request, response) => {
+  app.get("/api/admin/audit-logs", requireCapability("audit.read"), async (request, response) => {
     const { pageSize, offset, page } = parsePagination(request);
     const includeMaterialAudit = request.productChannel === "ai";
     const result = await query(
@@ -1149,7 +1291,7 @@ export const createApp = (
     response.json({ items: result.rows, pagination: { page, pageSize } });
   });
 
-  app.get("/api/admin/uploads", requireAdmin, async (request, response) => {
+  app.get("/api/admin/uploads", requireCapability("uploads.read"), async (request, response) => {
     const { page, pageSize, offset } = parsePagination(request);
     const status = String(request.query.status || "");
     const [items, total] = await Promise.all([
@@ -1177,9 +1319,9 @@ export const createApp = (
     });
   });
 
-  app.get("/api/admin/system", requireAdmin, async (request, response) => {
+  app.get("/api/admin/system", requireCapability("system.read"), async (request, response) => {
     const includeMaterialTables = request.productChannel === "ai";
-    const [databaseSize, tableCounts, migration] = await Promise.all([
+    const [databaseSize, tableCounts, migration, errorSummary, taskSummary] = await Promise.all([
       query<{ size: string }>("SELECT pg_size_pretty(pg_database_size(current_database())) AS size"),
       query<{ name: string; count: string }>(
         `SELECT name, count
@@ -1195,7 +1337,44 @@ export const createApp = (
              UNION ALL SELECT 'invite_codes', count(*)::text FROM invite_codes
            ) counts`
       ),
-      query("SELECT version, applied_at FROM schema_migrations ORDER BY applied_at DESC")
+      query("SELECT version, applied_at FROM schema_migrations ORDER BY applied_at DESC"),
+      query<{ last_24_hours: string; recent: unknown[] }>(
+        `SELECT
+           (SELECT count(*)::text
+              FROM app_errors
+             WHERE created_at >= now() - interval '24 hours') AS last_24_hours,
+           coalesce(
+             (SELECT jsonb_agg(to_jsonb(recent_errors) ORDER BY created_at DESC)
+                FROM (
+                  SELECT id, request_id AS "requestId", method, path, code,
+                         created_at AS "createdAt"
+                    FROM app_errors
+                   ORDER BY created_at DESC
+                   LIMIT 20
+                ) recent_errors),
+             '[]'::jsonb
+           ) AS recent`
+      ),
+      query<{
+        reconciliation_due: string;
+        failed_notifications: string;
+        failed_uploads: string;
+        failed_otp_deliveries: string;
+      }>(
+        `SELECT
+           (SELECT count(*)::text
+              FROM payment_attempts
+             WHERE reconciliation_state IN ('REQUIRED', 'RETRY_SCHEDULED')
+               AND reconciliation_next_at <= now()) AS reconciliation_due,
+           (SELECT count(*)::text
+              FROM payment_notification_events
+             WHERE processing_status = 'FAILED') AS failed_notifications,
+           (SELECT count(*)::text FROM uploads WHERE status = 'failed') AS failed_uploads,
+           (SELECT count(*)::text
+              FROM otp_codes
+             WHERE delivery_status = 'failed'
+               AND created_at >= now() - interval '24 hours') AS failed_otp_deliveries`
+      )
     ]);
     response.json({
       status: "healthy",
@@ -1207,11 +1386,23 @@ export const createApp = (
         node: process.version,
         uptimeSeconds: Math.round(process.uptime()),
         environment: config.NODE_ENV
+      },
+      operational: {
+        errors: {
+          last24Hours: Number(errorSummary.rows[0]?.last_24_hours || 0),
+          recent: errorSummary.rows[0]?.recent || []
+        },
+        tasks: {
+          reconciliationDue: Number(taskSummary.rows[0]?.reconciliation_due || 0),
+          failedNotifications: Number(taskSummary.rows[0]?.failed_notifications || 0),
+          failedUploads: Number(taskSummary.rows[0]?.failed_uploads || 0),
+          failedOtpDeliveries: Number(taskSummary.rows[0]?.failed_otp_deliveries || 0)
+        }
       }
     });
   });
 
-  app.get("/api/admin/uploads/:id/download", requireSuperAdmin, async (request, response) => {
+  app.get("/api/admin/uploads/:id/download", requireCapability("uploads.download"), async (request, response) => {
     const id = uuidSchema.parse(request.params.id);
     const result = await query<{ stored_name: string; original_name: string }>(
       "SELECT stored_name, original_name FROM uploads WHERE id = $1",
@@ -1228,7 +1419,7 @@ export const createApp = (
   });
 
   app.use(
-    (
+    async (
       error: unknown,
       request: Request,
       response: Response,
@@ -1271,6 +1462,25 @@ export const createApp = (
         return;
       }
       request.log?.error(error);
+      const internalError = error instanceof Error ? error : new Error("Unknown error");
+      try {
+        await query(
+          `INSERT INTO app_errors(
+             request_id, method, path, code, message, product_channel
+           )
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [
+            String(request.header("x-request-id") || request.id || "").slice(0, 160) || null,
+            request.method.slice(0, 20),
+            request.path.slice(0, 500),
+            (internalError.name || "INTERNAL_ERROR").slice(0, 100),
+            internalError.message.slice(0, 1_000),
+            request.productChannel || null
+          ]
+        );
+      } catch (auditError) {
+        request.log?.error(auditError);
+      }
       response.status(500).json({
         error: "INTERNAL_ERROR",
         message: "服务暂时开小差了"

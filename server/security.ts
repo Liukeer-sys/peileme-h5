@@ -6,7 +6,17 @@ import { query } from "./db.js";
 
 export type AuthUser = {
   id: string;
-  role: "user" | "admin" | "analyst";
+  role:
+    | "user"
+    | "admin"
+    | "policy_editor"
+    | "policy_reviewer"
+    | "operations"
+    | "finance"
+    | "support"
+    | "ai_operator"
+    | "auditor"
+    | "analyst";
   email: string | null;
   phone: string | null;
   displayName: string | null;
@@ -134,11 +144,7 @@ export const requireCapability = (capability: string) => async (
 };
 
 export const requireAdmin = (request: Request, response: Response, next: NextFunction) => {
-  if (!request.authUser || !["admin", "analyst"].includes(request.authUser.role)) {
-    response.status(403).json({ error: "ADMIN_REQUIRED", message: "需要管理权限" });
-    return;
-  }
-  next();
+  void requireCapability("admin.access")(request, response, next);
 };
 
 export const requireSuperAdmin = (

@@ -22,6 +22,7 @@ type RegionalParameter = {
   sourceUrl: string;
   sourcePublishedAt: string;
   status: "draft" | "verified" | "stale";
+  revision: number;
 };
 
 const parameterLabel = (type: RegionalParameter["parameterType"]) =>
@@ -141,7 +142,8 @@ export default function RegionalDataPanel({
             sourceName,
             sourceUrl,
             sourcePublishedAt: sourceDate,
-            status: editStatus
+            status: editStatus,
+            expectedRevision: editing.revision
           }
         }
       );

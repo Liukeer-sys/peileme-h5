@@ -389,7 +389,8 @@ const regionalParameterSchema = z
         message: "来源地址必须使用 HTTPS"
       }),
     sourcePublishedAt: isoDateSchema,
-    status: z.enum(["draft", "verified", "stale"])
+    status: z.enum(["draft", "verified", "stale"]),
+    expectedRevision: z.number().int().positive().optional()
   })
   .superRefine((value, context) => {
     if (value.status === "draft") return;
@@ -515,12 +516,16 @@ const updateAnnouncementSchema = z
     placement: announcementFields.placement.optional(),
     status: announcementFields.status.optional(),
     startsAt: announcementFields.startsAt,
-    endsAt: announcementFields.endsAt
+    endsAt: announcementFields.endsAt,
+    expectedRevision: z.number().int().positive().optional()
   })
   .strict()
-  .refine((value) => Object.keys(value).length > 0, {
+  .refine(
+    (value) => Object.keys(value).some((key) => key !== "expectedRevision"),
+    {
     message: "至少提供一个公告字段"
-  })
+    }
+  )
   .superRefine(validAnnouncementSchedule);
 
 const requireRegionalParameterCapability = (

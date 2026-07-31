@@ -1770,7 +1770,8 @@ describe("policy persistence foundation", () => {
       { version: "010_order_channel_lookup.sql" },
       { version: "011_real_payments.sql" },
       { version: "012_refunds_payment_transaction_index.sql" },
-      { version: "013_ai_analysis_pipeline.sql" }
+      { version: "013_ai_analysis_pipeline.sql" },
+      { version: "014_operations_admin.sql" }
     ]);
 
     const preserved = await query<{
