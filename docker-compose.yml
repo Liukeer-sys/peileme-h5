@@ -58,19 +58,44 @@ services:
     networks:
       - internal
 
-  web:
+  web-main:
     build:
       context: .
-      dockerfile: Dockerfile.web
+      dockerfile: Dockerfile.web-main
       args:
-        VITE_SHARE_URL: ${VITE_SHARE_URL:-https://peileme.art/}
-    container_name: peileme-web
+        VITE_SHARE_URL: ${VITE_MAIN_URL:-https://peileme.art/}
+    container_name: peileme-web-main
     restart: unless-stopped
     depends_on:
       api:
         condition: service_healthy
     ports:
-      - "127.0.0.1:${WEB_PORT:-18083}:80"
+      - "127.0.0.1:${WEB_MAIN_PORT:-18083}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/api/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    mem_limit: 128m
+    cpus: 0.5
+    logging: *logging
+    networks:
+      - internal
+
+  web-ai:
+    build:
+      context: .
+      dockerfile: Dockerfile.web-ai
+      args:
+        VITE_SHARE_URL: ${VITE_AI_URL:-https://ai.peileme.art/}
+    container_name: peileme-web-ai
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${WEB_AI_PORT:-18084}:80"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/api/health >/dev/null || exit 1"]
       interval: 15s

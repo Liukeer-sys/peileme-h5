@@ -15,7 +15,7 @@ chmod 700 "$BACKUP_ROOT"
 (
   flock -n 9 || {
     echo "A Peileme backup is already running"
-    exit 0
+    exit 1
   }
 
   cd "$COMPOSE_DIR"
