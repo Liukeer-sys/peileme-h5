@@ -135,7 +135,7 @@ const findAvailableEntitlement = async (
   return result.rows[0] ?? null;
 };
 
-const grantFirstPolicyEntitlement = async (
+const grantFirstUseEntitlement = async (
   client: pg.PoolClient,
   userId: string,
   productId: string
@@ -174,8 +174,7 @@ const grantFirstPolicyEntitlement = async (
   }>(
     `SELECT id, grant_count
      FROM promotion_rules
-     WHERE code = 'FIRST_POLICY_CALC'
-       AND product_id = $1
+     WHERE product_id = $1
        AND status = 'active'
        AND trigger_type = 'first_verified_user'
        AND (starts_at IS NULL OR starts_at <= now())
@@ -232,8 +231,8 @@ const reserveInTransaction = async (
   }
 
   let entitlement = await findAvailableEntitlement(client, userId, product.id);
-  if (!entitlement && sku === "POLICY_CALC") {
-    entitlement = await grantFirstPolicyEntitlement(
+  if (!entitlement) {
+    entitlement = await grantFirstUseEntitlement(
       client,
       userId,
       product.id

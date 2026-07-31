@@ -29,6 +29,7 @@ type AiJobRow = {
   selected_provider: string | null;
   selected_model: string | null;
   failure_code: string | null;
+  attempt_count: number;
   created_at: Date;
   updated_at: Date;
   completed_at: Date | null;
@@ -55,6 +56,16 @@ export type PublicAiJob = {
   createdAt: Date;
   updatedAt: Date;
   completedAt: Date | null;
+};
+
+export type WorkerAiJob = {
+  id: string;
+  userId: string;
+  kind: AiJobKind;
+  input: Record<string, unknown>;
+  uploadIds: string[];
+  entitlementUsageId: string;
+  attemptCount: number;
 };
 
 const stableJson = (value: unknown): string => {
@@ -112,6 +123,7 @@ const jobSelect = `
     j.selected_provider,
     j.selected_model,
     j.failure_code,
+    j.attempt_count,
     j.created_at,
     j.updated_at,
     j.completed_at,
@@ -215,16 +227,23 @@ const transitionJob = async (
     to: AiJobStatus;
     progress: number;
     detail?: Record<string, unknown>;
+    workerId?: string;
+    jobAttempt?: number;
   }
 ) => {
+  const fenced = input.workerId !== undefined && input.jobAttempt !== undefined;
   const updated = await client.query(
     `UPDATE ai_jobs
         SET status = $3,
             progress = $4,
             updated_at = now()
-      WHERE id = $1 AND status = $2
+      WHERE id = $1
+        AND status = $2
+        ${fenced ? "AND claimed_by = $5 AND attempt_count = $6" : ""}
       RETURNING id`,
-    [input.jobId, input.from, input.to, input.progress]
+    fenced
+      ? [input.jobId, input.from, input.to, input.progress, input.workerId, input.jobAttempt]
+      : [input.jobId, input.from, input.to, input.progress]
   );
   if (!updated.rowCount) {
     throw new Error(`AI job ${input.jobId} is no longer ${input.from}`);
@@ -236,35 +255,112 @@ const transitionJob = async (
   );
 };
 
-export const attachEntitlementAndStart = async (
+export const attachEntitlementToQueuedJob = async (
   jobId: string,
   usageId: string
 ) =>
   withTransaction(async (client) => {
-    await client.query(
-      `UPDATE ai_jobs SET entitlement_usage_id = $2 WHERE id = $1`,
+    const updated = await client.query(
+      `UPDATE ai_jobs
+          SET entitlement_usage_id = $2,
+              available_at = now(),
+              updated_at = now()
+        WHERE id = $1
+          AND status = 'QUEUED'
+          AND entitlement_usage_id IS NULL
+      RETURNING id`,
       [jobId, usageId]
     );
-    await transitionJob(client, {
-      jobId,
-      from: "QUEUED",
-      to: "RUNNING",
-      progress: 10
-    });
+    if (!updated.rowCount) {
+      throw new Error(`AI job ${jobId} cannot accept an entitlement`);
+    }
   });
+
+export const claimNextAiJob = async (
+  workerId: string,
+  leaseSeconds: number
+): Promise<WorkerAiJob | null> =>
+  withTransaction(async (client) => {
+    const selected = await client.query<{
+      id: string;
+      user_id: string;
+      kind: AiJobKind;
+      input_metadata: Record<string, unknown>;
+      upload_metadata: AiUploadMetadata[];
+      entitlement_usage_id: string;
+      attempt_count: number;
+    }>(
+      `SELECT id, user_id, kind, input_metadata, upload_metadata,
+              entitlement_usage_id, attempt_count
+         FROM ai_jobs
+        WHERE status = 'QUEUED'
+          AND entitlement_usage_id IS NOT NULL
+          AND available_at <= now()
+        ORDER BY available_at, created_at, id
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED`
+    );
+    const job = selected.rows[0];
+    if (!job) return null;
+    await client.query(
+      `UPDATE ai_jobs
+          SET status = 'RUNNING',
+              progress = 10,
+              attempt_count = attempt_count + 1,
+              claimed_by = $2,
+              claimed_at = now(),
+              lease_expires_at = now() + ($3 || ' seconds')::interval,
+              updated_at = now()
+        WHERE id = $1`,
+      [job.id, workerId, leaseSeconds]
+    );
+    await client.query(
+      `INSERT INTO ai_job_events(job_id, from_status, to_status, progress, detail)
+       VALUES ($1, 'QUEUED', 'RUNNING', 10, $2)`,
+      [job.id, { workerId, attempt: job.attempt_count + 1 }]
+    );
+    return {
+      id: job.id,
+      userId: job.user_id,
+      kind: job.kind,
+      input: job.input_metadata,
+      uploadIds: job.upload_metadata.map((upload) => upload.id),
+      entitlementUsageId: job.entitlement_usage_id,
+      attemptCount: job.attempt_count + 1
+    };
+  });
+
+export const renewAiJobLease = async (
+  jobId: string,
+  workerId: string,
+  leaseSeconds: number
+) => {
+  const renewed = await query(
+    `UPDATE ai_jobs
+        SET lease_expires_at = now() + ($3 || ' seconds')::interval,
+            updated_at = now()
+      WHERE id = $1
+        AND status = 'RUNNING'
+        AND claimed_by = $2`,
+    [jobId, workerId, leaseSeconds]
+  );
+  return renewed.rowCount === 1;
+};
 
 const persistAttempts = async (
   client: pg.PoolClient,
   jobId: string,
+  jobAttempt: number,
   attempts: readonly AiProviderAttempt[]
 ) => {
   for (const attempt of attempts) {
     await client.query(
       `INSERT INTO ai_provider_attempts(
-         job_id, ordinal, provider_key, model, outcome, error_code, latency_ms
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+         job_id, job_attempt, ordinal, provider_key, model, outcome, error_code, latency_ms
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
       [
         jobId,
+        jobAttempt,
         attempt.ordinal,
         attempt.providerKey,
         attempt.model,
@@ -279,13 +375,15 @@ const persistAttempts = async (
 export const completeAiJob = async (input: {
   jobId: string;
   usageId: string;
+  workerId: string;
   providerKey: string;
   model: string;
+  jobAttempt: number;
   attempts: readonly AiProviderAttempt[];
   report: AiReport;
 }) =>
   withTransaction(async (client) => {
-    await persistAttempts(client, input.jobId, input.attempts);
+    await persistAttempts(client, input.jobId, input.jobAttempt, input.attempts);
     await client.query(
       `INSERT INTO ai_reports(job_id, schema_version, content)
        VALUES ($1, $2, $3)`,
@@ -297,12 +395,17 @@ export const completeAiJob = async (input: {
       from: "RUNNING",
       to: "COMPLETED",
       progress: 100,
-      detail: { provider: input.providerKey, model: input.model }
+      detail: { provider: input.providerKey, model: input.model },
+      workerId: input.workerId,
+      jobAttempt: input.jobAttempt
     });
     await client.query(
       `UPDATE ai_jobs
           SET selected_provider = $2,
               selected_model = $3,
+              claimed_by = NULL,
+              claimed_at = NULL,
+              lease_expires_at = NULL,
               completed_at = now(),
               updated_at = now()
         WHERE id = $1`,
@@ -313,21 +416,30 @@ export const completeAiJob = async (input: {
 export const failAiJob = async (input: {
   jobId: string;
   failureCode: string;
+  usageId: string;
+  workerId: string;
+  jobAttempt: number;
   attempts: readonly AiProviderAttempt[];
 }) =>
   withTransaction(async (client) => {
-    await persistAttempts(client, input.jobId, input.attempts);
+    await persistAttempts(client, input.jobId, input.jobAttempt, input.attempts);
+    await releaseEntitlementInTransaction(client, input.usageId);
     await transitionJob(client, {
       jobId: input.jobId,
       from: "RUNNING",
       to: "FAILED_FINAL",
       progress: 100,
-      detail: { failureCode: input.failureCode }
+      detail: { failureCode: input.failureCode },
+      workerId: input.workerId,
+      jobAttempt: input.jobAttempt
     });
     await client.query(
       `UPDATE ai_jobs
           SET failure_code = $2,
               failure_message = NULL,
+              claimed_by = NULL,
+              claimed_at = NULL,
+              lease_expires_at = NULL,
               completed_at = now(),
               updated_at = now()
         WHERE id = $1`,
@@ -335,70 +447,137 @@ export const failAiJob = async (input: {
     );
   });
 
+export const requeueAiJob = async (input: {
+  jobId: string;
+  jobAttempt: number;
+  workerId: string;
+  delayMilliseconds: number;
+  failureCode: string;
+  attempts: readonly AiProviderAttempt[];
+}) =>
+  withTransaction(async (client) => {
+    await persistAttempts(client, input.jobId, input.jobAttempt, input.attempts);
+    await transitionJob(client, {
+      jobId: input.jobId,
+      from: "RUNNING",
+      to: "QUEUED",
+      progress: 0,
+      detail: {
+        failureCode: input.failureCode,
+        retryAttempt: input.jobAttempt + 1
+      },
+      workerId: input.workerId,
+      jobAttempt: input.jobAttempt
+    });
+    await client.query(
+      `UPDATE ai_jobs
+          SET available_at = now() + ($2 || ' milliseconds')::interval,
+              claimed_by = NULL,
+              claimed_at = NULL,
+              lease_expires_at = NULL,
+              updated_at = now()
+        WHERE id = $1`,
+      [input.jobId, input.delayMilliseconds]
+    );
+  });
+
 export const deleteQueuedAiJob = async (jobId: string) => {
   await query("DELETE FROM ai_jobs WHERE id = $1 AND status = 'QUEUED'", [jobId]);
 };
 
-export const recoverInterruptedAiJobs = async () =>
+export const recoverExpiredAiJobs = async (maxAttempts: number) =>
   withTransaction(async (client) => {
     await client.query(
       "SELECT pg_advisory_xact_lock(hashtextextended('ai-job-startup-recovery', 0))"
     );
     const active = await client.query<{
       id: string;
-      status: "QUEUED" | "AWAITING_ENTITLEMENT" | "RUNNING";
+      entitlement_usage_id: string;
+      attempt_count: number;
     }>(
-      `SELECT id, status
+      `SELECT id, entitlement_usage_id, attempt_count
          FROM ai_jobs
-        WHERE status IN ('QUEUED', 'AWAITING_ENTITLEMENT', 'RUNNING')
-        ORDER BY created_at, id
-        FOR UPDATE`
+        WHERE status = 'RUNNING'
+          AND entitlement_usage_id IS NOT NULL
+          AND lease_expires_at < now()
+        ORDER BY lease_expires_at, id
+        FOR UPDATE SKIP LOCKED`
     );
     let releasedUsages = 0;
-    let queuedDeleted = 0;
-    let runningFailed = 0;
+    let requeued = 0;
+    let failed = 0;
 
     for (const job of active.rows) {
-      const usages = await client.query<{ id: string }>(
-        `SELECT id
-           FROM entitlement_usages
-          WHERE business_type = 'commerce'
-            AND business_id = $1
-            AND status = 'reserved'
-          ORDER BY created_at, id
-          FOR UPDATE`,
-        [job.id]
-      );
-      for (const usage of usages.rows) {
-        await releaseEntitlementInTransaction(client, usage.id);
+      if (job.attempt_count >= maxAttempts) {
+        await releaseEntitlementInTransaction(client, job.entitlement_usage_id);
         releasedUsages += 1;
-      }
-
-      if (job.status === "RUNNING") {
         await transitionJob(client, {
           jobId: job.id,
           from: "RUNNING",
           to: "FAILED_FINAL",
           progress: 100,
-          detail: { failureCode: "AI_JOB_INTERRUPTED" }
+          detail: { failureCode: "AI_WORKER_LEASE_EXPIRED" }
         });
         await client.query(
           `UPDATE ai_jobs
-              SET failure_code = 'AI_JOB_INTERRUPTED',
+              SET failure_code = 'AI_WORKER_LEASE_EXPIRED',
                   failure_message = NULL,
+                  claimed_by = NULL,
+                  claimed_at = NULL,
+                  lease_expires_at = NULL,
                   completed_at = now(),
                   updated_at = now()
             WHERE id = $1`,
           [job.id]
         );
-        runningFailed += 1;
+        failed += 1;
       } else {
-        await client.query("DELETE FROM ai_jobs WHERE id = $1", [job.id]);
-        queuedDeleted += 1;
+        await transitionJob(client, {
+          jobId: job.id,
+          from: "RUNNING",
+          to: "QUEUED",
+          progress: 0,
+          detail: { failureCode: "AI_WORKER_LEASE_EXPIRED", recovered: true }
+        });
+        await client.query(
+          `UPDATE ai_jobs
+              SET available_at = now(),
+                  claimed_by = NULL,
+                  claimed_at = NULL,
+                  lease_expires_at = NULL,
+                  updated_at = now()
+            WHERE id = $1`,
+          [job.id]
+        );
+        requeued += 1;
       }
+      await client.query(
+        `UPDATE operational_job_runs
+            SET status = 'failed',
+                finished_at = now(),
+                detail = detail || jsonb_build_object(
+                  'failureCode', 'AI_WORKER_LEASE_EXPIRED',
+                  'recovered', $2::boolean
+                )
+          WHERE job_name = 'ai-analysis-worker'
+            AND status = 'running'
+            AND detail->>'jobId' = $1`,
+        [job.id, job.attempt_count < maxAttempts]
+      );
     }
 
-    return { releasedUsages, queuedDeleted, runningFailed };
+    const abandoned = await client.query(
+      `DELETE FROM ai_jobs
+        WHERE status = 'QUEUED'
+          AND entitlement_usage_id IS NULL
+          AND created_at < now() - interval '5 minutes'`
+    );
+    return {
+      releasedUsages,
+      requeued,
+      failed,
+      abandoned: abandoned.rowCount ?? 0
+    };
   });
 
 export const getOwnedAiJob = async (userId: string, jobId: string) => {

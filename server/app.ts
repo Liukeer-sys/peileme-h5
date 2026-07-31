@@ -79,6 +79,43 @@ const passwordSchema = z
   .regex(/[A-Za-z]/, "密码需包含字母")
   .regex(/\d/, "密码需包含数字");
 const uuidSchema = z.string().uuid();
+const entitlementSkuSchema = z.enum([
+  "POLICY_CALC",
+  "AI_SEVERANCE_ANALYSIS",
+  "AI_DOCUMENT_REVIEW"
+]);
+type EntitlementSku = z.infer<typeof entitlementSkuSchema>;
+const entitlementSkusForChannel = (channel: "main" | "ai" | undefined): EntitlementSku[] =>
+  channel === "ai"
+    ? ["AI_SEVERANCE_ANALYSIS", "AI_DOCUMENT_REVIEW"]
+    : ["POLICY_CALC"];
+const requireEntitlementSkuForChannel = (
+  channel: "main" | "ai" | undefined,
+  sku: EntitlementSku
+) => {
+  if (!entitlementSkusForChannel(channel).includes(sku)) {
+    throw new ApiError(
+      404,
+      "ENTITLEMENT_PRODUCT_NOT_AVAILABLE",
+      "当前产品站不提供该权益"
+    );
+  }
+};
+
+const firstUsePromotion = {
+  POLICY_CALC: {
+    code: "FIRST_POLICY_CALC",
+    name: "首次实名用户政策测算"
+  },
+  AI_SEVERANCE_ANALYSIS: {
+    code: "FIRST_AI_SEVERANCE_ANALYSIS",
+    name: "首次实名用户 AI 离职分析"
+  },
+  AI_DOCUMENT_REVIEW: {
+    code: "FIRST_AI_DOCUMENT_REVIEW",
+    name: "首次实名用户 AI 文件审查"
+  }
+} as const;
 
 const refreshTokenFrom = (request: Request) =>
   String(
@@ -328,7 +365,7 @@ export const createApp = (
     createPolicyRouter({ calculate: options.policyCalculate })
   );
   app.use("/api/admin/policy", createAdminPolicyRouter());
-  app.use("/api/ai", requireAiProductHost, createAiRouter(aiProviders));
+  app.use("/api/ai", requireAiProductHost, createAiRouter());
 
   app.get("/api/health", async (_request, response) => {
     const started = Date.now();
@@ -1045,7 +1082,21 @@ export const createApp = (
         `SELECT u.id, u.email, u.phone, u.display_name, u.role, u.status,
                 u.last_login_at, u.created_at, u.updated_at,
                 count(DISTINCT a.id)::int AS assessment_count,
-                count(DISTINCT r.id)::int AS invite_redemption_count
+                count(DISTINCT r.id)::int AS invite_redemption_count,
+                coalesce((
+                  SELECT jsonb_object_agg(balance.sku, balance.remaining_uses)
+                    FROM (
+                      SELECT p.sku, sum(e.remaining_uses)::int AS remaining_uses
+                        FROM entitlements e
+                        JOIN products p ON p.id = e.product_id
+                       WHERE e.user_id = u.id
+                         AND p.product_channel IN ($4, 'all')
+                         AND e.status = 'active'
+                         AND e.remaining_uses > 0
+                         AND (e.expires_at IS NULL OR e.expires_at > now())
+                       GROUP BY p.sku
+                    ) balance
+                ), '{}'::jsonb) AS entitlement_balances
            FROM users u
            LEFT JOIN assessments a ON a.user_id = u.id
                                   AND a.product_channel = $4
@@ -1083,6 +1134,211 @@ export const createApp = (
       pagination: { page, pageSize, total: Number(total.rows[0]?.count || 0) }
     });
   });
+
+  app.get(
+    "/api/admin/entitlements/first-use",
+    requireCapability("users.read"),
+    async (request, response) => {
+      const result = await query<{
+        sku: string;
+        name: string;
+        grant_count: number | null;
+        promotion_status: "active" | "inactive" | null;
+      }>(
+        `SELECT p.sku, p.name,
+                pr.grant_count,
+                pr.status AS promotion_status
+           FROM products p
+           LEFT JOIN promotion_rules pr
+             ON pr.product_id = p.id
+            AND pr.trigger_type = 'first_verified_user'
+          WHERE p.sku = ANY($1::text[])
+          ORDER BY p.sku`,
+        [entitlementSkusForChannel(request.productChannel)]
+      );
+      response.json({
+        items: result.rows.map((row) => ({
+          sku: row.sku,
+          name: row.name,
+          grantCount: row.grant_count ?? 1,
+          enabled: row.promotion_status === "active"
+        }))
+      });
+    }
+  );
+
+  app.patch(
+    "/api/admin/entitlements/first-use",
+    requireCapability("users.write"),
+    async (request, response) => {
+      const body = z.object({
+        sku: entitlementSkuSchema,
+        grantCount: z.coerce.number().int().min(1).max(100),
+        enabled: z.boolean()
+      }).strict().parse(request.body);
+      requireEntitlementSkuForChannel(request.productChannel, body.sku);
+      const definition = firstUsePromotion[body.sku];
+      const updated = await withTransaction(async (client) => {
+        const product = await client.query<{ id: string }>(
+          "SELECT id FROM products WHERE sku = $1 FOR UPDATE",
+          [body.sku]
+        );
+        if (!product.rows[0]) {
+          throw new ApiError(404, "PRODUCT_NOT_FOUND", "商品不存在");
+        }
+        const before = await client.query(
+          `SELECT id, grant_count, status
+             FROM promotion_rules
+            WHERE product_id = $1
+              AND trigger_type = 'first_verified_user'
+            FOR UPDATE`,
+          [product.rows[0].id]
+        );
+        const result = await client.query(
+          `INSERT INTO promotion_rules(
+             code, name, product_id, grant_count, trigger_type,
+             constraints, status
+           ) VALUES ($1, $2, $3, $4, 'first_verified_user', '{}'::jsonb, $5)
+           ON CONFLICT (code) DO UPDATE SET
+             grant_count = EXCLUDED.grant_count,
+             status = EXCLUDED.status,
+             updated_at = now()
+           RETURNING id, grant_count, status`,
+          [
+            definition.code,
+            definition.name,
+            product.rows[0].id,
+            body.grantCount,
+            body.enabled ? "active" : "inactive"
+          ]
+        );
+        await audit(
+          request,
+          "entitlement.first_use.update",
+          "promotion_rule",
+          result.rows[0].id,
+          { before: before.rows[0] ?? null, after: result.rows[0], sku: body.sku },
+          client
+        );
+        return result.rows[0];
+      });
+      response.json({
+        sku: body.sku,
+        grantCount: updated.grant_count,
+        enabled: updated.status === "active"
+      });
+    }
+  );
+
+  app.post(
+    "/api/admin/users/:id/entitlements",
+    requireCapability("users.write"),
+    async (request, response) => {
+      const userId = uuidSchema.parse(request.params.id);
+      const body = z.object({
+        sku: entitlementSkuSchema,
+        uses: z.coerce.number().int().min(1).max(1000),
+        reason: z.string().trim().min(3).max(240),
+        expiresAt: z.string().datetime({ offset: true }).nullable().optional(),
+        idempotencyKey: z.string().uuid()
+      }).strict().parse(request.body);
+      requireEntitlementSkuForChannel(request.productChannel, body.sku);
+      if (body.expiresAt && new Date(body.expiresAt).getTime() <= Date.now()) {
+        throw new ApiError(400, "ENTITLEMENT_EXPIRY_INVALID", "到期时间必须晚于当前时间");
+      }
+      const granted = await withTransaction(async (client) => {
+        const target = await client.query<{ id: string }>(
+          "SELECT id FROM users WHERE id = $1 FOR SHARE",
+          [userId]
+        );
+        if (!target.rows[0]) {
+          throw new ApiError(404, "USER_NOT_FOUND", "用户不存在");
+        }
+        const product = await client.query<{ id: string }>(
+          "SELECT id FROM products WHERE sku = $1 AND status = 'active' FOR SHARE",
+          [body.sku]
+        );
+        if (!product.rows[0]) {
+          throw new ApiError(404, "PRODUCT_NOT_FOUND", "商品不存在或已下架");
+        }
+        const inserted = await client.query<{
+          id: string;
+          total_uses: number;
+          remaining_uses: number;
+          expires_at: Date | null;
+        }>(
+          `INSERT INTO entitlements(
+             user_id, product_id, source_type, source_id,
+             total_uses, remaining_uses, status, expires_at
+           ) VALUES ($1, $2, 'admin', $3, $4, $4, 'active', $5)
+           ON CONFLICT (user_id, product_id, source_type, source_id)
+             WHERE source_id IS NOT NULL
+           DO NOTHING
+           RETURNING id, total_uses, remaining_uses, expires_at`,
+          [
+            userId,
+            product.rows[0].id,
+            body.idempotencyKey,
+            body.uses,
+            body.expiresAt ?? null
+          ]
+        );
+        let row = inserted.rows[0];
+        if (!row) {
+          const existing = await client.query<{
+            id: string;
+            total_uses: number;
+            remaining_uses: number;
+            expires_at: Date | null;
+          }>(
+            `SELECT id, total_uses, remaining_uses, expires_at
+               FROM entitlements
+              WHERE user_id = $1
+                AND product_id = $2
+                AND source_type = 'admin'
+                AND source_id = $3`,
+            [userId, product.rows[0].id, body.idempotencyKey]
+          );
+          row = existing.rows[0];
+          if (
+            !row ||
+            row.total_uses !== body.uses ||
+            (row.expires_at?.toISOString() ?? null) !== (body.expiresAt ?? null)
+          ) {
+            throw new ApiError(
+              409,
+              "ENTITLEMENT_IDEMPOTENCY_CONFLICT",
+              "同一幂等键不能用于不同的次数发放"
+            );
+          }
+          return { created: false, row };
+        }
+        await audit(
+          request,
+          "entitlement.admin_grant",
+          "entitlement",
+          row.id,
+          {
+            userId,
+            sku: body.sku,
+            uses: body.uses,
+            expiresAt: body.expiresAt ?? null,
+            reason: body.reason
+          },
+          client
+        );
+        return { created: true, row };
+      });
+      response.status(granted.created ? 201 : 200).json({
+        id: granted.row.id,
+        sku: body.sku,
+        totalUses: granted.row.total_uses,
+        remainingUses: granted.row.remaining_uses,
+        expiresAt: granted.row.expires_at,
+        created: granted.created
+      });
+    }
+  );
 
   app.patch("/api/admin/users/:id", requireCapability("users.write"), async (request, response) => {
     const id = uuidSchema.parse(request.params.id);
@@ -1370,7 +1626,7 @@ export const createApp = (
 
   app.get("/api/admin/system", requireCapability("system.read"), async (request, response) => {
     const includeMaterialTables = request.productChannel === "ai";
-    const [databaseSize, tableCounts, migration, errorSummary, taskSummary] = await Promise.all([
+    const [databaseSize, tableCounts, migration, errorSummary, taskSummary, aiWorker] = await Promise.all([
       query<{ size: string }>("SELECT pg_size_pretty(pg_database_size(current_database())) AS size"),
       query<{ name: string; count: string }>(
         `SELECT name, count
@@ -1423,6 +1679,30 @@ export const createApp = (
               FROM otp_codes
              WHERE delivery_status = 'failed'
                AND created_at >= now() - interval '24 hours') AS failed_otp_deliveries`
+      ),
+      query<{
+        queued: string;
+        running: string;
+        failed_24_hours: string;
+        instance_id: string | null;
+        heartbeat_status: string | null;
+        seen_at: Date | null;
+        heartbeat_fresh: boolean;
+      }>(
+        `SELECT
+           (SELECT count(*)::text FROM ai_jobs WHERE status = 'QUEUED') AS queued,
+           (SELECT count(*)::text FROM ai_jobs WHERE status = 'RUNNING') AS running,
+           (SELECT count(*)::text
+              FROM ai_jobs
+             WHERE status = 'FAILED_FINAL'
+               AND completed_at >= now() - interval '24 hours') AS failed_24_hours,
+           heartbeat.instance_id,
+           heartbeat.status AS heartbeat_status,
+           heartbeat.seen_at,
+           coalesce(heartbeat.seen_at >= now() - interval '30 seconds', false) AS heartbeat_fresh
+         FROM (SELECT 1) marker
+         LEFT JOIN service_heartbeats heartbeat
+           ON heartbeat.service_name = 'ai-worker'`
       )
     ]);
     response.json({
@@ -1437,6 +1717,15 @@ export const createApp = (
         environment: config.NODE_ENV
       },
       aiProviders: aiProviderStatus,
+      aiWorker: {
+        status: aiWorker.rows[0]?.heartbeat_fresh ? "healthy" : "unavailable",
+        instanceId: aiWorker.rows[0]?.instance_id ?? null,
+        heartbeatStatus: aiWorker.rows[0]?.heartbeat_status ?? null,
+        seenAt: aiWorker.rows[0]?.seen_at ?? null,
+        queued: Number(aiWorker.rows[0]?.queued ?? 0),
+        running: Number(aiWorker.rows[0]?.running ?? 0),
+        failed24Hours: Number(aiWorker.rows[0]?.failed_24_hours ?? 0)
+      },
       operational: {
         errors: {
           last24Hours: Number(errorSummary.rows[0]?.last_24_hours || 0),

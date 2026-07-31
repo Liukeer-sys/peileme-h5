@@ -9,6 +9,7 @@
 - 1Panel 编排目录：`/opt/1panel/docker/compose/peileme`
 - 规则站服务：`web-main`，回环端口 `127.0.0.1:18083`
 - AI 站服务：`web-ai`，回环端口 `127.0.0.1:18084`
+- AI 异步执行：`ai-worker`，仅位于 Compose 内部网络
 - OpenResty 配置：`/opt/1panel/www/conf.d/peileme.art.conf`
 - 数据卷：`peileme_peileme_postgres`
 - 材料卷：`peileme_peileme_uploads`
@@ -26,6 +27,7 @@ curl -fsS http://127.0.0.1:18084/api/health
 curl -fsS http://127.0.0.1:18083/ | rg "赔了么"
 curl -fsS http://127.0.0.1:18084/ | rg "赔了么"
 docker compose logs --tail=200 api
+docker compose logs --tail=200 ai-worker
 docker compose logs --tail=200 web-main
 docker compose logs --tail=200 web-ai
 ```
@@ -57,9 +59,9 @@ npm run test:e2e:production -- \
   e2e/dual-web-compose.spec.ts
 ```
 
-上述生产安全套件执行移动端测算、持久化管理回查和双站管理员登录链路。验收账号需预先写入测算、邀请码兑换、埋点和小型 PDF 材料，测试会核对用户侧私有下载、普通用户越权拦截及管理后台持久化结果。依赖 `OTP_DEBUG=true` 并创建测试用户的双构建共享会话用例仅允许在隔离的本地 Compose 环境执行。
+上述生产安全套件执行移动端测算、持久化管理回查和双站管理员登录链路。验收账号需预先写入测算、邀请码兑换、埋点和小型 PDF 材料，测试会核对用户侧私有下载、普通用户越权拦截及管理后台持久化结果。创建调试验证码测试用户的用例仅允许在 `OTP_DEBUG=true` 的隔离 Compose 环境执行；生产真实邮箱用例使用外部临时邮箱收件并确认响应不含 `debugCode`。
 
-本地或预发 Compose 的故障恢复验收使用专属项目名。脚本会通过同一 Compose 项目的 `db` service 写入唯一持久化标记，先验收双站浏览器链路，重启 `api web-main web-ai` 并等待健康，再复核标记和双站链路，最后删除标记：
+本地或预发 Compose 的故障恢复验收使用专属项目名。脚本会通过同一 Compose 项目的 `db` service 写入唯一持久化标记，先验收双站浏览器链路，重启 `api ai-worker web-main web-ai` 并等待健康，再复核标记和双站链路，最后删除标记：
 
 ```bash
 E2E_COMPOSE_PROJECT=peileme-acceptance \
@@ -103,16 +105,16 @@ npm run test:e2e:dual-compose
    docker compose up -d --build --wait
    ```
 
-5. 确认 `db`、`api`、`web-main`、`web-ai` 全部为 `healthy`，再执行回环和公网检查。
-6. 主动重启三个应用服务并等待自动恢复：
+5. 确认 `db`、`api`、`ai-worker`、`web-main`、`web-ai` 全部为 `healthy`，再执行回环和公网检查。
+6. 主动重启四个应用服务并等待自动恢复：
 
    ```bash
-   docker compose restart api web-main web-ai
+   docker compose restart api ai-worker web-main web-ai
    docker compose up -d --wait
    docker compose ps
    ```
 
-7. 检查根域、`www`、AI 子域、两个管理后台、API 安全头及持久化数据。
+7. 检查根域、`www`、AI 子域、两个管理后台、API 安全头、AI Worker 新鲜心跳及持久化数据。
 
 两个 Web Nginx 使用 Docker 内置 DNS 动态解析 API，API 容器重建后会重新解析共享 API 地址。
 

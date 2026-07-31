@@ -127,7 +127,7 @@ describe("dual web deployment contract", () => {
       "docker compose up -d --build --wait"
     );
     expect(runbook).toContain(
-      "docker compose restart api web-main web-ai"
+      "docker compose restart api ai-worker web-main web-ai"
     );
     expect(runbook).toContain(
       "curl -fsS http://127.0.0.1:18083/api/health"
@@ -201,16 +201,17 @@ describe("dual web deployment contract", () => {
     expect(harness).toContain("task9_restart_sentinel");
     expect(harness).toContain('"exec",');
     expect(harness).toContain('"db",');
-    expect(harness).toContain(
-      '["compose", "-p", composeProject, "restart"'
-    );
-    expect(harness).toContain(
-      '"api", "web-main", "web-ai"'
-    );
+    expect(harness).toContain('"restart",');
+    expect(harness).toContain('"api",');
+    expect(harness).toContain('"ai-worker",');
+    expect(harness).toContain('"web-main",');
+    expect(harness).toContain('"web-ai"');
     expect(harness).toContain(
       '["compose", "-p", composeProject, "up", "-d", "--wait"]'
     );
     expect(harness).toContain("e2e/dual-web-compose.spec.ts");
+    expect(harness).toContain('runCommand("npx", [');
+    expect(harness).toContain('"playwright",');
     expect(packageJson).toContain(
       '"test:e2e:dual-compose": "node scripts/run-dual-web-compose-e2e.mjs"'
     );

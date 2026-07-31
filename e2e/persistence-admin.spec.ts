@@ -239,7 +239,7 @@ test("AI 站材料持久化、私有下载与管理后台回查", async ({ page,
     adminPage.getByText("upload.download", { exact: true }).first()
   ).toBeVisible();
   await adminPage.getByRole("button", { name: /系统状态/ }).click();
-  await expect(adminPage.getByText("healthy", { exact: true })).toBeVisible();
+  await expect(adminPage.getByText("healthy", { exact: true }).first()).toBeVisible();
   if (expectNotifierConfigured) {
     await expect(
       adminPage.getByText("已配置", { exact: true }).first()

@@ -2,7 +2,6 @@ import { Router } from "express";
 import { z } from "zod";
 import { requireAuth } from "../../security.js";
 import { commerceApiError } from "../commerce/routes.js";
-import type { AiProvider } from "../llm/types.js";
 import {
   getOwnedAiJobDetail,
   listOwnedAiJobs
@@ -59,9 +58,9 @@ const listSchema = z.object({
   pageSize: z.coerce.number().int().min(1).max(50).default(20)
 });
 
-export const createAiRouter = (providers: readonly AiProvider[] = []) => {
+export const createAiRouter = () => {
   const router = Router();
-  const service = createAiAnalysisService(providers);
+  const service = createAiAnalysisService();
   router.use(requireAuth);
 
   router.post("/jobs", async (request, response, next) => {
@@ -74,7 +73,7 @@ export const createAiRouter = (providers: readonly AiProvider[] = []) => {
         payload: body.input,
         uploadIds: body.uploadIds
       });
-      response.status(result.created ? 201 : 200).json(result.job);
+      response.status(result.created ? 202 : 200).json(result.job);
     } catch (error) {
       next(commerceApiError(error));
     }

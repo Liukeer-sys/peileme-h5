@@ -580,7 +580,7 @@ describe("commerce catalog foundation", () => {
     ]);
   });
 
-  it("seeds the first verified policy-use promotion exactly once", async () => {
+  it("seeds every first verified product-use promotion exactly once", async () => {
     await seedPolicyFoundation();
     const promotion = await query<{
       code: string;
@@ -601,6 +601,20 @@ describe("commerce catalog foundation", () => {
     );
 
     expect(promotion.rows).toEqual([
+      {
+        code: "FIRST_AI_DOCUMENT_REVIEW",
+        sku: "AI_DOCUMENT_REVIEW",
+        grant_count: 1,
+        trigger_type: "first_verified_user",
+        status: "active"
+      },
+      {
+        code: "FIRST_AI_SEVERANCE_ANALYSIS",
+        sku: "AI_SEVERANCE_ANALYSIS",
+        grant_count: 1,
+        trigger_type: "first_verified_user",
+        status: "active"
+      },
       {
         code: "FIRST_POLICY_CALC",
         sku: "POLICY_CALC",
@@ -633,7 +647,7 @@ describe("commerce catalog foundation", () => {
     expect(counts.rows[0]).toEqual({
       products: "3",
       open_prices: "3",
-      promotions: "1"
+      promotions: "3"
     });
   });
 
@@ -1952,7 +1966,7 @@ describe("atomic commerce entitlements", () => {
     await seedPolicyFoundation();
     let userId: string | undefined;
     try {
-      userId = await createEntitlementTestUser(false);
+      userId = await createEntitlementTestUser(true);
       const entitlementId = await insertAdminEntitlement(
         userId,
         "AI_SEVERANCE_ANALYSIS",
@@ -2098,7 +2112,13 @@ describe("atomic commerce entitlements", () => {
     const businessB = randomUUID();
     const businessC = randomUUID();
     try {
-      userId = await createEntitlementTestUser(false);
+      userId = await createEntitlementTestUser(true);
+      const firstUse = await reserveEntitlement(
+        userId,
+        "AI_SEVERANCE_ANALYSIS",
+        randomUUID()
+      );
+      await consumeEntitlement(firstUse.usageId);
       const entitlementId = await insertAdminEntitlement(
         userId,
         "AI_SEVERANCE_ANALYSIS",

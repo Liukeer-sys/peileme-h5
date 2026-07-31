@@ -322,18 +322,24 @@ test.beforeAll(async () => {
          code, name, level, parent_code, status,
          source_name, source_url, source_snapshot_date
        )
-       VALUES (
-         '429998', '测试无参数市', 'prefecture', '420000', 'active',
-         'Task 8 E2E fixture', 'https://www.mca.gov.cn/task8/e2e',
-         current_date
-       )
+       VALUES
+         (
+           '429900', '测试无参数省', 'province', NULL, 'active',
+           'Task 8 E2E fixture', 'https://www.mca.gov.cn/task8/e2e',
+           current_date
+         ),
+         (
+           '429998', '测试无参数市', 'prefecture', '429900', 'active',
+           'Task 8 E2E fixture', 'https://www.mca.gov.cn/task8/e2e',
+           current_date
+         )
        ON CONFLICT (code) DO UPDATE
        SET name = EXCLUDED.name,
            parent_code = EXCLUDED.parent_code,
            status = 'active'`
     );
     await database.query(
-      `DELETE FROM regional_parameters WHERE region_code = '429998'`
+      `DELETE FROM regional_parameters WHERE region_code IN ('429900', '429998')`
     );
   } finally {
     await database.end();
@@ -400,9 +406,8 @@ test("登录后完整问卷使用服务端结果并在刷新后恢复", async ({
     bonus: "1个月工资左右",
     confirmWages: false
   });
-  await expect(
-    page.getByRole("region", { name: "提交政策测算" })
-  ).toContainText("补充后本次结果会标记为估算");
+  await expect(page.getByLabel("当地最低月工资（元）")).toHaveCount(0);
+  await expect(page.getByLabel("当地上年度职工月平均工资（元）")).toHaveCount(0);
   await expect(
     page.getByRole("region", { name: "近12个月税前应发工资" })
   ).toContainText("从早到晚");
@@ -487,7 +492,7 @@ test("登录后完整问卷使用服务端结果并在刷新后恢复", async ({
   assertCleanRuntime();
 });
 
-test("完整省市搜索可选择非快捷城市并补录缺失参数", async ({ page }) => {
+test("完整省市搜索可选择非快捷城市并使用省级参数回退", async ({ page }) => {
   const assertCleanRuntime = watchRuntime(page);
   await loginAs(page, policyUser);
   await completeQuestionnaire(page, {
@@ -497,9 +502,8 @@ test("完整省市搜索可选择非快捷城市并补录缺失参数", async ({
   await expect(
     page.getByRole("region", { name: "提交政策测算" })
   ).toContainText(/内蒙古自治区.*阿拉善盟/);
-  await expect(
-    page.getByRole("region", { name: "提交政策测算" })
-  ).toContainText("补充后本次结果会标记为估算");
+  await expect(page.getByLabel("当地最低月工资（元）")).toHaveCount(0);
+  await expect(page.getByLabel("当地上年度职工月平均工资（元）")).toHaveCount(0);
   await expect(
     page.getByRole("region", { name: "近12个月税前应发工资" })
   ).toContainText("奖金不会自动计入");

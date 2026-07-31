@@ -56,7 +56,19 @@ export type AdminDashboardExtension = {
 
 type AdminDashboardProps = {
   extensions?: AdminDashboardExtension[];
+  entitlementOptions?: Array<{ sku: string; label: string }>;
 };
+
+type FirstUseSetting = {
+  sku: string;
+  name: string;
+  grantCount: number;
+  enabled: boolean;
+};
+
+const mainEntitlementOptions = [
+  { sku: "POLICY_CALC", label: "政策测算" }
+];
 
 const navItems: Array<{ id: BaseTab; label: string; icon: string }> = [
   { id: "overview", label: "经营概览", icon: "⌁" },
@@ -102,7 +114,8 @@ const tabCapability: Partial<Record<BaseTab, string>> = {
 };
 
 export default function AdminDashboard({
-  extensions = noExtensions
+  extensions = noExtensions,
+  entitlementOptions = mainEntitlementOptions
 }: AdminDashboardProps) {
   const { user, capabilities, ready, logout } = useAuth();
   const [tab, setTab] = useState<string>("overview");
@@ -112,6 +125,13 @@ export default function AdminDashboard({
   const [authOpen, setAuthOpen] = useState(false);
   const [inviteDescription, setInviteDescription] = useState("");
   const [inviteUses, setInviteUses] = useState("1");
+  const [firstUseSettings, setFirstUseSettings] = useState<FirstUseSetting[]>([]);
+  const [grantingUser, setGrantingUser] = useState<UnknownRow | null>(null);
+  const [grantSku, setGrantSku] = useState(entitlementOptions[0]?.sku ?? "POLICY_CALC");
+  const [grantUses, setGrantUses] = useState("1");
+  const [grantReason, setGrantReason] = useState("");
+  const [grantExpiresAt, setGrantExpiresAt] = useState("");
+  const [userMessage, setUserMessage] = useState("");
   const [policyRefreshKey, setPolicyRefreshKey] = useState(0);
   const requestGenerationRef = useRef(0);
   const requestControllerRef = useRef<AbortController | null>(null);
@@ -146,6 +166,10 @@ export default function AdminDashboard({
   const activeExtension = useMemo(
     () => extensions.find((extension) => extension.id === tab),
     [extensions, tab]
+  );
+  const entitlementLabel = useMemo(
+    () => Object.fromEntries(entitlementOptions.map((item) => [item.sku, item.label])),
+    [entitlementOptions]
   );
   const endpoint = useMemo(
     () => {
@@ -243,6 +267,24 @@ export default function AdminDashboard({
     };
   }, [endpoint, isAdmin, load]);
 
+  useEffect(() => {
+    if (tab !== "users" || !isAdmin) return;
+    void api<{ items: FirstUseSetting[] }>(
+      "/api/admin/entitlements/first-use",
+      { auth: true }
+    )
+      .then((response) => setFirstUseSettings(
+        response.items.filter((item) => entitlementOptions.some((option) => option.sku === item.sku))
+      ))
+      .catch((requestError) =>
+        setError(
+          requestError instanceof ApiError
+            ? requestError.message
+            : "首次权益配置加载失败"
+        )
+      );
+  }, [entitlementOptions, isAdmin, tab]);
+
   if (!ready) {
     return <main className="admin-login-state">正在确认管理会话…</main>;
   }
@@ -313,22 +355,88 @@ export default function AdminDashboard({
 
   const updateUser = async (row: UnknownRow, patch: Record<string, unknown>) => {
     const capturedEndpoint = endpoint;
-    await api(`/api/admin/users/${row.id}`, {
-      method: "PATCH",
-      auth: true,
-      body: { ...patch, expectedUpdatedAt: row.updated_at }
-    });
-    await load(capturedEndpoint);
+    setError("");
+    try {
+      await api(`/api/admin/users/${row.id}`, {
+        method: "PATCH",
+        auth: true,
+        body: { ...patch, expectedUpdatedAt: row.updated_at }
+      });
+      await load(capturedEndpoint);
+    } catch (requestError) {
+      setError(requestError instanceof ApiError ? requestError.message : "用户更新失败");
+    }
   };
 
   const toggleInvite = async (row: UnknownRow) => {
     const capturedEndpoint = endpoint;
-    await api(`/api/admin/invites/${row.id}`, {
-      method: "PATCH",
-      auth: true,
-      body: { enabled: !row.enabled }
-    });
-    await load(capturedEndpoint);
+    setError("");
+    try {
+      await api(`/api/admin/invites/${row.id}`, {
+        method: "PATCH",
+        auth: true,
+        body: { enabled: !row.enabled }
+      });
+      await load(capturedEndpoint);
+    } catch (requestError) {
+      setError(requestError instanceof ApiError ? requestError.message : "邀请码更新失败");
+    }
+  };
+
+  const updateFirstUseSetting = async (setting: FirstUseSetting) => {
+    setError("");
+    setUserMessage("");
+    try {
+      const updated = await api<FirstUseSetting>(
+        "/api/admin/entitlements/first-use",
+        {
+          method: "PATCH",
+          auth: true,
+          body: {
+            sku: setting.sku,
+            grantCount: setting.grantCount,
+            enabled: setting.enabled
+          }
+        }
+      );
+      setFirstUseSettings((current) =>
+        current.map((item) => item.sku === updated.sku ? { ...item, ...updated } : item)
+      );
+      setUserMessage(`${entitlementLabel[setting.sku] || setting.name}首次权益已保存`);
+    } catch (requestError) {
+      setError(requestError instanceof ApiError ? requestError.message : "首次权益保存失败");
+    }
+  };
+
+  const grantEntitlement = async () => {
+    if (!grantingUser) return;
+    setError("");
+    setUserMessage("");
+    try {
+      await api(`/api/admin/users/${grantingUser.id}/entitlements`, {
+        method: "POST",
+        auth: true,
+        body: {
+          sku: grantSku,
+          uses: Number(grantUses),
+          reason: grantReason,
+          expiresAt: grantExpiresAt
+            ? new Date(grantExpiresAt).toISOString()
+            : null,
+          idempotencyKey: crypto.randomUUID()
+        }
+      });
+      setUserMessage(
+        `已向 ${value(grantingUser.display_name || grantingUser.email || grantingUser.phone)} 发放 ${grantUses} 次${entitlementLabel[grantSku] || grantSku}`
+      );
+      setGrantingUser(null);
+      setGrantUses("1");
+      setGrantReason("");
+      setGrantExpiresAt("");
+      await load(endpoint);
+    } catch (requestError) {
+      setError(requestError instanceof ApiError ? requestError.message : "次数发放失败");
+    }
   };
 
   return (
@@ -460,21 +568,106 @@ export default function AdminDashboard({
         )}
 
         {tab === "users" && (
-          <section className="admin-card">
-            <h2>用户清单 <small>共 {value((data.pagination as UnknownRow | undefined)?.total)} 人</small></h2>
-            <DataTable
-              rows={rows}
-              columns={[
+          <div className="admin-policy-stack">
+            {userMessage && <p className="admin-success" role="status">{userMessage}</p>}
+            <section className="admin-card" aria-label="首次权益配置">
+              <h2>首次权益配置</h2>
+              <div className="admin-entitlement-settings">
+                {firstUseSettings.map((setting) => (
+                  <div key={setting.sku} className="admin-entitlement-setting">
+                    <strong>{entitlementLabel[setting.sku] || setting.name}</strong>
+                    <label>
+                      <span>首次次数</span>
+                      <input
+                        aria-label={`${entitlementLabel[setting.sku] || setting.name}首次次数`}
+                        type="number"
+                        min="1"
+                        max="100"
+                        disabled={!canWriteUsers}
+                        value={setting.grantCount}
+                        onChange={(event) => setFirstUseSettings((current) =>
+                          current.map((item) => item.sku === setting.sku
+                            ? { ...item, grantCount: Number(event.target.value) }
+                            : item)
+                        )}
+                      />
+                    </label>
+                    <label className="admin-inline-check">
+                      <input
+                        aria-label={`${entitlementLabel[setting.sku] || setting.name}首次权益启用`}
+                        type="checkbox"
+                        disabled={!canWriteUsers}
+                        checked={setting.enabled}
+                        onChange={(event) => setFirstUseSettings((current) =>
+                          current.map((item) => item.sku === setting.sku
+                            ? { ...item, enabled: event.target.checked }
+                            : item)
+                        )}
+                      />
+                      启用
+                    </label>
+                    <button
+                      type="button"
+                      disabled={!canWriteUsers || setting.grantCount < 1 || setting.grantCount > 100}
+                      onClick={() => void updateFirstUseSetting(setting)}
+                    >保存</button>
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            {grantingUser && (
+              <section className="admin-card admin-entitlement-grant" aria-label="发放使用次数">
+                <div className="admin-section-title">
+                  <div>
+                    <span>人工补发 · 全程审计</span>
+                    <h2>向 {value(grantingUser.display_name || grantingUser.email || grantingUser.phone)} 发放次数</h2>
+                  </div>
+                  <button type="button" onClick={() => setGrantingUser(null)}>关闭</button>
+                </div>
+                <label><span>权益类型</span>
+                  <select aria-label="发放权益类型" value={grantSku} onChange={(event) => setGrantSku(event.target.value)}>
+                    {entitlementOptions.map(({ sku, label }) => <option key={sku} value={sku}>{label}</option>)}
+                  </select>
+                </label>
+                <label><span>发放次数</span><input aria-label="发放次数" type="number" min="1" max="1000" value={grantUses} onChange={(event) => setGrantUses(event.target.value)} /></label>
+                <label><span>到期时间（可选）</span><input aria-label="权益到期时间" type="datetime-local" value={grantExpiresAt} onChange={(event) => setGrantExpiresAt(event.target.value)} /></label>
+                <label><span>发放原因</span><input aria-label="发放原因" maxLength={240} value={grantReason} onChange={(event) => setGrantReason(event.target.value)} /></label>
+                <button
+                  className="admin-primary-action"
+                  type="button"
+                  disabled={!grantReason.trim() || Number(grantUses) < 1 || Number(grantUses) > 1000}
+                  onClick={() => void grantEntitlement()}
+                >确认发放</button>
+              </section>
+            )}
+
+            <section className="admin-card">
+              <h2>用户清单 <small>共 {value((data.pagination as UnknownRow | undefined)?.total)} 人</small></h2>
+              <DataTable
+                rows={rows}
+                columns={[
                 { key: "display_name", label: "用户", render: (row) => <><b>{value(row.display_name)}</b><br /><small>{value(row.email || row.phone)}</small></> },
                 { key: "role", label: "角色", render: (row) => roleLabel[row.role as User["role"]] || value(row.role) },
                 { key: "status", label: "状态" },
                 { key: "assessment_count", label: "测算数" },
+                { key: "entitlement_balances", label: "可用次数", render: (row) => {
+                  const balances = (row.entitlement_balances || {}) as Record<string, unknown>;
+                  return entitlementOptions
+                    .map(({ sku, label }) => `${label} ${value(balances[sku])}`)
+                    .join(" · ");
+                } },
                 { key: "created_at", label: "注册时间", render: (row) => dateTime(row.created_at) },
                 {
                   key: "actions",
                   label: "操作",
                   render: (row) => canWriteUsers ? (
                     <div className="admin-row-actions">
+                      <button type="button" onClick={() => {
+                        setGrantingUser(row);
+                        setGrantReason("");
+                        setUserMessage("");
+                      }}>发放次数</button>
                       <button type="button" onClick={() => void updateUser(row, { status: row.status === "active" ? "disabled" : "active" })}>
                         {row.status === "active" ? "停用" : "启用"}
                       </button>
@@ -486,9 +679,10 @@ export default function AdminDashboard({
                     </div>
                   ) : "只读"
                 }
-              ]}
-            />
-          </section>
+                ]}
+              />
+            </section>
+          </div>
         )}
 
         {tab === "assessments" && (
@@ -638,6 +832,16 @@ export default function AdminDashboard({
                   { key: "primary", label: "顺序", render: (row) => row.primary ? "主通道" : "降级通道" }
                 ]}
               />
+            </section>
+            <section className="admin-card">
+              <h2>AI 异步 Worker</h2>
+              <dl>
+                <div><dt>状态</dt><dd>{value((data.aiWorker as UnknownRow | undefined)?.status)}</dd></div>
+                <div><dt>排队任务</dt><dd>{value((data.aiWorker as UnknownRow | undefined)?.queued)}</dd></div>
+                <div><dt>运行任务</dt><dd>{value((data.aiWorker as UnknownRow | undefined)?.running)}</dd></div>
+                <div><dt>24 小时失败</dt><dd>{value((data.aiWorker as UnknownRow | undefined)?.failed24Hours)}</dd></div>
+                <div><dt>最近心跳</dt><dd>{dateTime((data.aiWorker as UnknownRow | undefined)?.seenAt)}</dd></div>
+              </dl>
             </section>
             <section className="admin-card">
               <h2>异常与待处理任务</h2>

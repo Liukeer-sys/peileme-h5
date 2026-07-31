@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import bcrypt from "bcryptjs";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -32,6 +33,7 @@ beforeAll(async () => {
   await query(`
     TRUNCATE TABLE
       operational_job_runs,
+      service_heartbeats,
       app_errors,
       admin_audit_logs,
       announcements,
@@ -187,6 +189,150 @@ describe("operations RBAC and user lifecycle", () => {
       .set("authorization", `Bearer ${operationsToken}`)
       .send({ status: "active", expectedUpdatedAt: current.rows[0].updated_at })
       .expect(403);
+  });
+});
+
+describe("first-use entitlements and audited admin grants", () => {
+  it("configures first-use counts while preserving capability boundaries", async () => {
+    const listed = await request(createApp())
+      .get("/api/admin/entitlements/first-use")
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${operationsToken}`)
+      .expect(200);
+    expect(listed.body.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        sku: "AI_SEVERANCE_ANALYSIS",
+        grantCount: 1,
+        enabled: true
+      }),
+      expect.objectContaining({
+        sku: "AI_DOCUMENT_REVIEW",
+        grantCount: 1,
+        enabled: true
+      })
+    ]));
+
+    await request(createApp())
+      .patch("/api/admin/entitlements/first-use")
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${operationsToken}`)
+      .send({ sku: "AI_SEVERANCE_ANALYSIS", grantCount: 2, enabled: true })
+      .expect(403);
+
+    const updated = await request(createApp())
+      .patch("/api/admin/entitlements/first-use")
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${adminToken}`)
+      .send({ sku: "AI_SEVERANCE_ANALYSIS", grantCount: 2, enabled: true })
+      .expect(200);
+    expect(updated.body).toEqual({
+      sku: "AI_SEVERANCE_ANALYSIS",
+      grantCount: 2,
+      enabled: true
+    });
+
+    await request(createApp())
+      .patch("/api/admin/entitlements/first-use")
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${adminToken}`)
+      .send({ sku: "AI_SEVERANCE_ANALYSIS", grantCount: 1, enabled: true })
+      .expect(200);
+
+    const main = await request(createApp())
+      .get("/api/admin/entitlements/first-use")
+      .set("host", "localhost")
+      .set("authorization", `Bearer ${adminToken}`)
+      .expect(200);
+    expect(main.body.items).toEqual([
+      expect.objectContaining({ sku: "POLICY_CALC" })
+    ]);
+    await request(createApp())
+      .patch("/api/admin/entitlements/first-use")
+      .set("host", "localhost")
+      .set("authorization", `Bearer ${adminToken}`)
+      .send({ sku: "AI_SEVERANCE_ANALYSIS", grantCount: 1, enabled: true })
+      .expect(404)
+      .expect(({ body }) => {
+        expect(body.error).toBe("ENTITLEMENT_PRODUCT_NOT_AVAILABLE");
+      });
+  });
+
+  it("grants idempotent per-SKU uses and records the stated reason", async () => {
+    const idempotencyKey = crypto.randomUUID();
+    const grantBody = {
+      sku: "AI_DOCUMENT_REVIEW",
+      uses: 3,
+      reason: "客服核实后补发测试次数",
+      expiresAt: null,
+      idempotencyKey
+    };
+    const first = await request(createApp())
+      .post(`/api/admin/users/${userId}/entitlements`)
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${adminToken}`)
+      .set("x-request-id", "admin-grant-entitlement-1")
+      .send(grantBody)
+      .expect(201);
+    expect(first.body).toMatchObject({
+      sku: "AI_DOCUMENT_REVIEW",
+      totalUses: 3,
+      remainingUses: 3,
+      created: true
+    });
+
+    const retry = await request(createApp())
+      .post(`/api/admin/users/${userId}/entitlements`)
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${adminToken}`)
+      .send(grantBody)
+      .expect(200);
+    expect(retry.body).toMatchObject({ id: first.body.id, created: false });
+
+    const conflict = await request(createApp())
+      .post(`/api/admin/users/${userId}/entitlements`)
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${adminToken}`)
+      .send({ ...grantBody, uses: 4 })
+      .expect(409);
+    expect(conflict.body.error).toBe("ENTITLEMENT_IDEMPOTENCY_CONFLICT");
+
+    await request(createApp())
+      .post(`/api/admin/users/${userId}/entitlements`)
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${operationsToken}`)
+      .send({ ...grantBody, idempotencyKey: crypto.randomUUID() })
+      .expect(403);
+
+    await request(createApp())
+      .post(`/api/admin/users/${userId}/entitlements`)
+      .set("host", "localhost")
+      .set("authorization", `Bearer ${adminToken}`)
+      .send({ ...grantBody, idempotencyKey: crypto.randomUUID() })
+      .expect(404);
+
+    const listed = await request(createApp())
+      .get("/api/admin/users?search=operations-user%40peileme.test")
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${adminToken}`)
+      .expect(200);
+    expect(listed.body.items[0].entitlement_balances).toMatchObject({
+      AI_DOCUMENT_REVIEW: 3
+    });
+    const auditRow = await query<{ detail: Record<string, unknown> }>(
+      `SELECT detail
+         FROM admin_audit_logs
+        WHERE action = 'entitlement.admin_grant'
+          AND target_id = $1
+        ORDER BY id DESC
+        LIMIT 1`,
+      [first.body.id]
+    );
+    expect(auditRow.rows[0].detail).toMatchObject({
+      userId,
+      sku: "AI_DOCUMENT_REVIEW",
+      uses: 3,
+      reason: "客服核实后补发测试次数"
+    });
   });
 });
 
@@ -410,6 +556,10 @@ describe("operational readiness", () => {
       dependencies: { database: "ready" }
     });
 
+    await query(
+      `INSERT INTO service_heartbeats(service_name, instance_id, status, detail, seen_at)
+       VALUES ('ai-worker', 'test-worker', 'healthy', '{"busy":false}', now())`
+    );
     const system = await request(createApp())
       .get("/api/admin/system")
       .set("authorization", `Bearer ${adminToken}`)
@@ -432,6 +582,14 @@ describe("operational readiness", () => {
         primary: false
       }
     ]);
+    expect(system.body.aiWorker).toMatchObject({
+      status: "healthy",
+      instanceId: "test-worker",
+      heartbeatStatus: "healthy",
+      queued: expect.any(Number),
+      running: expect.any(Number),
+      failed24Hours: expect.any(Number)
+    });
     expect(JSON.stringify(system.body)).not.toContain("API_KEY");
   });
 

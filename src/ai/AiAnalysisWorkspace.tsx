@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError, track } from "../lib/api";
 
 type AiFinding = {
@@ -20,6 +20,7 @@ type AiJob = {
   kind: "severance_analysis" | "document_review";
   status: "QUEUED" | "RUNNING" | "COMPLETED" | "FAILED_FINAL";
   failureCode: string | null;
+  progress?: number;
   report: AiReport | null;
   createdAt: string;
 };
@@ -52,6 +53,36 @@ export default function AiAnalysisWorkspace({
   const [activeJob, setActiveJob] = useState<AiJob | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+  const activeRequestRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => activeRequestRef.current?.abort(), []);
+
+  const waitForTerminalJob = async (job: AiJob, signal: AbortSignal) => {
+    let current = job;
+    for (let attempt = 0; attempt < 600; attempt += 1) {
+      if (current.status === "COMPLETED" || current.status === "FAILED_FINAL") {
+        return current;
+      }
+      await new Promise<void>((resolve, reject) => {
+        const timeout = window.setTimeout(resolve, 1_000);
+        signal.addEventListener("abort", () => {
+          window.clearTimeout(timeout);
+          reject(new DOMException("Aborted", "AbortError"));
+        }, { once: true });
+      });
+      current = await api<AiJob>(`/api/ai/jobs/${job.id}`, {
+        auth: true,
+        signal
+      });
+      setActiveJob(current);
+      setMessage(
+        current.status === "RUNNING"
+          ? `AI 正在分析（${current.progress ?? 10}%）`
+          : "任务已排队，正在等待 AI Worker"
+      );
+    }
+    throw new ApiError(504, "AI_JOB_POLL_TIMEOUT", "分析仍在后台进行，请稍后从历史记录查看");
+  };
 
   const loadHistory = useCallback(async (signal?: AbortSignal) => {
     try {
@@ -81,16 +112,23 @@ export default function AiAnalysisWorkspace({
     }
     setBusy(true);
     setMessage("");
+    activeRequestRef.current?.abort();
+    const controller = new AbortController();
+    activeRequestRef.current = controller;
     try {
-      const job = await api<AiJob>("/api/ai/jobs", {
+      const queuedJob = await api<AiJob>("/api/ai/jobs", {
         method: "POST",
         auth: true,
+        signal: controller.signal,
         body: {
           kind: "severance_analysis",
           idempotencyKey: `web-${crypto.randomUUID()}`,
           input: { situation: normalized }
         }
       });
+      setActiveJob(queuedJob);
+      setMessage("任务已排队，正在等待 AI Worker");
+      const job = await waitForTerminalJob(queuedJob, controller.signal);
       setActiveJob(job);
       await loadHistory();
       track("ai_analysis_completed", {
@@ -106,8 +144,10 @@ export default function AiAnalysisWorkspace({
         );
       }
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       setMessage(error instanceof ApiError ? error.message : "分析提交失败，请稍后重试");
     } finally {
+      if (activeRequestRef.current === controller) activeRequestRef.current = null;
       setBusy(false);
     }
   };
@@ -138,7 +178,7 @@ export default function AiAnalysisWorkspace({
           disabled={busy || situation.trim().length < 10}
           onClick={() => void analyze()}
         >
-          {busy ? "分析中…" : "开始 AI 分析"}
+          {busy ? "AI Worker 处理中…" : "开始 AI 分析"}
         </button>
         {message && <p className="ai-workspace-message" role="status">{message}</p>}
       </div>

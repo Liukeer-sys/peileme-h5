@@ -1276,7 +1276,7 @@ describe("policy persistence foundation", () => {
     );
     expect(coverage.rows[0]).toEqual({
       minimum_count: "31",
-      average_count: "1",
+      average_count: "32",
       invalid_amount_count: "0"
     });
 
@@ -1297,7 +1297,7 @@ describe("policy persistence foundation", () => {
        ORDER BY region_code, parameter_type`,
       [["110000", "310000", "420100", "440000", "540000", "650000"]]
     );
-    expect(samples.rows).toEqual([
+    expect(samples.rows).toEqual(expect.arrayContaining([
       expect.objectContaining({
         region_code: "110000",
         year: 2026,
@@ -1333,9 +1333,23 @@ describe("policy persistence foundation", () => {
         year: 2026,
         parameter_type: "minimum_monthly_wage",
         amount_fen: "207000"
+      }),
+      expect.objectContaining({
+        region_code: "110000",
+        year: 2025,
+        parameter_type: "employee_average_monthly_wage",
+        amount_fen: "1249183",
+        status: "stale"
+      }),
+      expect.objectContaining({
+        region_code: "540000",
+        year: 2025,
+        parameter_type: "employee_average_monthly_wage",
+        amount_fen: "958242",
+        status: "stale"
       })
-    ]);
-    expect(samples.rows.every((row) => row.status === "verified")).toBe(true);
+    ]));
+    expect(samples.rows).toHaveLength(11);
 
     const minimumWageProvenance = await query<{
       count: string;
@@ -1379,7 +1393,7 @@ describe("policy persistence foundation", () => {
     expect(lines[0]).toBe(
       "region_code,region_name,year,parameter_type,amount_fen,source_name,source_url,source_published_at,status"
     );
-    expect(lines).toHaveLength(33);
+    expect(lines).toHaveLength(64);
   });
 
   it("rejects invalid regional-parameter batches without partial writes", async () => {
@@ -1426,7 +1440,7 @@ describe("policy persistence foundation", () => {
     const count = await query<{ count: string }>(
       "SELECT count(*)::text AS count FROM regional_parameters"
     );
-    expect(count.rows[0].count).toBe("32");
+    expect(count.rows[0].count).toBe("63");
   });
 
   it(
@@ -1778,7 +1792,9 @@ describe("policy persistence foundation", () => {
       { version: "011_real_payments.sql" },
       { version: "012_refunds_payment_transaction_index.sql" },
       { version: "013_ai_analysis_pipeline.sql" },
-      { version: "014_operations_admin.sql" }
+      { version: "014_operations_admin.sql" },
+      { version: "015_ai_worker_entitlement_admin.sql" },
+      { version: "016_ai_worker_attempts.sql" }
     ]);
 
     const preserved = await query<{
@@ -1801,7 +1817,7 @@ describe("policy persistence foundation", () => {
     );
     expect(preserved.rows[0]).toEqual({
       regions: "364",
-      parameters: "32",
+      parameters: "63",
       rule_versions: "1",
       beijing_wage: "254000"
     });

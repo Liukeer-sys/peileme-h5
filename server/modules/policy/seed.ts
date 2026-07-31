@@ -374,16 +374,20 @@ export const seedPolicyFoundation = async () => {
          constraints,
          status
        )
-       SELECT
-         'FIRST_POLICY_CALC',
-         '首次实名用户政策测算',
-         id,
-         1,
-         'first_verified_user',
-         '{}'::jsonb,
-         'active'
+       SELECT promotion.code,
+              promotion.name,
+              products.id,
+              1,
+              'first_verified_user',
+              '{}'::jsonb,
+              'active'
        FROM products
-       WHERE sku = 'POLICY_CALC'
+       JOIN (VALUES
+         ('POLICY_CALC', 'FIRST_POLICY_CALC', '首次实名用户政策测算'),
+         ('AI_SEVERANCE_ANALYSIS', 'FIRST_AI_SEVERANCE_ANALYSIS', '首次实名用户 AI 离职分析'),
+         ('AI_DOCUMENT_REVIEW', 'FIRST_AI_DOCUMENT_REVIEW', '首次实名用户 AI 文件审查')
+       ) AS promotion(sku, code, name)
+         ON promotion.sku = products.sku
        ON CONFLICT (code) DO NOTHING`
     );
   });

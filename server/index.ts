@@ -3,14 +3,9 @@ import { createApp } from "./app.js";
 import { getConfig } from "./config.js";
 import { closePool } from "./db.js";
 import { runMigrations } from "./migrate.js";
-import { recoverInterruptedAiJobs } from "./modules/ai/repository.js";
 
 const start = async () => {
   await runMigrations();
-  const recoveredAiJobs = await recoverInterruptedAiJobs();
-  if (Object.values(recoveredAiJobs).some((count) => count > 0)) {
-    console.log("Recovered interrupted AI jobs", recoveredAiJobs);
-  }
   const config = getConfig();
   const server = http.createServer(createApp());
   server.listen(config.PORT, "0.0.0.0", () => {

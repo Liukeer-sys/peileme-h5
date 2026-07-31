@@ -23,7 +23,7 @@ export type PolicyRegion = {
   parentCode: string | null;
   parameterAvailability?: {
     minimumMonthlyWage: "exact" | "fallback" | "manual-needed";
-    employeeAverageMonthlyWage: "exact" | "manual-needed";
+    employeeAverageMonthlyWage: "exact" | "fallback" | "manual-needed";
   };
 };
 
@@ -825,11 +825,20 @@ export class PolicyRepository {
         );
         minimumFallback = Boolean(minimum);
       }
-      const average = await selectParameter(
+      let average = await selectParameter(
         region.code,
         "employee_average_monthly_wage",
         endYear - 1
       );
+      let averageFallback = false;
+      if (!average && region.level === "prefecture" && region.parent_code) {
+        average = await selectParameter(
+          region.parent_code,
+          "employee_average_monthly_wage",
+          endYear - 1
+        );
+        averageFallback = Boolean(average);
+      }
 
       const missing: string[] = [];
       if (
@@ -898,7 +907,7 @@ export class PolicyRepository {
             normalizedFacts.manualParameters!.minimumMonthlyWageFen!
           );
       const averageProvenance = average
-        ? databaseProvenance(average, false)
+        ? databaseProvenance(average, averageFallback)
         : manualProvenance(
             "employee_average_monthly_wage",
             normalizedFacts.manualParameters!.employeeAverageMonthlyWageFen!
@@ -2569,7 +2578,7 @@ export class PolicyRepository {
       level: PolicyRegion["level"];
       parent_code: string | null;
       minimum_status: "exact" | "fallback" | "manual-needed";
-      average_status: "exact" | "manual-needed";
+      average_status: "exact" | "fallback" | "manual-needed";
     }>(
       `SELECT r.code AS region_code,
               r.name AS region_name,
@@ -2582,6 +2591,7 @@ export class PolicyRepository {
               END AS minimum_status,
               CASE
                 WHEN exact_avg.id IS NOT NULL THEN 'exact'
+                WHEN parent_avg.id IS NOT NULL THEN 'fallback'
                 ELSE 'manual-needed'
               END AS average_status
          FROM administrative_regions r
@@ -2620,6 +2630,17 @@ export class PolicyRepository {
             ORDER BY rp.year DESC
             LIMIT 1
          ) exact_avg ON true
+         LEFT JOIN LATERAL (
+           SELECT rp.id
+             FROM regional_parameters rp
+            WHERE r.level = 'prefecture'
+              AND rp.region_code = parent_region.code
+              AND rp.parameter_type = 'employee_average_monthly_wage'
+              AND rp.year <= $1 - 1
+              AND rp.status IN ('verified', 'stale')
+            ORDER BY rp.year DESC
+            LIMIT 1
+         ) parent_avg ON exact_avg.id IS NULL
         WHERE r.status = 'active'
           AND (
             r.level = 'province' OR

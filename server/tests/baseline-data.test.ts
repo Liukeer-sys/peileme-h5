@@ -16,7 +16,7 @@ describe("bundled production policy baseline", () => {
   it("imports the complete region snapshot and current parameters idempotently", async () => {
     await expect(importBundledPolicyData()).resolves.toEqual({
       administrativeRegions: 364,
-      regionalParameters: 32
+      regionalParameters: 63
     });
     const first = await query<{
       regions: string;
@@ -36,7 +36,7 @@ describe("bundled production policy baseline", () => {
     );
     expect(first.rows[0]).toMatchObject({
       regions: "364",
-      parameters: "32",
+      parameters: "63",
       province_name: "湖北省",
       city_parent: "420000"
     });

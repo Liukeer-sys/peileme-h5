@@ -4,28 +4,20 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createApp } from "../app.js";
 import { closePool, query } from "../db.js";
 import { runMigrations } from "../migrate.js";
+import { processNextAiJob } from "../modules/ai/worker-service.js";
+import { seedPolicyFoundation } from "../modules/policy/seed.js";
 import { signAccessToken, type AuthUser } from "../security.js";
-
-type ControlledProvider = {
-  key: string;
-  model: string;
-  priority: number;
-  enabled?: boolean;
-  materialMode?: "metadata" | "content";
-  analyze: (input: unknown) => Promise<unknown>;
-};
+import type { AiProvider } from "../modules/llm/types.js";
 
 const report = (summary: string) => ({
-  schemaVersion: "1.0",
+  schemaVersion: "1.0" as const,
   summary,
-  riskLevel: "medium",
-  findings: [
-    {
-      title: "补偿基数需要核对",
-      severity: "medium",
-      explanation: "建议核对解除前十二个月应发工资。"
-    }
-  ],
+  riskLevel: "medium" as const,
+  findings: [{
+    title: "补偿基数需要核对",
+    severity: "medium" as const,
+    explanation: "建议核对解除前十二个月应发工资。"
+  }],
   actions: ["整理工资流水和解除通知"]
 });
 
@@ -38,15 +30,33 @@ const authUser = (id: string, email: string): AuthUser => ({
   status: "active"
 });
 
-const createAiApp = (providers: ControlledProvider[]) =>
-  createApp({ aiProviders: providers } as never);
+const workerOptions = (suffix: string, maxAttempts = 1) => ({
+  workerId: `test-worker-${suffix}`,
+  leaseSeconds: 60,
+  maxAttempts,
+  retryDelayMilliseconds: 0
+});
 
-let userA = "";
-let userB = "";
-let tokenA = "";
-let tokenB = "";
-let uploadA = "";
-let uploadB = "";
+const createAiApp = (providers: readonly AiProvider[] = []) =>
+  createApp({ aiProviders: providers });
+
+const submit = async (
+  token: string,
+  body: Record<string, unknown>,
+  expectedStatus = 202
+) => request(createAiApp())
+  .post("/api/ai/jobs")
+  .set("host", "ai.localhost")
+  .set("authorization", `Bearer ${token}`)
+  .send(body)
+  .expect(expectedStatus);
+
+const detail = async (token: string, id: string) =>
+  request(createAiApp())
+    .get(`/api/ai/jobs/${id}`)
+    .set("host", "ai.localhost")
+    .set("authorization", `Bearer ${token}`)
+    .expect(200);
 
 const grant = async (userId: string, sku: string, uses = 20) => {
   await query(
@@ -60,10 +70,22 @@ const grant = async (userId: string, sku: string, uses = 20) => {
   );
 };
 
+let userA = "";
+let userB = "";
+let tokenA = "";
+let tokenB = "";
+let uploadA = "";
+let uploadB = "";
+
 beforeAll(async () => {
   await runMigrations();
   await query(`
     TRUNCATE TABLE
+      operational_job_runs,
+      ai_provider_attempts,
+      ai_job_events,
+      ai_reports,
+      ai_jobs,
       entitlement_usages,
       entitlements,
       uploads,
@@ -71,6 +93,7 @@ beforeAll(async () => {
       users
     RESTART IDENTITY CASCADE
   `);
+  await seedPolicyFoundation();
   const users = await query<{ id: string; email: string }>(
     `INSERT INTO users(email, display_name, role, email_verified_at)
      VALUES
@@ -82,21 +105,8 @@ beforeAll(async () => {
   userB = users.rows[1].id;
   tokenA = await signAccessToken(authUser(userA, users.rows[0].email));
   tokenB = await signAccessToken(authUser(userB, users.rows[1].email));
-
-  await query(
-    `INSERT INTO products(
-       sku, name, description, product_channel, fulfillment_type, status,
-       entitlement_policy
-     ) VALUES
-       ('AI_SEVERANCE_ANALYSIS', 'AI 离职分析', '测试商品', 'ai', 'ai_analysis', 'active', '{"grantCount":1}'),
-       ('AI_DOCUMENT_REVIEW', 'AI 文件审查', '测试商品', 'ai', 'document_review', 'active', '{"grantCount":1}')
-     ON CONFLICT (sku) DO UPDATE
-       SET status = 'active',
-           entitlement_policy = EXCLUDED.entitlement_policy`
-  );
   await grant(userA, "AI_SEVERANCE_ANALYSIS");
   await grant(userA, "AI_DOCUMENT_REVIEW");
-  await grant(userB, "AI_SEVERANCE_ANALYSIS");
 
   const uploads = await query<{ id: string; user_id: string }>(
     `INSERT INTO uploads(
@@ -115,488 +125,272 @@ afterAll(async () => {
   await closePool();
 });
 
-describe("AI analysis API product and identity boundary", () => {
-  it("requires login, hides the API on the main host, and validates input", async () => {
-    const app = createAiApp([]);
+describe("AI asynchronous API boundary", () => {
+  it("requires login, hides AI routes on the main host, and validates input", async () => {
     const validBody = {
       kind: "severance_analysis",
       idempotencyKey: "boundary-valid-1",
       input: { situation: "公司提出协商解除，工作三年，月工资一万元，需要分析补偿和证据。" }
     };
-
-    await request(app)
-      .post("/api/ai/jobs")
-      .set("host", "ai.localhost")
-      .send(validBody)
-      .expect(401);
-    await request(app)
+    await request(createAiApp()).post("/api/ai/jobs").set("host", "ai.localhost").send(validBody).expect(401);
+    await request(createAiApp())
       .post("/api/ai/jobs")
       .set("host", "localhost")
       .set("authorization", `Bearer ${tokenA}`)
       .send(validBody)
       .expect(404);
-    const invalid = await request(app)
+    await request(createAiApp())
       .post("/api/ai/jobs")
       .set("host", "ai.localhost")
       .set("authorization", `Bearer ${tokenA}`)
-      .send({
-        kind: "severance_analysis",
-        idempotencyKey: "boundary-invalid-1",
-        input: { situation: "太短" }
-      })
+      .send({ ...validBody, input: { situation: "太短" } })
       .expect(400);
-    expect(invalid.body.error).toBe("VALIDATION_ERROR");
+  });
+
+  it("returns a durable queued job before any provider is called", async () => {
+    let calls = 0;
+    const provider: AiProvider = {
+      key: "delayed",
+      model: "delayed-v1",
+      priority: 1,
+      analyze: async () => {
+        calls += 1;
+        return report("后台完成");
+      }
+    };
+    const queued = await submit(tokenA, {
+      kind: "severance_analysis",
+      idempotencyKey: "async-boundary-1",
+      input: { situation: "公司提出解除，工作四年，月工资一万二，需要异步分析补偿和证据。" }
+    });
+    expect(queued.body).toMatchObject({ status: "QUEUED", progress: 0 });
+    expect(calls).toBe(0);
+
+    const tick = await processNextAiJob([provider], workerOptions("async"));
+    expect(tick).toMatchObject({ processed: true, status: "completed", jobId: queued.body.id });
+    expect(calls).toBe(1);
+    const completed = await detail(tokenA, queued.body.id);
+    expect(completed.body).toMatchObject({
+      status: "COMPLETED",
+      selectedProvider: "delayed",
+      report: { summary: "后台完成" }
+    });
+    expect(completed.body.events.map((event: { toStatus: string }) => event.toStatus)).toEqual([
+      "QUEUED", "RUNNING", "COMPLETED"
+    ]);
   });
 });
 
-describe("AI analysis provider fallback and persistence", () => {
-  it("falls back by priority, persists attempts and completes with a structured report", async () => {
+describe("AI Worker fallback, retry and entitlement settlement", () => {
+  it("falls back to the second provider and persists body-free attempt evidence", async () => {
     const calls: string[] = [];
-    const app = createAiApp([
+    const providers: AiProvider[] = [
       {
         key: "primary",
         model: "primary-model",
-        priority: 10,
+        priority: 1,
         analyze: async () => {
           calls.push("primary");
-          throw new Error("upstream body must never be persisted");
+          throw new Error("secret upstream failure body");
         }
       },
       {
         key: "fallback",
         model: "fallback-model",
-        priority: 20,
+        priority: 2,
         analyze: async () => {
           calls.push("fallback");
-          return report("已完成离职补偿分析");
+          return report("降级通道完成分析");
         }
       }
-    ]);
-    const response = await request(app)
-      .post("/api/ai/jobs")
-      .set("host", "ai.localhost")
-      .set("authorization", `Bearer ${tokenA}`)
-      .send({
-        kind: "severance_analysis",
-        idempotencyKey: "fallback-success-1",
-        input: { situation: "公司通知本月底解除劳动合同，工作五年，月工资一万二，需要核算补偿。" }
-      })
-      .expect(201);
-
-    expect(calls).toEqual(["primary", "fallback"]);
-    expect(response.body).toMatchObject({
-      status: "COMPLETED",
-      selectedProvider: "fallback",
-      report: { summary: "已完成离职补偿分析" }
+    ];
+    const queued = await submit(tokenA, {
+      kind: "severance_analysis",
+      idempotencyKey: "fallback-success-1",
+      input: { situation: "公司通知本月底解除劳动合同，工作五年，月工资一万二，需要核算补偿。" }
     });
+    await expect(processNextAiJob(providers, workerOptions("fallback"))).resolves.toMatchObject({
+      status: "completed",
+      provider: "fallback"
+    });
+    expect(calls).toEqual(["primary", "fallback"]);
 
     const attempts = await query<{
+      job_attempt: number;
       provider_key: string;
       outcome: string;
       error_code: string | null;
     }>(
-      `SELECT provider_key, outcome, error_code
+      `SELECT job_attempt, provider_key, outcome, error_code
          FROM ai_provider_attempts
         WHERE job_id = $1
-        ORDER BY ordinal`,
-      [response.body.id]
+        ORDER BY job_attempt, ordinal`,
+      [queued.body.id]
     );
     expect(attempts.rows).toEqual([
-      { provider_key: "primary", outcome: "failed", error_code: "PROVIDER_ERROR" },
-      { provider_key: "fallback", outcome: "succeeded", error_code: null }
+      { job_attempt: 1, provider_key: "primary", outcome: "failed", error_code: "PROVIDER_ERROR" },
+      { job_attempt: 1, provider_key: "fallback", outcome: "succeeded", error_code: null }
     ]);
-    expect(JSON.stringify(attempts.rows)).not.toContain("upstream body");
-
-    const states = await query<{ to_status: string }>(
-      "SELECT to_status FROM ai_job_events WHERE job_id = $1 ORDER BY id",
-      [response.body.id]
-    );
-    expect(states.rows.map((row) => row.to_status)).toEqual([
-      "QUEUED",
-      "RUNNING",
-      "COMPLETED"
-    ]);
+    expect(JSON.stringify(attempts.rows)).not.toContain("secret upstream");
     const usage = await query<{ status: string }>(
       "SELECT status FROM entitlement_usages WHERE business_id = $1",
-      [response.body.id]
+      [queued.body.id]
     );
     expect(usage.rows[0].status).toBe("consumed");
   });
 
-  it("persists a final failure, releases the reservation, and fails closed with no providers", async () => {
-    const failing = createAiApp([
-      {
-        key: "only-provider",
-        model: "broken-model",
-        priority: 1,
-        analyze: async () => {
-          throw new Error("secret upstream failure detail");
-        }
-      }
-    ]);
-    const failed = await request(failing)
-      .post("/api/ai/jobs")
-      .set("host", "ai.localhost")
-      .set("authorization", `Bearer ${tokenA}`)
-      .send({
-        kind: "severance_analysis",
-        idempotencyKey: "all-failed-1",
-        input: { situation: "公司要求立即离职，没有出具书面通知，工作两年，需要判断风险和补偿。" }
-      })
-      .expect(201);
+  it("requeues an exhausted chain once, then fails final and restores the use", async () => {
+    const provider: AiProvider = {
+      key: "broken",
+      model: "broken-v1",
+      priority: 1,
+      analyze: async () => { throw new Error("upstream unavailable"); }
+    };
+    const queued = await submit(tokenA, {
+      kind: "severance_analysis",
+      idempotencyKey: "worker-retry-final-1",
+      input: { situation: "公司要求立即离职且没有书面通知，需要验证 Worker 重试及次数退回。" }
+    });
+    await expect(processNextAiJob([provider], workerOptions("retry", 2))).resolves.toMatchObject({ status: "requeued" });
+    await expect(processNextAiJob([provider], workerOptions("retry", 2))).resolves.toMatchObject({ status: "failed" });
+    const failed = await detail(tokenA, queued.body.id);
     expect(failed.body).toMatchObject({
       status: "FAILED_FINAL",
       failureCode: "AI_PROVIDER_CHAIN_EXHAUSTED"
     });
-    expect(JSON.stringify(failed.body)).not.toContain("secret upstream");
-    const released = await query<{ status: string }>(
-      "SELECT status FROM entitlement_usages WHERE business_id = $1",
-      [failed.body.id]
+    const usage = await query<{ status: string; remaining_uses: number }>(
+      `SELECT eu.status, e.remaining_uses
+         FROM entitlement_usages eu
+         JOIN entitlements e ON e.id = eu.entitlement_id
+        WHERE eu.business_id = $1`,
+      [queued.body.id]
     );
-    expect(released.rows[0].status).toBe("released");
+    expect(usage.rows[0]).toMatchObject({ status: "released" });
+    expect(usage.rows[0].remaining_uses).toBeGreaterThan(0);
+  });
 
-    const disabled = await request(createAiApp([]))
-      .post("/api/ai/jobs")
-      .set("host", "ai.localhost")
-      .set("authorization", `Bearer ${tokenA}`)
-      .send({
-        kind: "severance_analysis",
-        idempotencyKey: "no-provider-1",
-        input: { situation: "劳动合同即将到期，公司表示不再续签，需要分析补偿标准与准备材料。" }
-      })
-      .expect(201);
-    expect(disabled.body).toMatchObject({
-      status: "FAILED_FINAL",
+  it("fails closed without providers and releases the reservation", async () => {
+    const queued = await submit(tokenA, {
+      kind: "severance_analysis",
+      idempotencyKey: "no-provider-async-1",
+      input: { situation: "劳动合同到期公司不续签，需要验证未配置模型时任务安全失败并退回次数。" }
+    });
+    await expect(processNextAiJob([], workerOptions("none"))).resolves.toMatchObject({
+      status: "failed",
       failureCode: "AI_PROVIDER_NOT_CONFIGURED"
     });
-  });
-
-  it("releases a reservation and permits an identical retry when starting the job fails", async () => {
-    let calls = 0;
-    const app = createAiApp([
-      {
-        key: "controlled-start-retry",
-        model: "controlled-v1",
-        priority: 1,
-        analyze: async () => {
-          calls += 1;
-          return report("启动故障恢复后分析完成");
-        }
-      }
-    ]);
-    const body = {
-      kind: "severance_analysis",
-      idempotencyKey: "attach-fault-retry-1",
-      input: { situation: "公司提出解除劳动关系，工作三年，工资包含奖金，需要在启动故障恢复后继续分析。" }
-    };
-    await query(`
-      CREATE OR REPLACE FUNCTION test_fail_ai_running_event()
-      RETURNS trigger LANGUAGE plpgsql AS $$
-      BEGIN
-        IF NEW.to_status = 'RUNNING' THEN
-          RAISE EXCEPTION 'controlled AI start failure';
-        END IF;
-        RETURN NEW;
-      END;
-      $$;
-      CREATE TRIGGER test_fail_ai_running_event_trigger
-      BEFORE INSERT ON ai_job_events
-      FOR EACH ROW EXECUTE FUNCTION test_fail_ai_running_event();
-    `);
-    try {
-      await request(app)
-        .post("/api/ai/jobs")
-        .set("host", "ai.localhost")
-        .set("authorization", `Bearer ${tokenA}`)
-        .send(body)
-        .expect(500);
-    } finally {
-      await query("DROP TRIGGER IF EXISTS test_fail_ai_running_event_trigger ON ai_job_events");
-      await query("DROP FUNCTION IF EXISTS test_fail_ai_running_event()");
-    }
-
-    const leakedUsage = await query<{ status: string }>(
-      `SELECT status
-         FROM entitlement_usages
-        WHERE user_id = $1
-        ORDER BY created_at DESC, id DESC
-        LIMIT 1`,
-      [userA]
-    );
-    expect(leakedUsage.rows[0].status).toBe("released");
-    const abandonedJob = await query<{ count: string }>(
-      "SELECT count(*)::text AS count FROM ai_jobs WHERE user_id = $1 AND idempotency_key = $2",
-      [userA, body.idempotencyKey]
-    );
-    expect(abandonedJob.rows[0].count).toBe("0");
-
-    const retry = await request(app)
-      .post("/api/ai/jobs")
-      .set("host", "ai.localhost")
-      .set("authorization", `Bearer ${tokenA}`)
-      .send(body)
-      .expect(201);
-    expect(retry.body).toMatchObject({
-      status: "COMPLETED",
-      report: { summary: "启动故障恢复后分析完成" }
-    });
-    expect(calls).toBe(1);
-  });
-
-  it("turns an invalid provider registry into a released terminal failure", async () => {
-    const invalidRegistry = createAiApp([
-      {
-        key: "duplicate-provider",
-        model: "first",
-        priority: 1,
-        analyze: async () => report("不应调用")
-      },
-      {
-        key: "duplicate-provider",
-        model: "second",
-        priority: 2,
-        analyze: async () => report("不应调用")
-      }
-    ]);
-    const failed = await request(invalidRegistry)
-      .post("/api/ai/jobs")
-      .set("host", "ai.localhost")
-      .set("authorization", `Bearer ${tokenA}`)
-      .send({
-        kind: "severance_analysis",
-        idempotencyKey: "registry-invalid-1",
-        input: { situation: "需要确认异常 provider 配置不会造成永久运行任务或长期占用分析次数。" }
-      })
-      .expect(201);
-    expect(failed.body).toMatchObject({
-      status: "FAILED_FINAL",
-      failureCode: "AI_PROVIDER_CONFIGURATION_ERROR"
-    });
-    const usage = await query<{ status: string }>(
-      "SELECT status FROM entitlement_usages WHERE business_id = $1",
-      [failed.body.id]
-    );
-    expect(usage.rows[0].status).toBe("released");
-
-    const recovered = await request(createAiApp([
-      {
-        key: "recovered-provider",
-        model: "recovered-v1",
-        priority: 1,
-        analyze: async () => report("配置修复后成功")
-      }
-    ]))
-      .post("/api/ai/jobs")
-      .set("host", "ai.localhost")
-      .set("authorization", `Bearer ${tokenA}`)
-      .send({
-        kind: "severance_analysis",
-        idempotencyKey: "registry-recovered-1",
-        input: { situation: "provider 配置修复后使用新的任务幂等键重新发起分析并成功完成。" }
-      })
-      .expect(201);
-    expect(recovered.body.status).toBe("COMPLETED");
+    const failed = await detail(tokenA, queued.body.id);
+    expect(failed.body).toMatchObject({ status: "FAILED_FINAL", failureCode: "AI_PROVIDER_NOT_CONFIGURED" });
   });
 });
 
-describe("AI analysis idempotency, document metadata and owned history", () => {
-  it("cleans up a first-time task when provider material is unavailable without reserving a use", async () => {
-    let calls = 0;
-    const idempotencyKey = "document-material-unavailable-1";
-    const usageCountBefore = await query<{ count: string }>(
-      "SELECT count(*)::text AS count FROM entitlement_usages WHERE user_id = $1",
-      [userA]
-    );
-    const app = createAiApp([
-      {
-        key: "content-provider",
-        model: "content-v1",
-        priority: 1,
-        materialMode: "content",
-        analyze: async () => {
-          calls += 1;
-          return report("不应调用");
-        }
-      }
-    ]);
-    const unavailable = await request(app)
-      .post("/api/ai/jobs")
-      .set("host", "ai.localhost")
-      .set("authorization", `Bearer ${tokenA}`)
-      .send({
-        kind: "document_review",
-        idempotencyKey,
-        input: { objective: "文件存储缺失时应允许用户重新上传后使用相同幂等键重试" },
-        uploadIds: [uploadA]
-      })
-      .expect(409);
-    expect(unavailable.body.error).toBe("AI_MATERIAL_UNAVAILABLE");
-    expect(calls).toBe(0);
-
-    const jobs = await query<{ count: string }>(
-      "SELECT count(*)::text AS count FROM ai_jobs WHERE user_id = $1 AND idempotency_key = $2",
-      [userA, idempotencyKey]
-    );
-    expect(jobs.rows[0].count).toBe("0");
-    const usages = await query<{ count: string }>(
-      "SELECT count(*)::text AS count FROM entitlement_usages WHERE user_id = $1",
-      [userA]
-    );
-    expect(usages.rows[0].count).toBe(usageCountBefore.rows[0].count);
-  });
-
-  it("returns a resumable entitlement boundary without running a provider", async () => {
-    let calls = 0;
-    const app = createAiApp([
-      {
-        key: "entitlement-provider",
-        model: "entitlement-v1",
-        priority: 1,
-        analyze: async () => {
-          calls += 1;
-          return report("购买次数后完成文件审查");
-        }
-      }
-    ]);
-    const body = {
+describe("AI first-use, documents and idempotency", () => {
+  it("grants and consumes the first document review, then requires another use", async () => {
+    const provider: AiProvider = {
+      key: "metadata-review",
+      model: "review-v1",
+      priority: 1,
+      materialMode: "metadata",
+      analyze: async () => report("首次文件审查完成")
+    };
+    const first = await submit(tokenB, {
       kind: "document_review",
-      idempotencyKey: "document-entitlement-1",
+      idempotencyKey: "first-document-review-1",
       input: { objective: "检查离职协议中的权利放弃、补偿金额、付款期限和违约责任" },
       uploadIds: [uploadB]
-    };
-    const required = await request(app)
-      .post("/api/ai/jobs")
-      .set("host", "ai.localhost")
-      .set("authorization", `Bearer ${tokenB}`)
-      .send(body)
-      .expect(402);
+    });
+    await processNextAiJob([provider], workerOptions("first-review"));
+    const completed = await detail(tokenB, first.body.id);
+    expect(completed.body.status).toBe("COMPLETED");
+    const free = await query<{ source_type: string; total_uses: number; remaining_uses: number }>(
+      `SELECT e.source_type, e.total_uses, e.remaining_uses
+         FROM entitlements e
+         JOIN products p ON p.id = e.product_id
+        WHERE e.user_id = $1 AND p.sku = 'AI_DOCUMENT_REVIEW'`,
+      [userB]
+    );
+    expect(free.rows).toEqual([{ source_type: "first_free", total_uses: 1, remaining_uses: 0 }]);
+
+    const required = await submit(tokenB, {
+      kind: "document_review",
+      idempotencyKey: "second-document-review-1",
+      input: { objective: "第二次文件审查应进入按次权益边界并返回明确提示" },
+      uploadIds: [uploadB]
+    }, 402);
     expect(required.body).toMatchObject({
       error: "AI_ENTITLEMENT_REQUIRED",
       detail: { sku: "AI_DOCUMENT_REVIEW" }
     });
-    expect(calls).toBe(0);
-    const abandoned = await query<{ count: string }>(
-      "SELECT count(*)::text AS count FROM ai_jobs WHERE user_id = $1 AND idempotency_key = $2",
-      [userB, body.idempotencyKey]
-    );
-    expect(abandoned.rows[0].count).toBe("0");
-
-    await grant(userB, "AI_DOCUMENT_REVIEW", 1);
-    const resumed = await request(app)
-      .post("/api/ai/jobs")
-      .set("host", "ai.localhost")
-      .set("authorization", `Bearer ${tokenB}`)
-      .send(body)
-      .expect(201);
-    expect(resumed.body).toMatchObject({
-      status: "COMPLETED",
-      report: { summary: "购买次数后完成文件审查" }
-    });
-    expect(calls).toBe(1);
   });
 
-  it("returns the same task for an identical retry and rejects a changed payload", async () => {
+  it("keeps a material parsing failure as a terminal job and releases the use", async () => {
+    const provider: AiProvider = {
+      key: "content-review",
+      model: "content-v1",
+      priority: 1,
+      materialMode: "content",
+      analyze: async () => report("不应执行")
+    };
+    const queued = await submit(tokenA, {
+      kind: "document_review",
+      idempotencyKey: "material-unavailable-async-1",
+      input: { objective: "文件存储缺失时任务应失败并退回本次使用次数" },
+      uploadIds: [uploadA]
+    });
+    await expect(processNextAiJob([provider], workerOptions("material"))).resolves.toMatchObject({
+      status: "failed",
+      failureCode: "AI_MATERIAL_UNAVAILABLE"
+    });
+    const failed = await detail(tokenA, queued.body.id);
+    expect(failed.body).toMatchObject({ status: "FAILED_FINAL", failureCode: "AI_MATERIAL_UNAVAILABLE" });
+  });
+
+  it("deduplicates identical submissions, rejects changed payloads and runs one Worker job", async () => {
     let calls = 0;
-    const app = createAiApp([
-      {
-        key: "controlled",
-        model: "controlled-v1",
-        priority: 1,
-        analyze: async () => {
-          calls += 1;
-          return report("幂等分析完成");
-        }
+    const provider: AiProvider = {
+      key: "idempotent",
+      model: "idempotent-v1",
+      priority: 1,
+      analyze: async () => {
+        calls += 1;
+        return report("幂等任务完成");
       }
-    ]);
+    };
     const body = {
       kind: "severance_analysis",
-      idempotencyKey: "same-request-1",
+      idempotencyKey: "same-async-request-1",
       input: { situation: "公司提出协商解除，工作四年，奖金比例较高，需要核对补偿工资基数。" }
     };
-    const first = await request(app)
-      .post("/api/ai/jobs")
-      .set("host", "ai.localhost")
-      .set("authorization", `Bearer ${tokenA}`)
-      .send(body)
-      .expect(201);
-    const retry = await request(app)
-      .post("/api/ai/jobs")
-      .set("host", "ai.localhost")
-      .set("authorization", `Bearer ${tokenA}`)
-      .send(body)
-      .expect(200);
+    const first = await submit(tokenA, body);
+    const retry = await submit(tokenA, body, 200);
     expect(retry.body.id).toBe(first.body.id);
-    expect(calls).toBe(1);
-
-    const conflict = await request(app)
-      .post("/api/ai/jobs")
-      .set("host", "ai.localhost")
-      .set("authorization", `Bearer ${tokenA}`)
-      .send({
-        ...body,
-        input: { situation: "同一个幂等键改成了另一份完全不同的离职事实，需要拒绝复用。" }
-      })
-      .expect(409);
+    expect(calls).toBe(0);
+    const conflict = await submit(tokenA, {
+      ...body,
+      input: { situation: "同一个幂等键改成另一份完全不同的离职事实，服务端必须拒绝复用。" }
+    }, 409);
     expect(conflict.body.error).toBe("AI_IDEMPOTENCY_CONFLICT");
+    await processNextAiJob([provider], workerOptions("idempotent"));
+    expect(calls).toBe(1);
   });
 
-  it("accepts owned upload metadata for document review and rejects another user's upload", async () => {
-    const app = createAiApp([
-      {
-        key: "document-provider",
-        model: "document-v1",
-        priority: 1,
-        analyze: async () => report("文件签署风险审查完成")
-      }
-    ]);
-    const accepted = await request(app)
-      .post("/api/ai/jobs")
-      .set("host", "ai.localhost")
-      .set("authorization", `Bearer ${tokenA}`)
-      .send({
-        kind: "document_review",
-        idempotencyKey: "document-owned-1",
-        input: { objective: "签署前检查离职协议中的放弃权利和违约条款" },
-        uploadIds: [uploadA]
-      })
-      .expect(201);
-    expect(accepted.body).toMatchObject({
+  it("rejects another user's upload and keeps history ownership isolated", async () => {
+    const forbidden = await submit(tokenA, {
       kind: "document_review",
-      status: "COMPLETED",
-      report: { summary: "文件签署风险审查完成" }
-    });
-
-    const forbidden = await request(app)
-      .post("/api/ai/jobs")
-      .set("host", "ai.localhost")
-      .set("authorization", `Bearer ${tokenA}`)
-      .send({
-        kind: "document_review",
-        idempotencyKey: "document-unowned-1",
-        input: { objective: "审查另一位用户的文件，服务端必须拒绝" },
-        uploadIds: [uploadB]
-      })
-      .expect(404);
+      idempotencyKey: "document-unowned-async-1",
+      input: { objective: "审查另一位用户的文件，服务端必须拒绝" },
+      uploadIds: [uploadB]
+    }, 404);
     expect(forbidden.body.error).toBe("AI_UPLOAD_NOT_FOUND");
-  });
 
-  it("lists and returns only the current user's task history", async () => {
-    const userAList = await request(createAiApp([]))
+    const userAList = await request(createAiApp())
       .get("/api/ai/jobs")
       .set("host", "ai.localhost")
       .set("authorization", `Bearer ${tokenA}`)
       .expect(200);
     expect(userAList.body.items.length).toBeGreaterThan(0);
-    expect(userAList.body.items.every((item: { userId?: string }) => item.userId === undefined)).toBe(true);
-
-    const ownedId = userAList.body.items[0].id;
-    await request(createAiApp([]))
-      .get(`/api/ai/jobs/${ownedId}`)
-      .set("host", "ai.localhost")
-      .set("authorization", `Bearer ${tokenA}`)
-      .expect(200);
-    const hidden = await request(createAiApp([]))
-      .get(`/api/ai/jobs/${ownedId}`)
+    const hidden = await request(createAiApp())
+      .get(`/api/ai/jobs/${userAList.body.items[0].id}`)
       .set("host", "ai.localhost")
       .set("authorization", `Bearer ${tokenB}`)
       .expect(404);

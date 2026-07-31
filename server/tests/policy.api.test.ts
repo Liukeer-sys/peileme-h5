@@ -939,9 +939,20 @@ describe("versioned policy public API", () => {
       code: "310000",
       parameterAvailability: {
         minimumMonthlyWage: "exact",
-        employeeAverageMonthlyWage: "manual-needed"
+        employeeAverageMonthlyWage: "exact"
       }
     });
+    expect(
+      response.body.items.every((item: {
+        parameterAvailability: {
+          minimumMonthlyWage: string;
+          employeeAverageMonthlyWage: string;
+        };
+      }) =>
+        item.parameterAvailability.minimumMonthlyWage !== "manual-needed" &&
+        item.parameterAvailability.employeeAverageMonthlyWage !== "manual-needed"
+      )
+    ).toBe(true);
   });
 
   it("requires authentication for calculation and history", async () => {
@@ -1822,6 +1833,11 @@ describe("versioned policy public API", () => {
   });
 
   it("uses manual values only for missing parameters and marks accuracy estimated", async () => {
+    await query(
+      `DELETE FROM regional_parameters
+        WHERE region_code = '130000'
+          AND parameter_type = 'employee_average_monthly_wage'`
+    );
     const response = await request(createApp())
       .post("/api/policy/calculate")
       .set(authHeader(userToken))
@@ -1854,6 +1870,11 @@ describe("versioned policy public API", () => {
   });
 
   it("marks stale DB provenance and requires absent values", async () => {
+    await query(
+      `DELETE FROM regional_parameters
+        WHERE region_code = '130000'
+          AND parameter_type = 'employee_average_monthly_wage'`
+    );
     const inserted = await query<{ id: string; region_code: string }>(
       `INSERT INTO regional_parameters(
          region_code, region_name, year, parameter_type, amount_fen,
@@ -3481,7 +3502,7 @@ describe("policy capability administration", () => {
       )
     ).toMatchObject({
       minimumMonthlyWage: "fallback",
-      employeeAverageMonthlyWage: "manual-needed"
+      employeeAverageMonthlyWage: "fallback"
     });
   });
 

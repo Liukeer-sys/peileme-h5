@@ -21,6 +21,14 @@ export default defineConfig({
   },
   server: {
     host: "0.0.0.0",
-    port: 5173
+    port: 5173,
+    proxy: process.env.VITE_API_PROXY_TARGET
+      ? {
+          "/api": {
+            target: process.env.VITE_API_PROXY_TARGET,
+            changeOrigin: true
+          }
+        }
+      : undefined
   }
 });

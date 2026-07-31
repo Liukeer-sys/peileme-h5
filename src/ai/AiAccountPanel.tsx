@@ -22,7 +22,34 @@ type AiJob = {
   kind: "document_review";
   status: "COMPLETED" | "FAILED_FINAL" | "QUEUED" | "RUNNING";
   failureCode: string | null;
+  progress?: number;
   report: { summary: string } | null;
+};
+
+const waitForTerminalJob = async (
+  initial: AiJob,
+  signal: AbortSignal,
+  onProgress: (job: AiJob) => void
+) => {
+  let current = initial;
+  for (let attempt = 0; attempt < 600; attempt += 1) {
+    if (current.status === "COMPLETED" || current.status === "FAILED_FINAL") {
+      return current;
+    }
+    await new Promise<void>((resolve, reject) => {
+      const timeout = window.setTimeout(resolve, 1_000);
+      signal.addEventListener("abort", () => {
+        window.clearTimeout(timeout);
+        reject(new DOMException("Aborted", "AbortError"));
+      }, { once: true });
+    });
+    current = await api<AiJob>(`/api/ai/jobs/${initial.id}`, {
+      auth: true,
+      signal
+    });
+    onProgress(current);
+  }
+  throw new ApiError(504, "AI_JOB_POLL_TIMEOUT", "审查仍在后台进行，请稍后从历史记录查看");
 };
 
 type AiAccountPanelProps = {
@@ -255,7 +282,7 @@ export default function AiAccountPanel({
     setReviewingUploadId(item.id);
     setUploadMessage("");
     try {
-      const job = await api<AiJob>("/api/ai/jobs", {
+      const queuedJob = await api<AiJob>("/api/ai/jobs", {
         method: "POST",
         auth: true,
         signal: controller.signal,
@@ -266,6 +293,21 @@ export default function AiAccountPanel({
           uploadIds: [item.id]
         }
       });
+      if (!guard.isCurrent(lifecycle) || controller.signal.aborted) return;
+      onJobCreated?.(queuedJob.id);
+      setUploadMessage("文件审查已排队，正在等待 AI Worker");
+      const job = await waitForTerminalJob(
+        queuedJob,
+        controller.signal,
+        (current) => {
+          if (!guard.isCurrent(lifecycle) || controller.signal.aborted) return;
+          setUploadMessage(
+            current.status === "RUNNING"
+              ? `AI 正在审查文件（${current.progress ?? 10}%）`
+              : "文件审查已排队，正在等待 AI Worker"
+          );
+        }
+      );
       if (!guard.isCurrent(lifecycle) || controller.signal.aborted) return;
       onJobCreated?.(job.id);
       setUploadMessage(
@@ -280,6 +322,7 @@ export default function AiAccountPanel({
         failureCode: job.failureCode
       });
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       if (guard.isCurrent(lifecycle) && !controller.signal.aborted) {
         setUploadMessage(explainError(error, "文件审查提交失败"));
       }

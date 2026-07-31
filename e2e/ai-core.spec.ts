@@ -51,6 +51,31 @@ const login = async (page: Page, email: string, password: string) => {
   await expect(page.getByRole("heading", { name: "离职补偿深度分析" })).toBeVisible();
 };
 
+type CompletedAiJob = {
+  id: string;
+  status: string;
+  selectedProvider: string | null;
+  report: { summary: string; findings?: unknown[]; actions?: unknown[] } | null;
+};
+
+const waitForCompletedJob = async (page: Page, jobId: string) => {
+  const response = await page.waitForResponse(
+    async (candidate) => {
+      if (
+        !candidate.url().endsWith(`/api/ai/jobs/${jobId}`) ||
+        candidate.request().method() !== "GET" ||
+        candidate.status() !== 200
+      ) {
+        return false;
+      }
+      const job = (await candidate.json()) as CompletedAiJob;
+      return job.status === "COMPLETED" || job.status === "FAILED_FINAL";
+    },
+    { timeout: 100_000 }
+  );
+  return (await response.json()) as CompletedAiJob;
+};
+
 test.describe.configure({ mode: "serial", timeout: 120_000 });
 
 test.beforeAll(async () => {
@@ -122,17 +147,15 @@ test("真实用户完成 AI 分析、PDF 审查、历史、下载、资料与邀
     ),
     analyzeButton.click()
   ]);
-  expect(analysisResponse.status()).toBe(201);
-  const analysis = (await analysisResponse.json()) as {
-    status: string;
-    selectedProvider: string;
-    report: { summary: string; findings: unknown[]; actions: unknown[] };
-  };
+  expect(analysisResponse.status()).toBe(202);
+  const queuedAnalysis = (await analysisResponse.json()) as CompletedAiJob;
+  expect(queuedAnalysis.status).toBe("QUEUED");
+  const analysis = await waitForCompletedJob(page, queuedAnalysis.id);
   expect(analysis.status).toBe("COMPLETED");
   expect(["tuzi", "dataeyes"]).toContain(analysis.selectedProvider);
-  expect(analysis.report.summary.length).toBeGreaterThan(10);
-  expect(analysis.report.findings.length).toBeGreaterThan(0);
-  expect(analysis.report.actions.length).toBeGreaterThan(0);
+  expect(analysis.report?.summary.length).toBeGreaterThan(10);
+  expect(analysis.report?.findings?.length).toBeGreaterThan(0);
+  expect(analysis.report?.actions?.length).toBeGreaterThan(0);
   await expect(page.getByRole("heading", { name: "分析报告" })).toBeVisible();
   await expect(page.getByText("下一步建议", { exact: true })).toBeVisible();
 
@@ -198,14 +221,13 @@ test("真实用户完成 AI 分析、PDF 审查、历史、下载、资料与邀
     ),
     uploadRow.getByRole("button", { name: "发起文件审查" }).click()
   ]);
-  expect(reviewResponse.status()).toBe(201);
-  const review = (await reviewResponse.json()) as {
-    status: string;
-    report: { summary: string };
-  };
+  expect(reviewResponse.status()).toBe(202);
+  const queuedReview = (await reviewResponse.json()) as CompletedAiJob;
+  expect(queuedReview.status).toBe("QUEUED");
+  const review = await waitForCompletedJob(page, queuedReview.id);
   expect(review.status).toBe("COMPLETED");
   await expect(account.locator(".account-message").first()).toContainText(
-    review.report.summary.slice(0, 12)
+    review.report!.summary.slice(0, 12)
   );
 
   const [downloadResponse] = await Promise.all([
@@ -248,8 +270,8 @@ test("真实用户完成 AI 分析、PDF 审查、历史、下载、资料与邀
   expectNoRuntimeFailures();
 });
 
-test("无可用次数用户收到可恢复的分析与文件审查边界", async ({ page }) => {
-  test.skip(skipAccountSetup, "外部环境不创建无权益账号");
+test("新用户两项 AI 首次权益各成功一次且第二次进入次数不足边界", async ({ page }) => {
+  test.skip(skipAccountSetup, "外部环境由真实邮箱用例验证首次权益");
   const expectNoRuntimeFailures = watchRuntime(page);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(aiBaseUrl!);
@@ -258,6 +280,20 @@ test("无可用次数用户收到可恢复的分析与文件审查边界", async
   await page.getByLabel("把你的情况说具体一些").fill(
     "公司要求立即离职，没有书面通知，我工作两年，月工资八千元，需要分析补偿。"
   );
+  const [firstAnalysisResponse] = await Promise.all([
+    page.waitForResponse(
+      (candidate) =>
+        candidate.url().endsWith("/api/ai/jobs") &&
+        candidate.request().method() === "POST"
+    ),
+    page.getByRole("button", { name: "开始 AI 分析" }).click()
+  ]);
+  expect(firstAnalysisResponse.status()).toBe(202);
+  const firstQueued = (await firstAnalysisResponse.json()) as CompletedAiJob;
+  const firstCompleted = await waitForCompletedJob(page, firstQueued.id);
+  expect(firstCompleted.status).toBe("COMPLETED");
+  await expect(page.getByRole("heading", { name: "分析报告" })).toBeVisible();
+
   const [analysisResponse] = await Promise.all([
     page.waitForResponse(
       (candidate) =>
@@ -282,6 +318,22 @@ test("无可用次数用户收到可恢复的分析与文件审查边界", async
   await account.getByRole("button", { name: "上传并保存" }).click();
   const uploadRow = account.getByRole("article").filter({ hasText: uploadName }).first();
   await expect(uploadRow).toBeVisible();
+  const [firstReviewResponse] = await Promise.all([
+    page.waitForResponse(
+      (candidate) =>
+        candidate.url().endsWith("/api/ai/jobs") &&
+        candidate.request().method() === "POST"
+    ),
+    uploadRow.getByRole("button", { name: "发起文件审查" }).click()
+  ]);
+  expect(firstReviewResponse.status()).toBe(202);
+  const firstReviewQueued = (await firstReviewResponse.json()) as CompletedAiJob;
+  const firstReviewCompleted = await waitForCompletedJob(page, firstReviewQueued.id);
+  expect(firstReviewCompleted.status).toBe("COMPLETED");
+  await expect(account.locator(".account-message").first()).toContainText(
+    firstReviewCompleted.report!.summary.slice(0, 12)
+  );
+
   const [reviewResponse] = await Promise.all([
     page.waitForResponse(
       (candidate) =>

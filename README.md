@@ -11,6 +11,8 @@
 - PDF/JPG/PNG/WebP 私有上传、文件签名校验、本人下载
 - 全链路埋点、访客会话、转化统计
 - 管理后台：经营概览、用户、测算、材料、邀请码、埋点、审计、系统状态
+- 首次政策/AI 权益后台配置、按用户人工补发次数与审计
+- AI 异步 Worker、Provider 降级链、租约续期/恢复、任务历史与运行监控
 - `admin` / `analyst` 分级权限，关键操作审计
 - PostgreSQL 迁移、初始化管理员、容器健康检查与持久化卷
 - SMTP、阿里云邮件推送、阿里云短信适配器
@@ -72,7 +74,7 @@ postgresql://peileme_test:peileme_test@127.0.0.1:55432/peileme_test
 2. 配置 `APP_ORIGIN`、邮件或短信渠道，保持 `OTP_DEBUG=false`。
 3. 运行 `docker compose up -d --build`。
 4. 由 1Panel OpenResty 将域名反代到 `127.0.0.1:${WEB_PORT}`。
-5. 配置 HTTPS 后，从公网检查 `/api/health`，并验证容器重启恢复。
+5. 配置 HTTPS 后，从公网检查 `/api/health`，并验证 API、AI Worker 与双 Web 容器重启恢复。
 
 部署时禁止提交 `.env`、上传材料和数据库卷。验证码、Cookie 与鉴权头会从日志中脱敏。
 

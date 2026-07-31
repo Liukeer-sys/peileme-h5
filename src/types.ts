@@ -48,7 +48,7 @@ export type TerminationScenario =
 
 export type PolicyParameterAvailability = {
   minimumMonthlyWage: "exact" | "fallback" | "manual-needed";
-  employeeAverageMonthlyWage: "exact" | "manual-needed";
+  employeeAverageMonthlyWage: "exact" | "fallback" | "manual-needed";
 };
 
 export type PolicyRegion = {

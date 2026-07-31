@@ -759,7 +759,9 @@ describe("migration concurrency", () => {
             { version: "011_real_payments.sql" },
             { version: "012_refunds_payment_transaction_index.sql" },
             { version: "013_ai_analysis_pipeline.sql" },
-            { version: "014_operations_admin.sql" }
+            { version: "014_operations_admin.sql" },
+            { version: "015_ai_worker_entitlement_admin.sql" },
+            { version: "016_ai_worker_attempts.sql" }
           ]);
           const tables = await verify.query<{ count: string }>(
             `SELECT count(*)::text AS count

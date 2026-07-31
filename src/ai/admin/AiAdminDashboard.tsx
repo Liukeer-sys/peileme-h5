@@ -89,6 +89,16 @@ const aiAdminExtensions: AdminDashboardExtension[] = [
   }
 ];
 
+const aiEntitlementOptions = [
+  { sku: "AI_SEVERANCE_ANALYSIS", label: "AI 离职分析" },
+  { sku: "AI_DOCUMENT_REVIEW", label: "AI 文件审查" }
+];
+
 export default function AiAdminDashboard() {
-  return <AdminDashboard extensions={aiAdminExtensions} />;
+  return (
+    <AdminDashboard
+      extensions={aiAdminExtensions}
+      entitlementOptions={aiEntitlementOptions}
+    />
+  );
 }

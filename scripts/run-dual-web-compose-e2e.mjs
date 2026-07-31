@@ -46,7 +46,8 @@ const runCommand = (command, args) =>
   });
 
 const runBrowserAcceptance = () =>
-  runCommand("playwright", [
+  runCommand("npx", [
+    "playwright",
     "test",
     "e2e/dual-web-compose.spec.ts",
     "--reporter=list"
@@ -107,7 +108,16 @@ try {
   sentinelInserted = true;
   await runSentinelSql(assertSentinel);
 
-  await runCommand("docker", ["compose", "-p", composeProject, "restart", "api", "web-main", "web-ai"]);
+  await runCommand("docker", [
+    "compose",
+    "-p",
+    composeProject,
+    "restart",
+    "api",
+    "ai-worker",
+    "web-main",
+    "web-ai"
+  ]);
   await runCommand("docker", ["compose", "-p", composeProject, "up", "-d", "--wait"]);
 
   await runSentinelSql(assertSentinel);
