@@ -1,0 +1,128 @@
+import { z } from "zod";
+import type {
+  AiProvider,
+  AiProviderAttempt,
+  AiProviderRequest
+} from "./types.js";
+
+const findingSchema = z
+  .object({
+    title: z.string().trim().min(1).max(200),
+    severity: z.enum(["low", "medium", "high"]),
+    explanation: z.string().trim().min(1).max(4_000)
+  })
+  .strict();
+
+export const aiReportSchema = z
+  .object({
+    schemaVersion: z.literal("1.0"),
+    summary: z.string().trim().min(1).max(8_000),
+    riskLevel: z.enum(["low", "medium", "high"]),
+    findings: z.array(findingSchema).max(100),
+    actions: z.array(z.string().trim().min(1).max(1_000)).max(100)
+  })
+  .strict();
+
+export type AiReport = z.infer<typeof aiReportSchema>;
+
+const safeProviderKey = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+export const createProviderRegistry = (
+  providers: readonly AiProvider[]
+): AiProvider[] => {
+  const enabled = providers
+    .filter((provider) => provider.enabled !== false)
+    .map((provider) => {
+      if (
+        !safeProviderKey.test(provider.key) ||
+        !provider.model.trim() ||
+        !Number.isFinite(provider.priority)
+      ) {
+        throw new Error("Invalid AI provider registry entry");
+      }
+      return provider;
+    })
+    .sort(
+      (left, right) =>
+        left.priority - right.priority || left.key.localeCompare(right.key)
+    );
+  if (new Set(enabled.map((provider) => provider.key)).size !== enabled.length) {
+    throw new Error("Duplicate AI provider registry key");
+  }
+  return enabled;
+};
+
+const classifyProviderError = (error: unknown) => {
+  if (error instanceof z.ZodError) return "INVALID_OUTPUT";
+  const name = error instanceof Error ? error.name.toLowerCase() : "";
+  if (name.includes("timeout")) return "TIMEOUT";
+  if (name.includes("ratelimit")) return "RATE_LIMITED";
+  return "PROVIDER_ERROR";
+};
+
+export type ProviderChainResult =
+  | {
+      ok: true;
+      report: AiReport;
+      providerKey: string;
+      model: string;
+      attempts: AiProviderAttempt[];
+    }
+  | {
+      ok: false;
+      failureCode:
+        | "AI_PROVIDER_NOT_CONFIGURED"
+        | "AI_PROVIDER_CHAIN_EXHAUSTED";
+      attempts: AiProviderAttempt[];
+    };
+
+export const runProviderChain = async (
+  providers: readonly AiProvider[],
+  request: AiProviderRequest
+): Promise<ProviderChainResult> => {
+  const chain = createProviderRegistry(providers);
+  if (!chain.length) {
+    return {
+      ok: false,
+      failureCode: "AI_PROVIDER_NOT_CONFIGURED",
+      attempts: []
+    };
+  }
+
+  const attempts: AiProviderAttempt[] = [];
+  for (const [index, provider] of chain.entries()) {
+    const startedAt = performance.now();
+    try {
+      const report = aiReportSchema.parse(await provider.analyze(request));
+      attempts.push({
+        ordinal: index + 1,
+        providerKey: provider.key,
+        model: provider.model,
+        outcome: "succeeded",
+        errorCode: null,
+        latencyMs: Math.max(0, Math.round(performance.now() - startedAt))
+      });
+      return {
+        ok: true,
+        report,
+        providerKey: provider.key,
+        model: provider.model,
+        attempts
+      };
+    } catch (error) {
+      attempts.push({
+        ordinal: index + 1,
+        providerKey: provider.key,
+        model: provider.model,
+        outcome: "failed",
+        errorCode: classifyProviderError(error),
+        latencyMs: Math.max(0, Math.round(performance.now() - startedAt))
+      });
+    }
+  }
+  return {
+    ok: false,
+    failureCode: "AI_PROVIDER_CHAIN_EXHAUSTED",
+    attempts
+  };
+};

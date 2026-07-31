@@ -17,6 +17,8 @@ import { getConfig } from "./config.js";
 import { query, withTransaction } from "./db.js";
 import { ApiError } from "./errors.js";
 import { createCommerceRouters } from "./modules/commerce/routes.js";
+import { createAiRouter } from "./modules/ai/routes.js";
+import type { AiProvider } from "./modules/llm/types.js";
 import type { PaymentProvider } from "./modules/payments/provider.js";
 import { getChannelStatus } from "./notifier.js";
 import {
@@ -199,6 +201,7 @@ export const createApp = (
   options: {
     policyCalculate?: (input: unknown) => PolicyOutput;
     paymentProvider?: PaymentProvider;
+    aiProviders?: readonly AiProvider[];
   } = {}
 ) => {
   const config = getConfig();
@@ -260,6 +263,7 @@ export const createApp = (
     createPolicyRouter({ calculate: options.policyCalculate })
   );
   app.use("/api/admin/policy", createAdminPolicyRouter());
+  app.use("/api/ai", requireAiProductHost, createAiRouter(options.aiProviders));
 
   app.get("/api/health", async (_request, response) => {
     const started = Date.now();

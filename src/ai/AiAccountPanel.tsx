@@ -17,6 +17,14 @@ type UploadItem = {
   created_at: string;
 };
 
+type AiJob = {
+  id: string;
+  kind: "document_review";
+  status: "COMPLETED" | "FAILED_FINAL" | "QUEUED" | "RUNNING";
+  failureCode: string | null;
+  report: { summary: string } | null;
+};
+
 type AiAccountPanelProps = {
   open: boolean;
   onClose: () => void;
@@ -38,6 +46,10 @@ export default function AiAccountPanel({
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [accountMessage, setAccountMessage] = useState("");
   const [uploadMessage, setUploadMessage] = useState("");
+  const [documentObjective, setDocumentObjective] = useState(
+    "签署前检查放弃权利、补偿金额、付款时间、保密和违约责任"
+  );
+  const [reviewingUploadId, setReviewingUploadId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const displayNameRef = useRef<HTMLInputElement | null>(null);
@@ -57,6 +69,8 @@ export default function AiAccountPanel({
     setSelectedFiles([]);
     setAccountMessage("");
     setUploadMessage("");
+    setDocumentObjective("签署前检查放弃权利、补偿金额、付款时间、保密和违约责任");
+    setReviewingUploadId(null);
     setBusy(false);
     if (fileInputRef.current) fileInputRef.current.value = "";
   }, []);
@@ -194,7 +208,7 @@ export default function AiAccountPanel({
       if (!guard.isCurrent(lifecycle) || controller.signal.aborted) return;
       setUploadMessage(
         refreshed
-          ? "材料已安全保存。AI 审查能力接入后再生成分析结论。"
+          ? "材料已安全保存，可以从材料列表发起文件审查。"
           : "材料已保存，但列表刷新失败，请重试"
       );
       track("ai_document_uploaded", {
@@ -231,6 +245,47 @@ export default function AiAccountPanel({
     }
   };
 
+  const reviewDocument = async (item: UploadItem) => {
+    const lifecycle = lifecycleRef.current;
+    const guard = lifecycleGuardRef.current!;
+    if (!lifecycle || !guard.isCurrent(lifecycle)) return;
+    const controller = guard.beginRequest("upload", lifecycle);
+    setReviewingUploadId(item.id);
+    setUploadMessage("");
+    try {
+      const job = await api<AiJob>("/api/ai/jobs", {
+        method: "POST",
+        auth: true,
+        signal: controller.signal,
+        body: {
+          kind: "document_review",
+          idempotencyKey: `document-${crypto.randomUUID()}`,
+          input: { objective: documentObjective.trim() },
+          uploadIds: [item.id]
+        }
+      });
+      if (!guard.isCurrent(lifecycle) || controller.signal.aborted) return;
+      setUploadMessage(
+        job.report?.summary ||
+          (job.failureCode === "AI_PROVIDER_NOT_CONFIGURED"
+            ? "模型通道尚未配置，本次审查次数已退回"
+            : "模型通道暂时不可用，本次审查次数已退回")
+      );
+      track("ai_document_review_completed", {
+        jobId: job.id,
+        status: job.status,
+        failureCode: job.failureCode
+      });
+    } catch (error) {
+      if (guard.isCurrent(lifecycle) && !controller.signal.aborted) {
+        setUploadMessage(explainError(error, "文件审查提交失败"));
+      }
+    } finally {
+      guard.finishRequest("upload", controller);
+      if (guard.isCurrent(lifecycle)) setReviewingUploadId(null);
+    }
+  };
+
   return (
     <div
       ref={dialogRef}
@@ -261,11 +316,11 @@ export default function AiAccountPanel({
           <div className="ai-review-heading">
             <div>
               <strong>劳动文件 AI 审查</strong>
-              <span>分析能力正在接入</span>
+              <span>上传后按次发起审查</span>
             </div>
             <small>{documentReviewSku}</small>
           </div>
-          <p>先保存解除协议、劳动合同或相关截图。当前页面仅完成私有归档，不会生成虚假的分析结论。</p>
+          <p>保存解除协议、劳动合同或相关截图，再选择材料发起签署前风险审查。</p>
           <label className="upload-box" htmlFor="ai-document-upload-input">
             <span>
               {selectedFiles.length
@@ -303,6 +358,14 @@ export default function AiAccountPanel({
 
         <div className="account-panel-section">
           <strong>已上传材料</strong>
+          <label className="ai-document-objective">
+            <span>审查重点</span>
+            <input
+              value={documentObjective}
+              maxLength={2_000}
+              onChange={(event) => setDocumentObjective(event.target.value)}
+            />
+          </label>
           <div className="history-list">
             {uploads.length ? (
               uploads.slice(0, 12).map((item) => (
@@ -315,12 +378,18 @@ export default function AiAccountPanel({
                       {new Date(item.created_at).toLocaleString("zh-CN")}
                     </span>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => void downloadUpload(item)}
-                  >
-                    下载
-                  </button>
+                  <div className="upload-history-actions">
+                    <button
+                      type="button"
+                      disabled={Boolean(reviewingUploadId) || documentObjective.trim().length < 8}
+                      onClick={() => void reviewDocument(item)}
+                    >
+                      {reviewingUploadId === item.id ? "审查中…" : "发起文件审查"}
+                    </button>
+                    <button type="button" onClick={() => void downloadUpload(item)}>
+                      下载
+                    </button>
+                  </div>
                 </article>
               ))
             ) : (
