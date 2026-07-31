@@ -7,6 +7,7 @@ export type ProductSku = (typeof productSkus)[number];
 
 export const productChannels = ["main", "ai", "all"] as const;
 export type ProductChannel = (typeof productChannels)[number];
+export type OrderProductChannel = "main" | "ai";
 
 export const fulfillmentTypes = [
   "policy_calculation",
@@ -16,6 +17,11 @@ export const fulfillmentTypes = [
 export type FulfillmentType = (typeof fulfillmentTypes)[number];
 
 export type ProductStatus = "active" | "inactive";
+export type PromotionTriggerType =
+  | "first_verified_user"
+  | "invite_redemption"
+  | "admin_grant";
+export type PromotionStatus = "active" | "inactive";
 export type Currency = "CNY";
 
 export type OrderStatus =

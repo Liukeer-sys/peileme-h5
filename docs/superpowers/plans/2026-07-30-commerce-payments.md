@@ -98,6 +98,8 @@ Expected: FAIL because `products` does not exist.
 Create `database/migrations/008_commerce.sql`:
 
 ```sql
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
 CREATE TABLE products (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   sku TEXT NOT NULL UNIQUE,
@@ -111,7 +113,18 @@ CREATE TABLE products (
   entitlement_policy JSONB NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CHECK (fulfillment_type <> 'document_review' OR product_channel = 'ai')
+  CHECK (fulfillment_type <> 'document_review' OR product_channel = 'ai'),
+  CONSTRAINT products_seeded_sku_contract CHECK (
+    (sku <> 'POLICY_CALC' OR (
+      product_channel = 'main' AND fulfillment_type = 'policy_calculation'
+    ))
+    AND (sku <> 'AI_SEVERANCE_ANALYSIS' OR (
+      product_channel = 'ai' AND fulfillment_type = 'ai_analysis'
+    ))
+    AND (sku <> 'AI_DOCUMENT_REVIEW' OR (
+      product_channel = 'ai' AND fulfillment_type = 'document_review'
+    ))
+  )
 );
 
 CREATE TABLE product_prices (
@@ -123,7 +136,11 @@ CREATE TABLE product_prices (
   effective_to TIMESTAMPTZ,
   created_by UUID REFERENCES users(id) ON DELETE SET NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CHECK (effective_to IS NULL OR effective_to > effective_from)
+  CHECK (effective_to IS NULL OR effective_to > effective_from),
+  CONSTRAINT product_prices_no_overlap EXCLUDE USING gist (
+    product_id WITH =,
+    tstzrange(effective_from, effective_to, '[)') WITH &&
+  )
 );
 CREATE UNIQUE INDEX product_prices_one_open_idx
   ON product_prices(product_id) WHERE effective_to IS NULL;
@@ -167,7 +184,8 @@ CREATE TABLE orders (
   expires_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (user_id, idempotency_key)
+  UNIQUE (user_id, idempotency_key),
+  UNIQUE (id, user_id)
 );
 
 CREATE TABLE order_items (
@@ -196,13 +214,14 @@ CREATE TABLE payment_attempts (
   error_code TEXT,
   error_message TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (order_id, id)
 );
 
 CREATE TABLE payment_transactions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   order_id UUID NOT NULL REFERENCES orders(id),
-  payment_attempt_id UUID REFERENCES payment_attempts(id),
+  payment_attempt_id UUID,
   channel TEXT NOT NULL,
   channel_transaction_id TEXT NOT NULL,
   amount_fen BIGINT NOT NULL,
@@ -211,7 +230,9 @@ CREATE TABLE payment_transactions (
   verified_payload JSONB NOT NULL,
   paid_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (channel, channel_transaction_id)
+  UNIQUE (channel, channel_transaction_id),
+  FOREIGN KEY (order_id, payment_attempt_id)
+    REFERENCES payment_attempts(order_id, id)
 );
 
 CREATE TABLE entitlements (
@@ -229,19 +250,22 @@ CREATE TABLE entitlements (
   reserved_at TIMESTAMPTZ,
   expires_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (id, user_id)
 );
 
 CREATE TABLE entitlement_usages (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  entitlement_id UUID NOT NULL REFERENCES entitlements(id),
+  entitlement_id UUID NOT NULL,
   user_id UUID NOT NULL REFERENCES users(id),
   business_type TEXT NOT NULL,
   business_id UUID NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('reserved', 'consumed', 'released')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   consumed_at TIMESTAMPTZ,
-  UNIQUE (business_type, business_id)
+  UNIQUE (business_type, business_id),
+  FOREIGN KEY (entitlement_id, user_id)
+    REFERENCES entitlements(id, user_id)
 );
 
 CREATE TABLE refunds (
@@ -275,7 +299,7 @@ CREATE TABLE reconciliation_runs (
 CREATE TABLE invoice_requests (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id),
-  order_id UUID NOT NULL REFERENCES orders(id),
+  order_id UUID NOT NULL,
   title TEXT NOT NULL,
   tax_number TEXT,
   email TEXT NOT NULL,
@@ -283,7 +307,9 @@ CREATE TABLE invoice_requests (
   invoice_url TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (user_id, order_id)
+  UNIQUE (user_id, order_id),
+  FOREIGN KEY (order_id, user_id)
+    REFERENCES orders(id, user_id)
 );
 
 CREATE INDEX orders_user_time_idx ON orders(user_id, created_at DESC);
@@ -304,6 +330,10 @@ export const productSkus = [
   "AI_DOCUMENT_REVIEW"
 ] as const;
 export type ProductSku = typeof productSkus[number];
+export type OrderProductChannel = "main" | "ai";
+export type PromotionTriggerType =
+  | "first_verified_user" | "invite_redemption" | "admin_grant";
+export type PromotionStatus = "active" | "inactive";
 
 export type OrderStatus =
   | "CREATED" | "PAYING" | "PAID" | "FULFILLING" | "COMPLETED"
@@ -315,7 +345,7 @@ export type PaymentChannel = "wechat_h5" | "alipay_wap" | "fake";
 
 - [ ] **Step 5: Seed products, prices and first-free promotion**
 
-Extend `seedPolicyFoundation()` with one transaction that upserts the three products and inserts an open price only when one does not exist. `POLICY_CALC` belongs to `main`; `AI_SEVERANCE_ANALYSIS` and `AI_DOCUMENT_REVIEW` belong to `ai`. Insert promotion `FIRST_POLICY_CALC` for `POLICY_CALC`, `grant_count = 1`, `trigger_type = first_verified_user`.
+Extend `seedPolicyFoundation()` with one transaction that inserts the three product defaults only when each SKU is absent and inserts an open price only when one does not exist. Re-running the seed preserves administrator-configured names, descriptions, status, entitlement policies and open prices. The database fixes `POLICY_CALC` to `main/policy_calculation`, `AI_SEVERANCE_ANALYSIS` to `ai/ai_analysis`, and `AI_DOCUMENT_REVIEW` to `ai/document_review`. Insert promotion `FIRST_POLICY_CALC` for `POLICY_CALC`, `grant_count = 1`, `trigger_type = first_verified_user`.
 
 The file-signing/document-review product is AI-site only. Main-site APIs, navigation, copy, JavaScript and built artifacts must continue to exclude it.
 

@@ -1,3 +1,5 @@
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
 CREATE TABLE products (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   sku TEXT NOT NULL UNIQUE
@@ -22,6 +24,29 @@ CREATE TABLE products (
   CHECK (
     fulfillment_type <> 'document_review'
     OR product_channel = 'ai'
+  ),
+  CONSTRAINT products_seeded_sku_contract CHECK (
+    (
+      sku <> 'POLICY_CALC'
+      OR (
+        product_channel = 'main'
+        AND fulfillment_type = 'policy_calculation'
+      )
+    )
+    AND (
+      sku <> 'AI_SEVERANCE_ANALYSIS'
+      OR (
+        product_channel = 'ai'
+        AND fulfillment_type = 'ai_analysis'
+      )
+    )
+    AND (
+      sku <> 'AI_DOCUMENT_REVIEW'
+      OR (
+        product_channel = 'ai'
+        AND fulfillment_type = 'document_review'
+      )
+    )
   )
 );
 
@@ -35,7 +60,11 @@ CREATE TABLE product_prices (
   created_by UUID REFERENCES users(id) ON DELETE SET NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   CHECK (effective_to IS NULL OR effective_to > effective_from),
-  UNIQUE (product_id, effective_from)
+  UNIQUE (product_id, effective_from),
+  CONSTRAINT product_prices_no_overlap EXCLUDE USING gist (
+    product_id WITH =,
+    tstzrange(effective_from, effective_to, '[)') WITH &&
+  )
 );
 
 CREATE UNIQUE INDEX product_prices_one_open_idx
@@ -106,6 +135,7 @@ CREATE TABLE orders (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (user_id, idempotency_key),
+  CONSTRAINT orders_id_user_unique UNIQUE (id, user_id),
   CHECK (expires_at > created_at)
 );
 
@@ -147,7 +177,8 @@ CREATE TABLE payment_attempts (
   error_code TEXT,
   error_message TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT payment_attempts_order_id_unique UNIQUE (order_id, id)
 );
 
 CREATE UNIQUE INDEX payment_attempts_channel_prepay_unique_idx
@@ -157,7 +188,7 @@ CREATE UNIQUE INDEX payment_attempts_channel_prepay_unique_idx
 CREATE TABLE payment_transactions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   order_id UUID NOT NULL REFERENCES orders(id),
-  payment_attempt_id UUID REFERENCES payment_attempts(id),
+  payment_attempt_id UUID,
   channel TEXT NOT NULL CHECK (channel IN ('wechat_h5', 'alipay_wap', 'fake')),
   channel_transaction_id TEXT NOT NULL
     CHECK (length(btrim(channel_transaction_id)) > 0),
@@ -168,7 +199,10 @@ CREATE TABLE payment_transactions (
     CHECK (jsonb_typeof(verified_payload) = 'object'),
   paid_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (channel, channel_transaction_id)
+  UNIQUE (channel, channel_transaction_id),
+  CONSTRAINT payment_transactions_attempt_order_fk
+    FOREIGN KEY (order_id, payment_attempt_id)
+    REFERENCES payment_attempts(order_id, id)
 );
 
 CREATE TABLE entitlements (
@@ -191,7 +225,8 @@ CREATE TABLE entitlements (
   CHECK (
     (reserved_for IS NULL AND reserved_at IS NULL)
     OR (reserved_for IS NOT NULL AND reserved_at IS NOT NULL)
-  )
+  ),
+  CONSTRAINT entitlements_id_user_unique UNIQUE (id, user_id)
 );
 
 CREATE UNIQUE INDEX entitlements_source_unique_idx
@@ -204,7 +239,7 @@ CREATE UNIQUE INDEX entitlements_first_free_unique_idx
 
 CREATE TABLE entitlement_usages (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  entitlement_id UUID NOT NULL REFERENCES entitlements(id),
+  entitlement_id UUID NOT NULL,
   user_id UUID NOT NULL REFERENCES users(id),
   business_type TEXT NOT NULL CHECK (length(btrim(business_type)) > 0),
   business_id UUID NOT NULL,
@@ -215,7 +250,10 @@ CREATE TABLE entitlement_usages (
   CHECK (
     (status = 'consumed' AND consumed_at IS NOT NULL)
     OR (status <> 'consumed' AND consumed_at IS NULL)
-  )
+  ),
+  CONSTRAINT entitlement_usages_owner_fk
+    FOREIGN KEY (entitlement_id, user_id)
+    REFERENCES entitlements(id, user_id)
 );
 
 CREATE TABLE refunds (
@@ -255,7 +293,7 @@ CREATE TABLE reconciliation_runs (
 CREATE TABLE invoice_requests (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id),
-  order_id UUID NOT NULL REFERENCES orders(id),
+  order_id UUID NOT NULL,
   title TEXT NOT NULL CHECK (length(btrim(title)) > 0),
   tax_number TEXT,
   email TEXT NOT NULL CHECK (length(btrim(email)) > 0),
@@ -264,7 +302,10 @@ CREATE TABLE invoice_requests (
   invoice_url TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (user_id, order_id)
+  UNIQUE (user_id, order_id),
+  CONSTRAINT invoice_requests_order_owner_fk
+    FOREIGN KEY (order_id, user_id)
+    REFERENCES orders(id, user_id)
 );
 
 CREATE INDEX orders_user_time_idx ON orders(user_id, created_at DESC);

@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { randomUUID } from "node:crypto";
 import { closePool, query } from "../db.js";
 import { runMigrations } from "../migrate.js";
 import { seedPolicyFoundation } from "../modules/policy/seed.js";
@@ -185,7 +186,361 @@ describe("commerce catalog foundation", () => {
     }
   });
 
-  it("rejects a second open price for one product", async () => {
+  it("preserves administrator-configured product fields when the seed is rerun", async () => {
+    await seedPolicyFoundation();
+    try {
+      await query(
+        `UPDATE products
+            SET name = '后台自定义文件审查',
+                description = '后台配置的商品说明',
+                status = 'inactive',
+                entitlement_policy = '{"grantCount":3,"expiresInDays":30}'::jsonb,
+                updated_at = TIMESTAMPTZ '2026-01-02 03:04:05+08'
+          WHERE sku = 'AI_DOCUMENT_REVIEW'`
+      );
+      const before = await query<{
+        name: string;
+        description: string;
+        status: string;
+        entitlement_policy: unknown;
+        updated_at: string;
+      }>(
+        `SELECT
+           name,
+           description,
+           status,
+           entitlement_policy,
+           updated_at::text
+         FROM products
+         WHERE sku = 'AI_DOCUMENT_REVIEW'`
+      );
+
+      await seedPolicyFoundation();
+
+      const after = await query<{
+        name: string;
+        description: string;
+        status: string;
+        entitlement_policy: unknown;
+        updated_at: string;
+      }>(
+        `SELECT
+           name,
+           description,
+           status,
+           entitlement_policy,
+           updated_at::text
+         FROM products
+         WHERE sku = 'AI_DOCUMENT_REVIEW'`
+      );
+      expect(after.rows).toEqual(before.rows);
+    } finally {
+      await query(
+        `UPDATE products
+            SET name = 'AI 劳动文件审查',
+                description = '劳动文件签署与风险分析单次使用权益',
+                status = 'active',
+                entitlement_policy = '{"grantCount":1}'::jsonb,
+                updated_at = now()
+          WHERE sku = 'AI_DOCUMENT_REVIEW'`
+      );
+    }
+  });
+
+  it("enforces the fixed channel and fulfillment mapping for seeded SKUs", async () => {
+    await seedPolicyFoundation();
+    try {
+      for (const [sku, channel, fulfillmentType] of [
+        ["POLICY_CALC", "ai", "policy_calculation"],
+        ["AI_SEVERANCE_ANALYSIS", "main", "ai_analysis"],
+        ["AI_DOCUMENT_REVIEW", "ai", "ai_analysis"]
+      ]) {
+        await expect(
+          query(
+            `UPDATE products
+                SET product_channel = $2,
+                    fulfillment_type = $3
+              WHERE sku = $1`,
+            [sku, channel, fulfillmentType]
+          )
+        ).rejects.toMatchObject({
+          code: "23514",
+          constraint: "products_seeded_sku_contract"
+        });
+      }
+    } finally {
+      await query(
+        `UPDATE products
+            SET product_channel = CASE sku
+                  WHEN 'POLICY_CALC' THEN 'main'
+                  ELSE 'ai'
+                END,
+                fulfillment_type = CASE sku
+                  WHEN 'POLICY_CALC' THEN 'policy_calculation'
+                  WHEN 'AI_SEVERANCE_ANALYSIS' THEN 'ai_analysis'
+                  WHEN 'AI_DOCUMENT_REVIEW' THEN 'document_review'
+                END
+          WHERE sku IN (
+            'POLICY_CALC',
+            'AI_SEVERANCE_ANALYSIS',
+            'AI_DOCUMENT_REVIEW'
+          )`
+      );
+    }
+  });
+
+  it("rejects overlapping price periods and permits adjacent half-open periods", async () => {
+    const sku = `QUALITY_PRICE_${randomUUID().replaceAll("-", "").toUpperCase()}`;
+    const product = await query<{ id: string }>(
+      `INSERT INTO products(
+         sku,
+         name,
+         description,
+         product_channel,
+         fulfillment_type,
+         status,
+         entitlement_policy
+       )
+       VALUES ($1, '价格区间测试', '价格区间测试商品', 'ai', 'ai_analysis', 'active', '{}')
+       RETURNING id`,
+      [sku]
+    );
+    const productId = product.rows[0].id;
+    try {
+      await query(
+        `INSERT INTO product_prices(
+           product_id, amount_fen, effective_from, effective_to
+         )
+         VALUES (
+           $1, 100, TIMESTAMPTZ '2026-01-01 00:00:00+08',
+           TIMESTAMPTZ '2026-02-01 00:00:00+08'
+         )`,
+        [productId]
+      );
+      await expect(
+        query(
+          `INSERT INTO product_prices(
+             product_id, amount_fen, effective_from, effective_to
+           )
+           VALUES (
+             $1, 200, TIMESTAMPTZ '2026-01-15 00:00:00+08',
+             TIMESTAMPTZ '2026-02-15 00:00:00+08'
+           )`,
+          [productId]
+        )
+      ).rejects.toMatchObject({
+        code: "23P01",
+        constraint: "product_prices_no_overlap"
+      });
+      await expect(
+        query(
+          `INSERT INTO product_prices(
+             product_id, amount_fen, effective_from, effective_to
+           )
+           VALUES (
+             $1, 300, TIMESTAMPTZ '2026-02-01 00:00:00+08',
+             TIMESTAMPTZ '2026-03-01 00:00:00+08'
+           )`,
+          [productId]
+        )
+      ).resolves.toMatchObject({ rowCount: 1 });
+    } finally {
+      await query("DELETE FROM products WHERE id = $1", [productId]);
+    }
+  });
+
+  it("allows only one of two concurrent overlapping price inserts", async () => {
+    const sku = `QUALITY_RACE_${randomUUID().replaceAll("-", "").toUpperCase()}`;
+    const product = await query<{ id: string }>(
+      `INSERT INTO products(
+         sku,
+         name,
+         description,
+         product_channel,
+         fulfillment_type,
+         status,
+         entitlement_policy
+       )
+       VALUES ($1, '并发价格测试', '并发价格测试商品', 'ai', 'ai_analysis', 'active', '{}')
+       RETURNING id`,
+      [sku]
+    );
+    const productId = product.rows[0].id;
+    try {
+      const attempts = await Promise.allSettled([
+        query(
+          `INSERT INTO product_prices(
+             product_id, amount_fen, effective_from, effective_to
+           )
+           VALUES (
+             $1, 100, TIMESTAMPTZ '2026-04-01 00:00:00+08',
+             TIMESTAMPTZ '2026-05-01 00:00:00+08'
+           )`,
+          [productId]
+        ),
+        query(
+          `INSERT INTO product_prices(
+             product_id, amount_fen, effective_from, effective_to
+           )
+           VALUES (
+             $1, 200, TIMESTAMPTZ '2026-04-15 00:00:00+08',
+             TIMESTAMPTZ '2026-05-15 00:00:00+08'
+           )`,
+          [productId]
+        )
+      ]);
+      expect(attempts.filter((attempt) => attempt.status === "fulfilled")).toHaveLength(1);
+      expect(attempts.filter((attempt) => attempt.status === "rejected")).toEqual([
+        expect.objectContaining({
+          reason: expect.objectContaining({
+            code: "23P01",
+            constraint: "product_prices_no_overlap"
+          }),
+          status: "rejected"
+        })
+      ]);
+    } finally {
+      await query("DELETE FROM products WHERE id = $1", [productId]);
+    }
+  });
+
+  it("rejects payment, entitlement and invoice rows with mismatched ownership", async () => {
+    await seedPolicyFoundation();
+    const marker = randomUUID().replaceAll("-", "");
+    const users = await query<{ id: string }>(
+      `INSERT INTO users(email)
+       VALUES ($1), ($2)
+       RETURNING id`,
+      [`quality-a-${marker}@peileme.test`, `quality-b-${marker}@peileme.test`]
+    );
+    const [userA, userB] = users.rows.map((row) => row.id);
+    const orders = await query<{ id: string }>(
+      `INSERT INTO orders(
+         order_no,
+         user_id,
+         product_channel,
+         status,
+         total_fen,
+         idempotency_key,
+         expires_at
+       )
+       VALUES
+         ($1, $3, 'main', 'CREATED', 990, $4, now() + interval '30 minutes'),
+         ($2, $5, 'main', 'CREATED', 990, $6, now() + interval '30 minutes')
+       RETURNING id`,
+      [
+        `QUALITY-A-${marker}`,
+        `QUALITY-B-${marker}`,
+        userA,
+        `quality-a-${marker}`,
+        userB,
+        `quality-b-${marker}`
+      ]
+    );
+    const [orderA, orderB] = orders.rows.map((row) => row.id);
+    const attempt = await query<{ id: string }>(
+      `INSERT INTO payment_attempts(order_id, channel, status)
+       VALUES ($1, 'fake', 'CREATED')
+       RETURNING id`,
+      [orderA]
+    );
+    const entitlement = await query<{ id: string }>(
+      `INSERT INTO entitlements(
+         user_id,
+         product_id,
+         source_type,
+         total_uses,
+         remaining_uses,
+         status
+       )
+       SELECT $1, id, 'admin', 1, 1, 'active'
+         FROM products
+        WHERE sku = 'POLICY_CALC'
+       RETURNING id`,
+      [userA]
+    );
+    try {
+      await expect(
+        query(
+          `INSERT INTO payment_transactions(
+             order_id,
+             payment_attempt_id,
+             channel,
+             channel_transaction_id,
+             amount_fen,
+             currency,
+             status,
+             verified_payload
+           )
+           VALUES ($1, $2, 'fake', $3, 990, 'CNY', 'SUCCESS', '{}')`,
+          [orderB, attempt.rows[0].id, `quality-${marker}`]
+        )
+      ).rejects.toMatchObject({
+        code: "23503",
+        constraint: "payment_transactions_attempt_order_fk"
+      });
+
+      await expect(
+        query(
+          `INSERT INTO entitlement_usages(
+             entitlement_id,
+             user_id,
+             business_type,
+             business_id,
+             status
+           )
+           VALUES ($1, $2, 'quality', $3, 'reserved')`,
+          [entitlement.rows[0].id, userB, randomUUID()]
+        )
+      ).rejects.toMatchObject({
+        code: "23503",
+        constraint: "entitlement_usages_owner_fk"
+      });
+
+      await expect(
+        query(
+          `INSERT INTO invoice_requests(
+             user_id,
+             order_id,
+             title,
+             email,
+             status
+           )
+           VALUES ($1, $2, '错配发票', $3, 'SUBMITTED')`,
+          [userB, orderA, `quality-b-${marker}@peileme.test`]
+        )
+      ).rejects.toMatchObject({
+        code: "23503",
+        constraint: "invoice_requests_order_owner_fk"
+      });
+    } finally {
+      await query(
+        "DELETE FROM payment_transactions WHERE channel_transaction_id = $1",
+        [`quality-${marker}`]
+      );
+      await query(
+        "DELETE FROM entitlement_usages WHERE entitlement_id = $1",
+        [entitlement.rows[0].id]
+      );
+      await query("DELETE FROM invoice_requests WHERE order_id = ANY($1::uuid[])", [
+        [orderA, orderB]
+      ]);
+      await query("DELETE FROM entitlements WHERE id = $1", [
+        entitlement.rows[0].id
+      ]);
+      await query("DELETE FROM payment_attempts WHERE id = $1", [
+        attempt.rows[0].id
+      ]);
+      await query("DELETE FROM orders WHERE id = ANY($1::uuid[])", [
+        [orderA, orderB]
+      ]);
+      await query("DELETE FROM users WHERE id = ANY($1::uuid[])", [
+        [userA, userB]
+      ]);
+    }
+  });
+
+  it("rejects a second open price as an overlapping period", async () => {
     await seedPolicyFoundation();
     await expect(
       query(
@@ -195,8 +550,8 @@ describe("commerce catalog foundation", () => {
           WHERE sku = 'POLICY_CALC'`
       )
     ).rejects.toMatchObject({
-      code: "23505",
-      constraint: "product_prices_one_open_idx"
+      code: "23P01",
+      constraint: "product_prices_no_overlap"
     });
   });
 

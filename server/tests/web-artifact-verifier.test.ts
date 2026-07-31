@@ -40,6 +40,8 @@ describe("built web artifact verifier", () => {
 
   it.each([
     "documentReview",
+    "AI_DOCUMENT_REVIEW",
+    "document_review",
     "AiShell",
     "AI 深度分析",
     "providerChain"

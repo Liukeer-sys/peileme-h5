@@ -285,19 +285,8 @@ export const seedPolicyFoundation = async () => {
 
       const lockedProduct = await client.query<{
         id: string;
-        name: string;
-        description: string;
-        product_channel: string;
-        fulfillment_type: string;
-        entitlement_policy: unknown;
       }>(
-        `SELECT
-           id,
-           name,
-           description,
-           product_channel,
-           fulfillment_type,
-           entitlement_policy
+        `SELECT id
          FROM products
          WHERE sku = $1
          FOR UPDATE`,
@@ -306,32 +295,6 @@ export const seedPolicyFoundation = async () => {
       const existing = lockedProduct.rows[0];
       if (!existing) {
         throw new Error(`Commerce product disappeared during seed: ${product.sku}`);
-      }
-      const existingPolicy = JSON.stringify(existing.entitlement_policy);
-      if (
-        existing.name !== product.name ||
-        existing.description !== product.description ||
-        existing.product_channel !== product.productChannel ||
-        existing.fulfillment_type !== product.fulfillmentType ||
-        existingPolicy !== '{"grantCount":1}'
-      ) {
-        await client.query(
-          `UPDATE products
-           SET name = $2,
-               description = $3,
-               product_channel = $4,
-               fulfillment_type = $5,
-               entitlement_policy = '{"grantCount":1}'::jsonb,
-               updated_at = now()
-           WHERE id = $1`,
-          [
-            existing.id,
-            product.name,
-            product.description,
-            product.productChannel,
-            product.fulfillmentType
-          ]
-        );
       }
 
       await client.query(

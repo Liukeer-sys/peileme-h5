@@ -9,6 +9,8 @@ type VerifyWebArtifactsOptions = {
 const textExtensions = new Set([".css", ".html", ".js", ".json", ".map", ".txt"]);
 const forbiddenMainMarkers = [
   "documentReview",
+  "AI_DOCUMENT_REVIEW",
+  "document_review",
   "AiShell",
   "AI 深度分析",
   "providerChain",
