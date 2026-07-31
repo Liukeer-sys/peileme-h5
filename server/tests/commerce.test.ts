@@ -3144,12 +3144,13 @@ describe("atomic commerce orders and payments", () => {
             paymentVerificationFailed: 0
           },
           closedRecovery: {
-            terminalCount: 1,
+            scannedCount: 0,
+            terminalCount: 0,
             terminalByReason: {
-              paymentAfterExpiry:
-                anomalyCase.kind === "PAYMENT_AFTER_EXPIRY" ? 1 : 0,
-              paymentVerificationFailed:
-                anomalyCase.kind === "PAYMENT_VERIFICATION_FAILED" ? 1 : 0
+              deadlineExceeded: 0,
+              noPaymentLimitExceeded: 0,
+              paymentAfterExpiry: 0,
+              paymentVerificationFailed: 0
             }
           }
         });
@@ -4202,6 +4203,1025 @@ describe("atomic commerce orders and payments", () => {
     }
   });
 
+  it("rolls back CLOSED paid recovery with its audit while preserving only the claim lease", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const closed = await createScheduledClosedPaymentOrder(
+        userId,
+        "closed-paid-audit-rollback"
+      );
+      const verified = {
+        orderNo: closed.order.orderNo,
+        channel: "fake" as const,
+        channelTransactionId: `closed-paid-audit-${randomUUID()}`,
+        amountFen: closed.order.amountFen,
+        currency: "CNY" as const,
+        paidAt: new Date(Date.now() - 2 * 60_000).toISOString(),
+        raw: { source: "closed-paid-audit-rollback" }
+      };
+      let releaseProvider!: () => void;
+      const providerReleased = new Promise<void>((resolve) => {
+        releaseProvider = resolve;
+      });
+      let reportProviderQuery!: () => void;
+      const providerQueried = new Promise<void>((resolve) => {
+        reportProviderQuery = resolve;
+      });
+      let queryCalls = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          throw new Error("must not create");
+        },
+        async queryPayment() {
+          queryCalls += 1;
+          await query(
+            "SELECT id FROM orders WHERE id = $1 FOR UPDATE NOWAIT",
+            [closed.order.id]
+          );
+          await query(
+            "SELECT id FROM payment_attempts WHERE id = $1 FOR UPDATE NOWAIT",
+            [closed.attemptId]
+          );
+          reportProviderQuery();
+          await providerReleased;
+          return verified;
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      const forcedAuditFailure = new Error(
+        "forced paid reconciliation audit failure"
+      );
+      const failingWorker = reconcileAndCloseExpiredOrders({
+        provider,
+        limit: 5,
+        providerQueryBudget: 1,
+        providerTimeoutMs: 1_000,
+        onClosed: async () => {
+          throw forcedAuditFailure;
+        }
+      });
+      await providerQueried;
+      const concurrentWorker = await reconcileAndCloseExpiredOrders({
+        provider,
+        limit: 5,
+        providerQueryBudget: 1,
+        providerTimeoutMs: 1_000
+      });
+      expect(concurrentWorker.summary.scannedCount).toBe(0);
+      expect(queryCalls).toBe(1);
+      releaseProvider();
+      await expect(failingWorker).rejects.toThrow(
+        "forced paid reconciliation audit failure"
+      );
+
+      const rolledBack = await query<{
+        order_status: string;
+        attempt_status: string;
+        reconciliation_state: string;
+        reconciliation_attempt_count: number;
+        reconciliation_no_payment_count: number;
+        reconciliation_query_error_count: number;
+        reconciliation_next_at: Date | null;
+        reconciliation_deadline_at: Date | null;
+        reconciliation_last_result: string | null;
+        error_code: string | null;
+        transactions: string;
+        entitlements: string;
+        anomalies: string;
+      }>(
+        `SELECT
+           o.status AS order_status,
+           pa.status AS attempt_status,
+           pa.reconciliation_state,
+           pa.reconciliation_attempt_count,
+           pa.reconciliation_no_payment_count,
+           pa.reconciliation_query_error_count,
+           pa.reconciliation_next_at,
+           pa.reconciliation_deadline_at,
+           pa.reconciliation_last_result,
+           pa.error_code,
+           (SELECT count(*)::text
+              FROM payment_transactions
+             WHERE order_id = o.id) AS transactions,
+           (SELECT count(*)::text
+              FROM entitlements
+             WHERE source_id = o.id) AS entitlements,
+           (SELECT count(*)::text
+              FROM payment_anomalies
+             WHERE order_id = o.id) AS anomalies
+         FROM orders o
+         JOIN payment_attempts pa ON pa.id = $2
+         WHERE o.id = $1`,
+        [closed.order.id, closed.attemptId]
+      );
+      expect(rolledBack.rows[0]).toMatchObject({
+        order_status: "CLOSED",
+        attempt_status: "CLOSED",
+        reconciliation_state: "RETRY_SCHEDULED",
+        reconciliation_attempt_count: 1,
+        reconciliation_no_payment_count: 0,
+        reconciliation_query_error_count: 0,
+        reconciliation_next_at: expect.any(Date),
+        reconciliation_deadline_at: expect.any(Date),
+        reconciliation_last_result: "QUERY_IN_PROGRESS",
+        error_code: null,
+        transactions: "0",
+        entitlements: "0",
+        anomalies: "0"
+      });
+
+      await query(
+        `UPDATE payment_attempts
+         SET reconciliation_next_at = now() - interval '1 second'
+         WHERE id = $1`,
+        [closed.attemptId]
+      );
+      const auditAction = `commerce.reconcile.success.${randomUUID()}`;
+      const succeeded = await reconcileAndCloseExpiredOrders({
+        provider: {
+          ...provider,
+          async queryPayment() {
+            queryCalls += 1;
+            return verified;
+          }
+        },
+        limit: 5,
+        providerQueryBudget: 1,
+        providerTimeoutMs: 1_000,
+        onClosed: async (client, _closedOrderIds, summary) => {
+          await client.query(
+            `INSERT INTO admin_audit_logs(
+               admin_user_id,
+               action,
+               target_type,
+               target_id,
+               detail
+             )
+             VALUES ($1, $2, 'order', $3, $4::jsonb)`,
+            [
+              userId,
+              auditAction,
+              closed.order.id,
+              JSON.stringify(summary)
+            ]
+          );
+        }
+      });
+      expect(succeeded.summary).toMatchObject({
+        providerConfirmedPaidCount: 1,
+        closedRecovery: {
+          recoveredCount: 1
+        }
+      });
+      const committed = await query<{
+        order_status: string;
+        attempt_status: string;
+        reconciliation_state: string;
+        transactions: string;
+        entitlements: string;
+        audits: string;
+      }>(
+        `SELECT
+           o.status AS order_status,
+           pa.status AS attempt_status,
+           pa.reconciliation_state,
+           (SELECT count(*)::text
+              FROM payment_transactions
+             WHERE order_id = o.id) AS transactions,
+           (SELECT count(*)::text
+              FROM entitlements
+             WHERE source_id = o.id) AS entitlements,
+           (SELECT count(*)::text
+              FROM admin_audit_logs
+             WHERE admin_user_id = $3
+               AND action = $4) AS audits
+         FROM orders o
+         JOIN payment_attempts pa ON pa.id = $2
+         WHERE o.id = $1`,
+        [closed.order.id, closed.attemptId, userId, auditAction]
+      );
+      expect(committed.rows[0]).toEqual({
+        order_status: "COMPLETED",
+        attempt_status: "SUCCEEDED",
+        reconciliation_state: "RECOVERED",
+        transactions: "1",
+        entitlements: "1",
+        audits: "1"
+      });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("rolls back a failed paid apply to its claim before committing the summary audit", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const closed = await createScheduledClosedPaymentOrder(
+        userId,
+        "closed-invalid-entitlement-apply"
+      );
+      await query(
+        `UPDATE order_items
+         SET entitlement_policy =
+           '{"grantCount":"invalid"}'::jsonb
+         WHERE order_id = $1`,
+        [closed.order.id]
+      );
+      const verified = {
+        orderNo: closed.order.orderNo,
+        channel: "fake" as const,
+        channelTransactionId:
+          `closed-invalid-entitlement-${randomUUID()}`,
+        amountFen: closed.order.amountFen,
+        currency: "CNY" as const,
+        paidAt: new Date(Date.now() - 2 * 60_000).toISOString(),
+        raw: { source: "closed-invalid-entitlement-apply" }
+      };
+      const auditAction =
+        `commerce.reconcile.invalid-entitlement.${randomUUID()}`;
+      const result = await reconcileAndCloseExpiredOrders({
+        provider: {
+          channel: "fake",
+          async createPayment() {
+            throw new Error("must not create");
+          },
+          async queryPayment() {
+            return verified;
+          },
+          async refund() {
+            return { channelRefundId: "unused", raw: {} };
+          }
+        },
+        limit: 5,
+        providerQueryBudget: 1,
+        providerTimeoutMs: 100,
+        onClosed: async (client, _closedOrderIds, summary) => {
+          await client.query(
+            `INSERT INTO admin_audit_logs(
+               admin_user_id,
+               action,
+               target_type,
+               target_id,
+               detail
+             )
+             VALUES ($1, $2, 'order', $3, $4::jsonb)`,
+            [
+              userId,
+              auditAction,
+              closed.order.id,
+              JSON.stringify(summary)
+            ]
+          );
+        }
+      });
+      expect(result.summary).toMatchObject({
+        scannedCount: 1,
+        closedCount: 0,
+        providerConfirmedPaidCount: 0,
+        deferredCount: 1,
+        terminalCount: 0,
+        hasMore: false,
+        scheduledRecoveryCount: 1,
+        deferredByReason: {
+          unsafeOrChangedState: 1
+        },
+        closedRecovery: {
+          scannedCount: 1,
+          recoveredCount: 0,
+          retryScheduledCount: 0,
+          terminalCount: 0
+        }
+      });
+      expect(result.summary.scannedCount).toBe(
+        result.summary.closedCount +
+          result.summary.providerConfirmedPaidCount +
+          result.summary.deferredCount +
+          result.summary.terminalCount
+      );
+      const persisted = await query<{
+        order_status: string;
+        attempt_status: string;
+        reconciliation_state: string;
+        reconciliation_attempt_count: number;
+        reconciliation_last_result: string | null;
+        transactions: string;
+        entitlements: string;
+        audits: string;
+      }>(
+        `SELECT
+           o.status AS order_status,
+           pa.status AS attempt_status,
+           pa.reconciliation_state,
+           pa.reconciliation_attempt_count,
+           pa.reconciliation_last_result,
+           (SELECT count(*)::text
+              FROM payment_transactions
+             WHERE order_id = o.id) AS transactions,
+           (SELECT count(*)::text
+              FROM entitlements
+             WHERE source_id = o.id) AS entitlements,
+           (SELECT count(*)::text
+              FROM admin_audit_logs
+             WHERE admin_user_id = $3
+               AND action = $4) AS audits
+         FROM orders o
+         JOIN payment_attempts pa ON pa.id = $2
+         WHERE o.id = $1`,
+        [closed.order.id, closed.attemptId, userId, auditAction]
+      );
+      expect(persisted.rows[0]).toEqual({
+        order_status: "CLOSED",
+        attempt_status: "CLOSED",
+        reconciliation_state: "RETRY_SCHEDULED",
+        reconciliation_attempt_count: 1,
+        reconciliation_last_result: "QUERY_IN_PROGRESS",
+        transactions: "0",
+        entitlements: "0",
+        audits: "1"
+      });
+    } finally {
+      if (userId) {
+        await query(
+          `UPDATE order_items
+           SET entitlement_policy = '{"grantCount":1}'::jsonb
+           WHERE order_id IN (
+             SELECT id
+             FROM orders
+             WHERE user_id = $1
+           )`,
+          [userId]
+        );
+        await cleanupEntitlementTestUsers([userId]);
+      }
+    }
+  });
+
+  it("rolls back a terminal CLOSED no-payment result when its audit fails", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const closed = await createScheduledClosedPaymentOrder(
+        userId,
+        "closed-null-audit-rollback"
+      );
+      await query(
+        `UPDATE payment_attempts
+         SET reconciliation_no_payment_count = 4
+         WHERE id = $1`,
+        [closed.attemptId]
+      );
+      let queryCalls = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          throw new Error("must not create");
+        },
+        async queryPayment() {
+          queryCalls += 1;
+          return null;
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      await expect(
+        reconcileAndCloseExpiredOrders({
+          provider,
+          limit: 5,
+          providerQueryBudget: 1,
+          providerTimeoutMs: 100,
+          onClosed: async () => {
+            throw new Error("forced null reconciliation audit failure");
+          }
+        })
+      ).rejects.toThrow("forced null reconciliation audit failure");
+      expect(queryCalls).toBe(1);
+      const rolledBack = await query<{
+        reconciliation_state: string;
+        reconciliation_attempt_count: number;
+        reconciliation_no_payment_count: number;
+        reconciliation_query_error_count: number;
+        reconciliation_next_at: Date | null;
+        reconciliation_deadline_at: Date | null;
+        reconciliation_last_result: string | null;
+        error_code: string | null;
+      }>(
+        `SELECT
+           reconciliation_state,
+           reconciliation_attempt_count,
+           reconciliation_no_payment_count,
+           reconciliation_query_error_count,
+           reconciliation_next_at,
+           reconciliation_deadline_at,
+           reconciliation_last_result,
+           error_code
+         FROM payment_attempts
+         WHERE id = $1`,
+        [closed.attemptId]
+      );
+      expect(rolledBack.rows[0]).toMatchObject({
+        reconciliation_state: "RETRY_SCHEDULED",
+        reconciliation_attempt_count: 1,
+        reconciliation_no_payment_count: 4,
+        reconciliation_query_error_count: 0,
+        reconciliation_next_at: expect.any(Date),
+        reconciliation_deadline_at: expect.any(Date),
+        reconciliation_last_result: "QUERY_IN_PROGRESS",
+        error_code: null
+      });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("rolls back CLOSED and open provider-query errors when their audit fails", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const closed = await createScheduledClosedPaymentOrder(
+        userId,
+        "closed-error-audit-rollback"
+      );
+      const open = await createFailedPaymentOrder(
+        userId,
+        "open-error-audit-rollback"
+      );
+      await query(
+        `UPDATE orders
+         SET status = 'PAYING',
+             created_at = now() - interval '2 minutes',
+             expires_at = now() - interval '1 second',
+             updated_at = now() - interval '1 minute'
+         WHERE id = $1`,
+        [open.order.id]
+      );
+      await query(
+        `UPDATE payment_attempts
+         SET status = 'PENDING',
+             reconciliation_state = 'NONE',
+             error_code = NULL,
+             error_message = NULL,
+             updated_at = now() - interval '1 minute'
+         WHERE id = $1`,
+        [open.attemptId]
+      );
+      let queryCalls = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          throw new Error("must not create");
+        },
+        async queryPayment() {
+          queryCalls += 1;
+          throw new Error("forced provider query failure");
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      await expect(
+        reconcileAndCloseExpiredOrders({
+          provider,
+          limit: 5,
+          providerQueryBudget: 2,
+          providerTimeoutMs: 100,
+          onClosed: async () => {
+            throw new Error("forced error reconciliation audit failure");
+          }
+        })
+      ).rejects.toThrow("forced error reconciliation audit failure");
+      expect(queryCalls).toBe(2);
+      const rolledBack = await query<{
+        id: string;
+        status: string;
+        reconciliation_state: string;
+        reconciliation_attempt_count: number;
+        reconciliation_query_error_count: number;
+        reconciliation_last_result: string | null;
+        error_code: string | null;
+        error_message: string | null;
+      }>(
+        `SELECT
+           id,
+           status,
+           reconciliation_state,
+           reconciliation_attempt_count,
+           reconciliation_query_error_count,
+           reconciliation_last_result,
+           error_code,
+           error_message
+         FROM payment_attempts
+         WHERE id = ANY($1::uuid[])
+         ORDER BY id`,
+        [[closed.attemptId, open.attemptId]]
+      );
+      const byId = new Map(
+        rolledBack.rows.map((attempt) => [attempt.id, attempt])
+      );
+      expect(byId.get(closed.attemptId)).toMatchObject({
+        status: "CLOSED",
+        reconciliation_state: "RETRY_SCHEDULED",
+        reconciliation_attempt_count: 1,
+        reconciliation_query_error_count: 0,
+        reconciliation_last_result: "QUERY_IN_PROGRESS",
+        error_code: null,
+        error_message: null
+      });
+      expect(byId.get(open.attemptId)).toMatchObject({
+        status: "PENDING",
+        reconciliation_state: "NONE",
+        reconciliation_attempt_count: 0,
+        reconciliation_query_error_count: 0,
+        reconciliation_last_result: null,
+        error_code: null,
+        error_message: null
+      });
+      const openOrder = await query<{ status: string }>(
+        "SELECT status FROM orders WHERE id = $1",
+        [open.order.id]
+      );
+      expect(openOrder.rows[0].status).toBe("PAYING");
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("accounts for an open query-error race as changed state after its callback wins", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const open = await createFailedPaymentOrder(
+        userId,
+        "open-query-error-callback-race"
+      );
+      await query(
+        `UPDATE orders
+         SET status = 'PAYING',
+             created_at = now() - interval '3 minutes',
+             expires_at = now() - interval '1 minute',
+             updated_at = now() - interval '1 minute'
+         WHERE id = $1`,
+        [open.order.id]
+      );
+      await query(
+        `UPDATE payment_attempts
+         SET status = 'PENDING',
+             reconciliation_state = 'NONE',
+             error_code = NULL,
+             error_message = NULL,
+             updated_at = now() - interval '1 minute'
+         WHERE id = $1`,
+        [open.attemptId]
+      );
+      const verified = {
+        orderNo: open.order.orderNo,
+        channel: "fake" as const,
+        channelTransactionId:
+          `open-query-error-callback-${randomUUID()}`,
+        amountFen: open.order.amountFen,
+        currency: "CNY" as const,
+        paidAt: new Date(Date.now() - 2 * 60_000).toISOString(),
+        raw: { source: "open-query-error-callback-race" }
+      };
+      let releaseProvider!: () => void;
+      const providerReleased = new Promise<void>((resolve) => {
+        releaseProvider = resolve;
+      });
+      let reportProviderQuery!: () => void;
+      const providerQueried = new Promise<void>((resolve) => {
+        reportProviderQuery = resolve;
+      });
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          throw new Error("must not create");
+        },
+        async queryPayment() {
+          reportProviderQuery();
+          await providerReleased;
+          throw new Error("stale open provider query failed");
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      const worker = reconcileAndCloseExpiredOrders({
+        provider,
+        limit: 5,
+        providerQueryBudget: 1,
+        providerTimeoutMs: 1_000
+      });
+      await providerQueried;
+      await markOrderPaid({
+        orderId: open.order.id,
+        paymentAttemptId: open.attemptId,
+        verified
+      });
+      releaseProvider();
+      const result = await worker;
+      expect(result.summary).toMatchObject({
+        scannedCount: 1,
+        providerConfirmedPaidCount: 0,
+        deferredCount: 1,
+        terminalCount: 0,
+        hasMore: false,
+        deferredByReason: {
+          providerQueryError: 0,
+          unsafeOrChangedState: 1
+        }
+      });
+      expect(result.summary.scannedCount).toBe(
+        result.summary.closedCount +
+          result.summary.providerConfirmedPaidCount +
+          result.summary.deferredCount +
+          result.summary.terminalCount
+      );
+      const persisted = await query<{
+        order_status: string;
+        attempt_status: string;
+        error_code: string | null;
+        transactions: string;
+        entitlements: string;
+      }>(
+        `SELECT
+           o.status AS order_status,
+           pa.status AS attempt_status,
+           pa.error_code,
+           (SELECT count(*)::text
+              FROM payment_transactions
+             WHERE order_id = o.id) AS transactions,
+           (SELECT count(*)::text
+              FROM entitlements
+             WHERE source_id = o.id) AS entitlements
+         FROM orders o
+         JOIN payment_attempts pa ON pa.id = $2
+         WHERE o.id = $1`,
+        [open.order.id, open.attemptId]
+      );
+      expect(persisted.rows[0]).toEqual({
+        order_status: "COMPLETED",
+        attempt_status: "SUCCEEDED",
+        error_code: null,
+        transactions: "1",
+        entitlements: "1"
+      });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("rolls back an open late-payment anomaly when its audit fails", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const open = await createFailedPaymentOrder(
+        userId,
+        "open-anomaly-audit-rollback"
+      );
+      await query(
+        `UPDATE orders
+         SET status = 'PAYING',
+             created_at = now() - interval '3 minutes',
+             expires_at = now() - interval '1 minute',
+             updated_at = now() - interval '1 minute'
+         WHERE id = $1`,
+        [open.order.id]
+      );
+      await query(
+        `UPDATE payment_attempts
+         SET status = 'PENDING',
+             reconciliation_state = 'NONE',
+             updated_at = now() - interval '1 minute'
+         WHERE id = $1`,
+        [open.attemptId]
+      );
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          throw new Error("must not create");
+        },
+        async queryPayment(orderNo: string) {
+          return {
+            orderNo,
+            channel: "fake" as const,
+            channelTransactionId: `open-late-audit-${randomUUID()}`,
+            amountFen: open.order.amountFen,
+            currency: "CNY" as const,
+            paidAt: new Date().toISOString(),
+            raw: { source: "open-anomaly-audit-rollback" }
+          };
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      await expect(
+        reconcileAndCloseExpiredOrders({
+          provider,
+          limit: 5,
+          providerQueryBudget: 1,
+          providerTimeoutMs: 100,
+          onClosed: async () => {
+            throw new Error("forced anomaly reconciliation audit failure");
+          }
+        })
+      ).rejects.toThrow("forced anomaly reconciliation audit failure");
+      const rolledBack = await query<{
+        order_status: string;
+        attempt_status: string;
+        reconciliation_state: string;
+        reconciliation_last_result: string | null;
+        error_code: string | null;
+        anomalies: string;
+        transactions: string;
+        entitlements: string;
+      }>(
+        `SELECT
+           o.status AS order_status,
+           pa.status AS attempt_status,
+           pa.reconciliation_state,
+           pa.reconciliation_last_result,
+           pa.error_code,
+           (SELECT count(*)::text
+              FROM payment_anomalies
+             WHERE order_id = o.id) AS anomalies,
+           (SELECT count(*)::text
+              FROM payment_transactions
+             WHERE order_id = o.id) AS transactions,
+           (SELECT count(*)::text
+              FROM entitlements
+             WHERE source_id = o.id) AS entitlements
+         FROM orders o
+         JOIN payment_attempts pa ON pa.id = $2
+         WHERE o.id = $1`,
+        [open.order.id, open.attemptId]
+      );
+      expect(rolledBack.rows[0]).toEqual({
+        order_status: "PAYING",
+        attempt_status: "PENDING",
+        reconciliation_state: "NONE",
+        reconciliation_last_result: null,
+        error_code: null,
+        anomalies: "0",
+        transactions: "0",
+        entitlements: "0"
+      });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("ignores a stale paid result after a newer CLOSED claim generation", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const closed = await createScheduledClosedPaymentOrder(
+        userId,
+        "closed-stale-paid-generation"
+      );
+      const staleVerified = {
+        orderNo: closed.order.orderNo,
+        channel: "fake" as const,
+        channelTransactionId: `closed-stale-paid-${randomUUID()}`,
+        amountFen: closed.order.amountFen,
+        currency: "CNY" as const,
+        paidAt: new Date(Date.now() - 2 * 60_000).toISOString(),
+        raw: { source: "closed-stale-paid-generation" }
+      };
+      let releaseFirstQuery!: () => void;
+      const firstQueryReleased = new Promise<void>((resolve) => {
+        releaseFirstQuery = resolve;
+      });
+      let reportFirstQuery!: () => void;
+      const firstQueryStarted = new Promise<void>((resolve) => {
+        reportFirstQuery = resolve;
+      });
+      let queryCalls = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          throw new Error("must not create");
+        },
+        async queryPayment() {
+          queryCalls += 1;
+          if (queryCalls === 1) {
+            await query(
+              "SELECT id FROM orders WHERE id = $1 FOR UPDATE NOWAIT",
+              [closed.order.id]
+            );
+            await query(
+              "SELECT id FROM payment_attempts WHERE id = $1 FOR UPDATE NOWAIT",
+              [closed.attemptId]
+            );
+            reportFirstQuery();
+            await firstQueryReleased;
+            return staleVerified;
+          }
+          return null;
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+
+      const staleWorker = reconcileAndCloseExpiredOrders({
+        provider,
+        limit: 5,
+        providerQueryBudget: 1,
+        providerTimeoutMs: 1_000
+      });
+      await firstQueryStarted;
+      await query(
+        `UPDATE payment_attempts
+         SET reconciliation_next_at = now() - interval '1 second'
+         WHERE id = $1`,
+        [closed.attemptId]
+      );
+      const newerWorker = await reconcileAndCloseExpiredOrders({
+        provider,
+        limit: 5,
+        providerQueryBudget: 1,
+        providerTimeoutMs: 1_000
+      });
+      expect(newerWorker.summary).toMatchObject({
+        deferredCount: 1,
+        closedRecovery: {
+          retryScheduledCount: 1,
+          retryByReason: {
+            noPayment: 1
+          }
+        }
+      });
+      releaseFirstQuery();
+      await staleWorker;
+      expect(queryCalls).toBe(2);
+
+      const persisted = await query<{
+        order_status: string;
+        attempt_status: string;
+        reconciliation_state: string;
+        reconciliation_attempt_count: number;
+        reconciliation_no_payment_count: number;
+        reconciliation_query_error_count: number;
+        reconciliation_last_result: string | null;
+        transactions: string;
+        entitlements: string;
+      }>(
+        `SELECT
+           o.status AS order_status,
+           pa.status AS attempt_status,
+           pa.reconciliation_state,
+           pa.reconciliation_attempt_count,
+           pa.reconciliation_no_payment_count,
+           pa.reconciliation_query_error_count,
+           pa.reconciliation_last_result,
+           (SELECT count(*)::text
+              FROM payment_transactions
+             WHERE order_id = o.id) AS transactions,
+           (SELECT count(*)::text
+              FROM entitlements
+             WHERE source_id = o.id) AS entitlements
+         FROM orders o
+         JOIN payment_attempts pa ON pa.id = $2
+         WHERE o.id = $1`,
+        [closed.order.id, closed.attemptId]
+      );
+      expect(persisted.rows[0]).toEqual({
+        order_status: "CLOSED",
+        attempt_status: "CLOSED",
+        reconciliation_state: "RETRY_SCHEDULED",
+        reconciliation_attempt_count: 2,
+        reconciliation_no_payment_count: 1,
+        reconciliation_query_error_count: 0,
+        reconciliation_last_result: "NO_PAYMENT",
+        transactions: "0",
+        entitlements: "0"
+      });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("keeps a newer paid generation when an older CLOSED query errors", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const closed = await createScheduledClosedPaymentOrder(
+        userId,
+        "closed-newer-paid-generation"
+      );
+      const verified = {
+        orderNo: closed.order.orderNo,
+        channel: "fake" as const,
+        channelTransactionId: `closed-newer-paid-${randomUUID()}`,
+        amountFen: closed.order.amountFen,
+        currency: "CNY" as const,
+        paidAt: new Date(Date.now() - 2 * 60_000).toISOString(),
+        raw: { source: "closed-newer-paid-generation" }
+      };
+      let releaseFirstQuery!: () => void;
+      const firstQueryReleased = new Promise<void>((resolve) => {
+        releaseFirstQuery = resolve;
+      });
+      let reportFirstQuery!: () => void;
+      const firstQueryStarted = new Promise<void>((resolve) => {
+        reportFirstQuery = resolve;
+      });
+      let queryCalls = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          throw new Error("must not create");
+        },
+        async queryPayment() {
+          queryCalls += 1;
+          if (queryCalls === 1) {
+            reportFirstQuery();
+            await firstQueryReleased;
+            throw new Error("stale provider query failed");
+          }
+          return verified;
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      const staleWorker = reconcileAndCloseExpiredOrders({
+        provider,
+        limit: 5,
+        providerQueryBudget: 1,
+        providerTimeoutMs: 1_000
+      });
+      await firstQueryStarted;
+      await query(
+        `UPDATE payment_attempts
+         SET reconciliation_next_at = now() - interval '1 second'
+         WHERE id = $1`,
+        [closed.attemptId]
+      );
+      const newerWorker = await reconcileAndCloseExpiredOrders({
+        provider,
+        limit: 5,
+        providerQueryBudget: 1,
+        providerTimeoutMs: 1_000
+      });
+      expect(newerWorker.summary.providerConfirmedPaidCount).toBe(1);
+      releaseFirstQuery();
+      await staleWorker;
+      expect(queryCalls).toBe(2);
+      const persisted = await query<{
+        order_status: string;
+        reconciliation_state: string;
+        reconciliation_attempt_count: number;
+        reconciliation_no_payment_count: number;
+        reconciliation_query_error_count: number;
+        transactions: string;
+        entitlements: string;
+      }>(
+        `SELECT
+           o.status AS order_status,
+           pa.reconciliation_state,
+           pa.reconciliation_attempt_count,
+           pa.reconciliation_no_payment_count,
+           pa.reconciliation_query_error_count,
+           (SELECT count(*)::text
+              FROM payment_transactions
+             WHERE order_id = o.id) AS transactions,
+           (SELECT count(*)::text
+              FROM entitlements
+             WHERE source_id = o.id) AS entitlements
+         FROM orders o
+         JOIN payment_attempts pa ON pa.id = $2
+         WHERE o.id = $1`,
+        [closed.order.id, closed.attemptId]
+      );
+      expect(persisted.rows[0]).toEqual({
+        order_status: "COMPLETED",
+        reconciliation_state: "RECOVERED",
+        reconciliation_attempt_count: 2,
+        reconciliation_no_payment_count: 0,
+        reconciliation_query_error_count: 0,
+        transactions: "1",
+        entitlements: "1"
+      });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
   it("bounds persistent CLOSED no-payment reconciliation and persists a terminal state", async () => {
     await seedPolicyFoundation();
     let userId: string | undefined;
@@ -4741,7 +5761,7 @@ describe("atomic commerce orders and payments", () => {
           queryCalls += 1;
           reportProviderQuery();
           await providerReleased;
-          return verified;
+          return null;
         },
         async refund() {
           return { channelRefundId: "unused", raw: {} };
@@ -4764,9 +5784,10 @@ describe("atomic commerce orders and payments", () => {
       releaseProvider();
       await expect(worker).resolves.toMatchObject({
         summary: {
-          providerConfirmedPaidCount: 1,
+          providerConfirmedPaidCount: 0,
           closedRecovery: {
-            recoveredCount: 1
+            recoveredCount: 0,
+            changedStateCount: 1
           }
         }
       });
@@ -6147,14 +7168,7 @@ describe("atomic commerce orders and payments", () => {
           closeCapacityExceeded: 0,
           unsafeOrChangedState: 0
         },
-        closedRecovery: {
-          ...emptyClosedRecoverySummary(),
-          terminalCount: 1,
-          terminalByReason: {
-            ...emptyClosedRecoverySummary().terminalByReason,
-            paymentVerificationFailed: 1
-          }
-        }
+        closedRecovery: emptyClosedRecoverySummary()
       });
       expect(queryCallsByRun).toEqual([
         [
@@ -6249,6 +7263,119 @@ describe("atomic commerce orders and payments", () => {
               entitlements: "0"
             }
           ]
+        ])
+      );
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("accounts for a full-capacity callback race as changed state", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const noAttempt = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `capacity-race-no-attempt-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      const open = await createFailedPaymentOrder(
+        userId,
+        "capacity-race-open"
+      );
+      await query(
+        `UPDATE orders
+         SET created_at = now() - interval '3 minutes',
+             expires_at = now() - interval '1 minute'
+         WHERE id = ANY($1::uuid[])`,
+        [[noAttempt.id, open.order.id]]
+      );
+      const verified = {
+        orderNo: open.order.orderNo,
+        channel: "fake" as const,
+        channelTransactionId: `capacity-race-${randomUUID()}`,
+        amountFen: open.order.amountFen,
+        currency: "CNY" as const,
+        paidAt: new Date(Date.now() - 2 * 60_000).toISOString(),
+        raw: { source: "capacity-race-open" }
+      };
+      let releaseProvider!: () => void;
+      const providerReleased = new Promise<void>((resolve) => {
+        releaseProvider = resolve;
+      });
+      let reportProviderQuery!: () => void;
+      const providerQueried = new Promise<void>((resolve) => {
+        reportProviderQuery = resolve;
+      });
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          throw new Error("must not create");
+        },
+        async queryPayment() {
+          reportProviderQuery();
+          await providerReleased;
+          return null;
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      const worker = reconcileAndCloseExpiredOrders({
+        provider,
+        limit: 1,
+        providerQueryBudget: 1,
+        providerTimeoutMs: 1_000
+      });
+      await providerQueried;
+      await markOrderPaid({
+        orderId: open.order.id,
+        paymentAttemptId: open.attemptId,
+        verified
+      });
+      releaseProvider();
+      const result = await worker;
+      expect(result.closedOrderIds).toEqual([noAttempt.id]);
+      expect(result.summary).toMatchObject({
+        scannedCount: 2,
+        closedCount: 1,
+        providerConfirmedPaidCount: 0,
+        deferredCount: 1,
+        terminalCount: 0,
+        hasMore: false,
+        scheduledRecoveryCount: 0,
+        deferredByReason: {
+          closeCapacityExceeded: 0,
+          unsafeOrChangedState: 1
+        }
+      });
+      expect(result.summary.scannedCount).toBe(
+        result.summary.closedCount +
+          result.summary.providerConfirmedPaidCount +
+          result.summary.deferredCount +
+          result.summary.terminalCount
+      );
+      const persisted = await query<{
+        id: string;
+        status: string;
+      }>(
+        `SELECT id, status
+         FROM orders
+         WHERE id = ANY($1::uuid[])
+         ORDER BY id`,
+        [[noAttempt.id, open.order.id]]
+      );
+      expect(
+        new Map(
+          persisted.rows.map((order) => [order.id, order.status])
+        )
+      ).toEqual(
+        new Map([
+          [noAttempt.id, "CLOSED"],
+          [open.order.id, "COMPLETED"]
         ])
       );
     } finally {

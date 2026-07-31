@@ -800,14 +800,27 @@ const recordPaymentAnomalyInTransaction = async (
   );
 };
 
-export const markOrderPaid = async ({
-  orderId: orderIdInput,
-  paymentAttemptId: paymentAttemptIdInput,
-  verified
-}: MarkOrderPaidInput): Promise<CommerceOrder> => {
-  const orderId = requireUuid(orderIdInput);
-  const paymentAttemptId = requireUuid(paymentAttemptIdInput);
-  const outcome = await withTransaction(async (client) => {
+type ReconciliationClaimToken = {
+  attemptCount: number;
+  nextAt: Date;
+};
+
+type MarkOrderPaidInTransactionOutcome =
+  | { order: CommerceOrder }
+  | { anomaly: PaymentAnomalyKind }
+  | { changedState: true };
+
+const markOrderPaidInTransaction = async (
+  client: pg.PoolClient,
+  {
+    orderId: orderIdInput,
+    paymentAttemptId: paymentAttemptIdInput,
+    verified
+  }: MarkOrderPaidInput,
+  claimToken?: ReconciliationClaimToken
+): Promise<MarkOrderPaidInTransactionOutcome> => {
+    const orderId = requireUuid(orderIdInput);
+    const paymentAttemptId = requireUuid(paymentAttemptIdInput);
     const order = await loadFulfillmentOrder(client, orderId);
     const attempt = await client.query<{
       id: string;
@@ -818,10 +831,28 @@ export const markOrderPaid = async ({
        FROM payment_attempts
        WHERE id = $1
          AND order_id = $2
+         AND (
+           $3::integer IS NULL
+           OR (
+             status = 'CLOSED'
+             AND reconciliation_state = 'RETRY_SCHEDULED'
+             AND reconciliation_attempt_count = $3
+             AND reconciliation_next_at = $4
+             AND reconciliation_last_result = 'QUERY_IN_PROGRESS'
+           )
+         )
        FOR UPDATE`,
-      [paymentAttemptId, order.id]
+      [
+        paymentAttemptId,
+        order.id,
+        claimToken?.attemptCount ?? null,
+        claimToken?.nextAt.toISOString() ?? null
+      ]
     );
     const selectedAttempt = attempt.rows[0];
+    if (!selectedAttempt && claimToken) {
+      return { changedState: true as const };
+    }
     if (
       !selectedAttempt ||
       !paymentChannels.includes(verified.channel) ||
@@ -832,7 +863,9 @@ export const markOrderPaid = async ({
       throw new CommerceError("PAYMENT_VERIFICATION_FAILED");
     }
     if (selectedAttempt.error_code === "PAYMENT_REVIEW_REQUIRED") {
-      return { anomaly: true as const };
+      return {
+        anomaly: "PAYMENT_VERIFICATION_FAILED" as const
+      };
     }
     const verifiedAmount = tryNormalizeAmount(verified.amountFen);
     const parsedPaidAt = new Date(verified.paidAt);
@@ -898,7 +931,7 @@ export const markOrderPaid = async ({
         paidAt,
         kind: anomalyKind
       });
-      return { anomaly: true as const };
+      return { anomaly: anomalyKind };
     }
     if (
       !["CREATED", "PAYING", "PAYMENT_FAILED", "CLOSED"].includes(
@@ -977,7 +1010,7 @@ export const markOrderPaid = async ({
           paidAt,
           kind: "PAYMENT_VERIFICATION_FAILED"
         });
-        return { anomaly: true as const };
+        return { anomaly: "PAYMENT_VERIFICATION_FAILED" as const };
       }
     }
     await client.query(
@@ -1033,9 +1066,19 @@ export const markOrderPaid = async ({
         status: "PAID"
       })
     };
+};
+
+export const markOrderPaid = async (
+  input: MarkOrderPaidInput
+): Promise<CommerceOrder> => {
+  const outcome = await withTransaction(async (client) => {
+    return markOrderPaidInTransaction(client, input);
   });
   if ("anomaly" in outcome) {
     throw new CommerceError("PAYMENT_VERIFICATION_FAILED");
+  }
+  if ("changedState" in outcome) {
+    throw new CommerceError("ORDER_STATE_CONFLICT");
   }
   return outcome.order;
 };
@@ -1392,6 +1435,7 @@ export const reconcileAndCloseExpiredOrders = async (input: {
     reconciliation_query_error_count: number;
     reconciliation_next_at: Date | null;
     reconciliation_deadline_at: Date | null;
+    reconciliation_last_result: string | null;
   };
   const safeToClose: ExpiredCloseCandidate[] =
     noAttemptCandidates.rows.map((candidate) => ({
@@ -1402,6 +1446,7 @@ export const reconcileAndCloseExpiredOrders = async (input: {
     }));
   let scannedCount = noAttemptCandidates.rows.length;
   let providerConfirmedPaidCount = 0;
+  let terminalCount = 0;
   const deferredByReason = {
     providerQueryError: 0,
     paymentVerificationFailed: 0,
@@ -1426,6 +1471,37 @@ export const reconcileAndCloseExpiredOrders = async (input: {
     }
   };
 
+  type ClosedRecoveryTerminalReason =
+    | "deadlineExceeded"
+    | "noPaymentLimitExceeded"
+    | "paymentAfterExpiry"
+    | "paymentVerificationFailed";
+  type DeferredReason =
+    | "providerQueryError"
+    | "paymentVerificationFailed"
+    | "closeCapacityExceeded"
+    | "unsafeOrChangedState";
+  type ProviderNetworkOutcome =
+    | {
+        kind: "deferred";
+        reason: DeferredReason;
+        closedRecovery: boolean;
+      }
+    | {
+        kind: "closedTerminalPrecheck";
+        candidate: ReconciliationCandidate;
+        reason: ClosedRecoveryTerminalReason;
+      }
+    | {
+        kind: "providerQuery";
+        candidate: ReconciliationCandidate;
+        claimToken?: ReconciliationClaimToken;
+        result:
+          | { queryError: true }
+          | { verified: VerifiedPayment | null };
+      };
+  const providerOutcomes: ProviderNetworkOutcome[] = [];
+
   if (provider) {
     const candidates = await query<ReconciliationCandidate>(
       `WITH closed_due AS MATERIALIZED (
@@ -1442,6 +1518,7 @@ export const reconcileAndCloseExpiredOrders = async (input: {
            attempt.reconciliation_query_error_count,
            attempt.reconciliation_next_at,
            attempt.reconciliation_deadline_at,
+           attempt.reconciliation_last_result,
            LEAST(
              attempt.reconciliation_next_at,
              attempt.reconciliation_deadline_at
@@ -1481,6 +1558,7 @@ export const reconcileAndCloseExpiredOrders = async (input: {
            attempt.reconciliation_query_error_count,
            attempt.reconciliation_next_at,
            attempt.reconciliation_deadline_at,
+           attempt.reconciliation_last_result,
            attempt.updated_at AS candidate_at
          FROM orders o
          JOIN LATERAL (
@@ -1493,7 +1571,8 @@ export const reconcileAndCloseExpiredOrders = async (input: {
              reconciliation_no_payment_count,
              reconciliation_query_error_count,
              reconciliation_next_at,
-             reconciliation_deadline_at
+             reconciliation_deadline_at,
+             reconciliation_last_result
            FROM payment_attempts
            WHERE order_id = o.id
              AND channel = $2
@@ -1522,7 +1601,8 @@ export const reconcileAndCloseExpiredOrders = async (input: {
          reconciliation_no_payment_count,
          reconciliation_query_error_count,
          reconciliation_next_at,
-         reconciliation_deadline_at
+         reconciliation_deadline_at,
+         reconciliation_last_result
        FROM provider_candidates
        ORDER BY candidate_at, expires_at, id
        LIMIT $1`,
@@ -1532,101 +1612,32 @@ export const reconcileAndCloseExpiredOrders = async (input: {
     closedRecovery.scannedCount += candidates.rows.filter(
       (candidate) => candidate.status === "CLOSED"
     ).length;
-    type ClosedRecoveryTerminalReason =
-      | "deadlineExceeded"
-      | "noPaymentLimitExceeded"
-      | "paymentAfterExpiry"
-      | "paymentVerificationFailed";
-    type ReconciliationOutcome =
-      | { safeToClose: ExpiredCloseCandidate }
-      | {
-          deferred:
-            | "providerQueryError"
-            | "paymentVerificationFailed"
-            | "closeCapacityExceeded"
-            | "unsafeOrChangedState";
-        }
-      | {
-          providerConfirmedPaid: true;
-          closedRecovery: boolean;
-        }
-      | {
-          closedRetryScheduled: "noPayment" | "queryError";
-        }
-      | {
-          closedTerminal: ClosedRecoveryTerminalReason;
-        }
-      | {
-          closedChangedState: true;
-        };
-    const outcomes = new Array<ReconciliationOutcome | undefined>(
+    const outcomes = new Array<ProviderNetworkOutcome | undefined>(
       candidates.rows.length
     );
-    const markClosedRecoveryTerminal = async (
-      candidate: ReconciliationCandidate,
-      reason: ClosedRecoveryTerminalReason
-    ) => {
-      const terminalResult = {
-        deadlineExceeded: "DEADLINE_EXCEEDED",
-        noPaymentLimitExceeded: "NO_PAYMENT_LIMIT_EXCEEDED",
-        paymentAfterExpiry: "PAYMENT_AFTER_EXPIRY",
-        paymentVerificationFailed: "PAYMENT_VERIFICATION_FAILED"
-      }[reason];
-      const terminal = await query(
-        `UPDATE payment_attempts pa
-         SET reconciliation_state = 'TERMINAL',
-             reconciliation_next_at = NULL,
-             reconciliation_deadline_at = NULL,
-             reconciliation_last_result = $2,
-             error_code = CASE
-               WHEN $2 IN (
-                 'PAYMENT_AFTER_EXPIRY',
-                 'PAYMENT_VERIFICATION_FAILED'
-               )
-                 THEN 'RECONCILIATION_' || $2
-               ELSE error_code
-             END,
-             error_message = CASE
-               WHEN $2 = 'PAYMENT_AFTER_EXPIRY'
-                 THEN '渠道付款时间晚于订单有效期，已停止自动恢复'
-               WHEN $2 = 'PAYMENT_VERIFICATION_FAILED'
-                 THEN '支付核验不一致，已停止自动恢复'
-               ELSE error_message
-             END,
-             updated_at = now()
-         WHERE pa.id = $1
-           AND pa.reconciliation_state IN (
-             'REQUIRED',
-             'RETRY_SCHEDULED'
-           )
-           AND EXISTS (
-             SELECT 1
-             FROM orders o
-             WHERE o.id = pa.order_id
-               AND o.status = 'CLOSED'
-           )`,
-        [candidate.attempt_id, terminalResult]
-      );
-      return Boolean(terminal.rowCount);
-    };
     let nextCandidateIndex = 0;
     const reconcileCandidate = async (candidateIndex: number) => {
       const candidate = candidates.rows[candidateIndex];
+      const isClosedRecovery = candidate.status === "CLOSED";
       if (
         !candidate.attempt_id ||
         candidate.attempt_channel !== provider.channel
       ) {
         outcomes[candidateIndex] = {
-          deferred: "unsafeOrChangedState"
+          kind: "deferred",
+          reason: "unsafeOrChangedState",
+          closedRecovery: isClosedRecovery
         };
         return;
       }
-      const isClosedRecovery = candidate.status === "CLOSED";
+      let claimToken: ReconciliationClaimToken | undefined;
       if (isClosedRecovery) {
         const deadline = candidate.reconciliation_deadline_at;
         if (!deadline) {
           outcomes[candidateIndex] = {
-            closedChangedState: true
+            kind: "deferred",
+            reason: "unsafeOrChangedState",
+            closedRecovery: true
           };
           return;
         }
@@ -1638,10 +1649,11 @@ export const reconcileAndCloseExpiredOrders = async (input: {
               ? "noPaymentLimitExceeded"
               : undefined;
         if (terminalReason) {
-          outcomes[candidateIndex] =
-            await markClosedRecoveryTerminal(candidate, terminalReason)
-              ? { closedTerminal: terminalReason }
-              : { closedChangedState: true };
+          outcomes[candidateIndex] = {
+            kind: "closedTerminalPrecheck",
+            candidate,
+            reason: terminalReason
+          };
           return;
         }
         const nextAttemptCount =
@@ -1650,7 +1662,10 @@ export const reconcileAndCloseExpiredOrders = async (input: {
           Date.now() +
             closedPaymentReconciliationBackoffMs(nextAttemptCount)
         );
-        const claimed = await query(
+        const claimed = await query<{
+          reconciliation_attempt_count: number;
+          reconciliation_next_at: Date;
+        }>(
           `UPDATE payment_attempts pa
            SET reconciliation_state = 'RETRY_SCHEDULED',
                reconciliation_attempt_count =
@@ -1674,180 +1689,44 @@ export const reconcileAndCloseExpiredOrders = async (input: {
                WHERE o.id = pa.order_id
                  AND o.status = 'CLOSED'
              )
-           RETURNING reconciliation_attempt_count`,
+           RETURNING
+             reconciliation_attempt_count,
+             reconciliation_next_at`,
           [candidate.attempt_id, nextRetryAt.toISOString()]
         );
         if (!claimed.rowCount) {
           outcomes[candidateIndex] = {
-            closedChangedState: true
+            kind: "deferred",
+            reason: "unsafeOrChangedState",
+            closedRecovery: true
           };
           return;
         }
+        claimToken = {
+          attemptCount:
+            claimed.rows[0].reconciliation_attempt_count,
+          nextAt: claimed.rows[0].reconciliation_next_at
+        };
       }
-      let verified: VerifiedPayment | null;
       try {
-        verified = await withPaymentProviderTimeout(
+        const verified = await withPaymentProviderTimeout(
           (signal) => provider.queryPayment(candidate.order_no, signal),
           providerTimeoutMs
         );
-      } catch {
-        const updated = await query(
-          `UPDATE payment_attempts
-           SET error_code = 'RECONCILIATION_QUERY_FAILED',
-               error_message = '支付渠道查单失败，等待下次重试',
-               reconciliation_no_payment_count = CASE
-                 WHEN $2::boolean THEN 0
-                 ELSE reconciliation_no_payment_count
-               END,
-               reconciliation_query_error_count = CASE
-                 WHEN $2::boolean
-                   THEN reconciliation_query_error_count + 1
-                 ELSE reconciliation_query_error_count
-               END,
-               reconciliation_last_result = CASE
-                 WHEN $2::boolean THEN 'QUERY_ERROR'
-                 ELSE reconciliation_last_result
-               END,
-               updated_at = now()
-           WHERE id = $1
-             AND (
-               (
-                 $2::boolean
-                 AND status = 'CLOSED'
-                 AND reconciliation_state = 'RETRY_SCHEDULED'
-               )
-               OR (
-                 NOT $2::boolean
-                 AND status IN (
-                   'CREATED',
-                   'REDIRECT_READY',
-                   'PENDING',
-                   'FAILED'
-                 )
-               )
-             )`,
-          [candidate.attempt_id, isClosedRecovery]
-        );
-        outcomes[candidateIndex] = isClosedRecovery
-          ? updated.rowCount
-            ? { closedRetryScheduled: "queryError" }
-            : { closedChangedState: true }
-          : { deferred: "providerQueryError" };
-        return;
-      }
-      if (verified) {
-        try {
-          await markOrderPaid({
-            orderId: candidate.id,
-            paymentAttemptId: candidate.attempt_id,
-            verified
-          });
-          outcomes[candidateIndex] = {
-            providerConfirmedPaid: true,
-            closedRecovery: isClosedRecovery
-          };
-        } catch (error) {
-          const verificationFailed =
-            error instanceof CommerceError &&
-            error.code === "PAYMENT_VERIFICATION_FAILED";
-          if (verificationFailed) {
-            const recordedAnomaly = await query<{
-              reconciliation_last_result: PaymentAnomalyKind;
-            }>(
-              `SELECT reconciliation_last_result
-               FROM payment_attempts
-               WHERE id = $1
-                 AND status = 'CLOSED'
-                 AND reconciliation_state = 'TERMINAL'
-                 AND error_code = 'PAYMENT_REVIEW_REQUIRED'`,
-              [candidate.attempt_id]
-            );
-            const anomalyResult =
-              recordedAnomaly.rows[0]?.reconciliation_last_result;
-            if (anomalyResult) {
-              outcomes[candidateIndex] = {
-                closedTerminal:
-                  anomalyResult === "PAYMENT_AFTER_EXPIRY"
-                    ? "paymentAfterExpiry"
-                    : "paymentVerificationFailed"
-              };
-              return;
-            }
-          }
-          await query(
-            `UPDATE payment_attempts
-             SET error_code = $2,
-                 error_message = $3,
-                 updated_at = now()
-             WHERE id = $1
-               AND status IN ('CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED')`,
-            [
-              candidate.attempt_id,
-              verificationFailed
-                ? "RECONCILIATION_VERIFICATION_FAILED"
-                : "RECONCILIATION_SETTLEMENT_DEFERRED",
-              verificationFailed
-                ? "支付核验不一致，等待人工检查"
-                : "支付状态已变化，等待下次核验"
-            ]
-          );
-          outcomes[candidateIndex] = {
-            deferred: verificationFailed
-              ? "paymentVerificationFailed"
-              : "unsafeOrChangedState"
-          };
-        }
-        return;
-      }
-      if (isClosedRecovery) {
-        const updated = await query<{
-          reconciliation_no_payment_count: number;
-        }>(
-          `UPDATE payment_attempts
-           SET reconciliation_no_payment_count =
-                 reconciliation_no_payment_count + 1,
-               reconciliation_last_result = 'NO_PAYMENT',
-               error_code = NULL,
-               error_message = NULL,
-               updated_at = now()
-           WHERE id = $1
-             AND status = 'CLOSED'
-             AND reconciliation_state = 'RETRY_SCHEDULED'
-           RETURNING reconciliation_no_payment_count`,
-          [candidate.attempt_id]
-        );
-        if (!updated.rowCount) {
-          outcomes[candidateIndex] = {
-            closedChangedState: true
-          };
-          return;
-        }
-        if (
-          updated.rows[0].reconciliation_no_payment_count >=
-          closedPaymentReconciliationMaxNoPaymentConfirmations
-        ) {
-          outcomes[candidateIndex] =
-            await markClosedRecoveryTerminal(
-              candidate,
-              "noPaymentLimitExceeded"
-            )
-              ? { closedTerminal: "noPaymentLimitExceeded" }
-              : { closedChangedState: true };
-          return;
-        }
         outcomes[candidateIndex] = {
-          closedRetryScheduled: "noPayment"
+          kind: "providerQuery",
+          candidate,
+          claimToken,
+          result: { verified }
         };
-        return;
+      } catch {
+        outcomes[candidateIndex] = {
+          kind: "providerQuery",
+          candidate,
+          claimToken,
+          result: { queryError: true }
+        };
       }
-      outcomes[candidateIndex] = {
-        safeToClose: {
-          id: candidate.id,
-          status: candidate.status,
-          attemptId: candidate.attempt_id,
-          attemptChannel: candidate.attempt_channel
-        }
-      };
     };
     const workers = Array.from(
       { length: Math.min(10, candidates.rows.length) },
@@ -1861,41 +1740,364 @@ export const reconcileAndCloseExpiredOrders = async (input: {
     );
     await Promise.all(workers);
     for (const outcome of outcomes) {
-      if (!outcome) continue;
-      if ("providerConfirmedPaid" in outcome) {
-        providerConfirmedPaidCount += 1;
-        if (outcome.closedRecovery) {
-          closedRecovery.recoveredCount += 1;
-        }
-      } else if ("closedRetryScheduled" in outcome) {
-        closedRecovery.retryScheduledCount += 1;
-        closedRecovery.retryByReason[outcome.closedRetryScheduled] += 1;
-      } else if ("closedTerminal" in outcome) {
-        closedRecovery.terminalCount += 1;
-        closedRecovery.terminalByReason[outcome.closedTerminal] += 1;
-      } else if ("closedChangedState" in outcome) {
+      if (outcome) providerOutcomes.push(outcome);
+    }
+  }
+
+  return withTransaction(async (client) => {
+    const recordChangedState = (isClosedRecovery: boolean) => {
+      deferredByReason.unsafeOrChangedState += 1;
+      if (isClosedRecovery) {
         closedRecovery.changedStateCount += 1;
-        deferredByReason.unsafeOrChangedState += 1;
-      } else if ("deferred" in outcome) {
-        deferredByReason[outcome.deferred] += 1;
-      } else if (safeToClose.length < limit) {
-        safeToClose.push(outcome.safeToClose);
+      }
+    };
+    const recordTerminal = (
+      reason: ClosedRecoveryTerminalReason,
+      isClosedRecovery: boolean
+    ) => {
+      terminalCount += 1;
+      if (isClosedRecovery) {
+        closedRecovery.terminalCount += 1;
+        closedRecovery.terminalByReason[reason] += 1;
+      }
+    };
+    const applyClosedTerminal = async (
+      candidate: ReconciliationCandidate,
+      reason: ClosedRecoveryTerminalReason
+    ) => {
+      const terminalResult = {
+        deadlineExceeded: "DEADLINE_EXCEEDED",
+        noPaymentLimitExceeded: "NO_PAYMENT_LIMIT_EXCEEDED",
+        paymentAfterExpiry: "PAYMENT_AFTER_EXPIRY",
+        paymentVerificationFailed: "PAYMENT_VERIFICATION_FAILED"
+      }[reason];
+      const terminal = await client.query(
+        `UPDATE payment_attempts pa
+         SET reconciliation_state = 'TERMINAL',
+             reconciliation_next_at = NULL,
+             reconciliation_deadline_at = NULL,
+             reconciliation_last_result = $2,
+             error_code = CASE
+               WHEN $2 IN (
+                 'PAYMENT_AFTER_EXPIRY',
+                 'PAYMENT_VERIFICATION_FAILED'
+               )
+                 THEN 'RECONCILIATION_' || $2
+               ELSE error_code
+             END,
+             error_message = CASE
+               WHEN $2 = 'PAYMENT_AFTER_EXPIRY'
+                 THEN '渠道付款时间晚于订单有效期，已停止自动恢复'
+               WHEN $2 = 'PAYMENT_VERIFICATION_FAILED'
+                 THEN '支付核验不一致，已停止自动恢复'
+               ELSE error_message
+             END,
+             updated_at = now()
+         WHERE pa.id = $1
+           AND pa.reconciliation_state = $3
+           AND pa.reconciliation_attempt_count = $4
+           AND pa.reconciliation_no_payment_count = $5
+           AND pa.reconciliation_query_error_count = $6
+           AND pa.reconciliation_last_result
+                 IS NOT DISTINCT FROM $7
+           AND EXISTS (
+             SELECT 1
+             FROM orders o
+             WHERE o.id = pa.order_id
+               AND o.status = 'CLOSED'
+           )`,
+        [
+          candidate.attempt_id,
+          terminalResult,
+          candidate.reconciliation_state,
+          candidate.reconciliation_attempt_count,
+          candidate.reconciliation_no_payment_count,
+          candidate.reconciliation_query_error_count,
+          candidate.reconciliation_last_result
+        ]
+      );
+      if (terminal.rowCount) {
+        recordTerminal(reason, true);
       } else {
-        await query(
+        recordChangedState(true);
+      }
+    };
+
+    for (const outcome of providerOutcomes) {
+      if (outcome.kind === "deferred") {
+        if (outcome.reason === "unsafeOrChangedState") {
+          recordChangedState(outcome.closedRecovery);
+        } else {
+          deferredByReason[outcome.reason] += 1;
+        }
+        continue;
+      }
+      if (outcome.kind === "closedTerminalPrecheck") {
+        await applyClosedTerminal(outcome.candidate, outcome.reason);
+        continue;
+      }
+
+      const candidate = outcome.candidate;
+      const isClosedRecovery = candidate.status === "CLOSED";
+      const claimToken = outcome.claimToken;
+      if ("queryError" in outcome.result) {
+        if (isClosedRecovery && claimToken) {
+          const updated = await client.query(
+            `UPDATE payment_attempts pa
+             SET error_code = 'RECONCILIATION_QUERY_FAILED',
+                 error_message = '支付渠道查单失败，等待下次重试',
+                 reconciliation_no_payment_count = 0,
+                 reconciliation_query_error_count =
+                   reconciliation_query_error_count + 1,
+                 reconciliation_last_result = 'QUERY_ERROR',
+                 updated_at = now()
+             WHERE pa.id = $1
+               AND pa.status = 'CLOSED'
+               AND pa.reconciliation_state = 'RETRY_SCHEDULED'
+               AND pa.reconciliation_attempt_count = $2
+               AND pa.reconciliation_next_at = $3
+               AND pa.reconciliation_last_result = 'QUERY_IN_PROGRESS'
+               AND EXISTS (
+                 SELECT 1
+                 FROM orders o
+                 WHERE o.id = pa.order_id
+                   AND o.status = 'CLOSED'
+               )`,
+            [
+              candidate.attempt_id,
+              claimToken.attemptCount,
+              claimToken.nextAt.toISOString()
+            ]
+          );
+          if (updated.rowCount) {
+            closedRecovery.retryScheduledCount += 1;
+            closedRecovery.retryByReason.queryError += 1;
+          } else {
+            recordChangedState(true);
+          }
+        } else {
+          const updated = await client.query(
+            `UPDATE payment_attempts pa
+             SET error_code = 'RECONCILIATION_QUERY_FAILED',
+                 error_message = '支付渠道查单失败，等待下次重试',
+                 updated_at = now()
+             WHERE pa.id = $1
+               AND pa.status IN (
+                 'CREATED',
+                 'REDIRECT_READY',
+                 'PENDING',
+                 'FAILED'
+               )
+               AND EXISTS (
+                 SELECT 1
+                 FROM orders o
+                 WHERE o.id = pa.order_id
+                   AND o.status IN (
+                     'CREATED',
+                     'PAYING',
+                     'PAYMENT_FAILED'
+                   )
+               )`,
+            [candidate.attempt_id]
+          );
+          if (updated.rowCount) {
+            deferredByReason.providerQueryError += 1;
+          } else {
+            recordChangedState(false);
+          }
+        }
+        continue;
+      }
+
+      const verified = outcome.result.verified;
+      if (verified) {
+        await client.query(
+          "SAVEPOINT reconciliation_paid_apply"
+        );
+        try {
+          const paid = await markOrderPaidInTransaction(
+            client,
+            {
+              orderId: candidate.id,
+              paymentAttemptId: candidate.attempt_id!,
+              verified
+            },
+            claimToken
+          );
+          await client.query(
+            "RELEASE SAVEPOINT reconciliation_paid_apply"
+          );
+          if ("changedState" in paid) {
+            recordChangedState(isClosedRecovery);
+          } else if ("anomaly" in paid) {
+            recordTerminal(
+              paid.anomaly === "PAYMENT_AFTER_EXPIRY"
+                ? "paymentAfterExpiry"
+                : "paymentVerificationFailed",
+              isClosedRecovery
+            );
+          } else {
+            providerConfirmedPaidCount += 1;
+            if (isClosedRecovery) {
+              closedRecovery.recoveredCount += 1;
+            }
+          }
+        } catch (error) {
+          const verificationFailed =
+            error instanceof CommerceError &&
+            error.code === "PAYMENT_VERIFICATION_FAILED";
+          await client.query(
+            "ROLLBACK TO SAVEPOINT reconciliation_paid_apply"
+          );
+          await client.query(
+            "RELEASE SAVEPOINT reconciliation_paid_apply"
+          );
+          let updatedOpenAttempt = true;
+          if (!isClosedRecovery) {
+            const updated = await client.query(
+              `UPDATE payment_attempts pa
+               SET error_code = $2,
+                   error_message = $3,
+                   updated_at = now()
+               WHERE pa.id = $1
+                 AND pa.status IN (
+                   'CREATED',
+                   'REDIRECT_READY',
+                   'PENDING',
+                   'FAILED'
+                 )
+                 AND EXISTS (
+                   SELECT 1
+                   FROM orders o
+                   WHERE o.id = pa.order_id
+                     AND o.status IN (
+                       'CREATED',
+                       'PAYING',
+                       'PAYMENT_FAILED'
+                     )
+                 )`,
+              [
+                candidate.attempt_id,
+                verificationFailed
+                  ? "RECONCILIATION_VERIFICATION_FAILED"
+                  : "RECONCILIATION_SETTLEMENT_DEFERRED",
+                verificationFailed
+                  ? "支付核验不一致，等待人工检查"
+                  : "支付状态已变化，等待下次核验"
+              ]
+            );
+            updatedOpenAttempt = Boolean(updated.rowCount);
+          }
+          if (!updatedOpenAttempt) {
+            recordChangedState(false);
+            continue;
+          }
+          deferredByReason[
+            verificationFailed
+              ? "paymentVerificationFailed"
+              : "unsafeOrChangedState"
+          ] += 1;
+        }
+        continue;
+      }
+
+      if (isClosedRecovery && claimToken) {
+        const updated = await client.query<{
+          reconciliation_no_payment_count: number;
+          reconciliation_state: "RETRY_SCHEDULED" | "TERMINAL";
+        }>(
+          `UPDATE payment_attempts pa
+           SET reconciliation_no_payment_count =
+                 reconciliation_no_payment_count + 1,
+               reconciliation_state = CASE
+                 WHEN reconciliation_no_payment_count + 1 >= $4
+                   THEN 'TERMINAL'
+                 ELSE reconciliation_state
+               END,
+               reconciliation_next_at = CASE
+                 WHEN reconciliation_no_payment_count + 1 >= $4
+                   THEN NULL
+                 ELSE reconciliation_next_at
+               END,
+               reconciliation_deadline_at = CASE
+                 WHEN reconciliation_no_payment_count + 1 >= $4
+                   THEN NULL
+                 ELSE reconciliation_deadline_at
+               END,
+               reconciliation_last_result = CASE
+                 WHEN reconciliation_no_payment_count + 1 >= $4
+                   THEN 'NO_PAYMENT_LIMIT_EXCEEDED'
+                 ELSE 'NO_PAYMENT'
+               END,
+               error_code = NULL,
+               error_message = NULL,
+               updated_at = now()
+           WHERE pa.id = $1
+             AND pa.status = 'CLOSED'
+             AND pa.reconciliation_state = 'RETRY_SCHEDULED'
+             AND pa.reconciliation_attempt_count = $2
+             AND pa.reconciliation_next_at = $3
+             AND pa.reconciliation_last_result = 'QUERY_IN_PROGRESS'
+             AND EXISTS (
+               SELECT 1
+               FROM orders o
+               WHERE o.id = pa.order_id
+                 AND o.status = 'CLOSED'
+             )
+           RETURNING
+             reconciliation_no_payment_count,
+             reconciliation_state`,
+          [
+            candidate.attempt_id,
+            claimToken.attemptCount,
+            claimToken.nextAt.toISOString(),
+            closedPaymentReconciliationMaxNoPaymentConfirmations
+          ]
+        );
+        if (!updated.rowCount) {
+          recordChangedState(true);
+        } else if (
+          updated.rows[0].reconciliation_state === "TERMINAL"
+        ) {
+          recordTerminal("noPaymentLimitExceeded", true);
+        } else {
+          closedRecovery.retryScheduledCount += 1;
+          closedRecovery.retryByReason.noPayment += 1;
+        }
+        continue;
+      }
+
+      const closeCandidate: ExpiredCloseCandidate = {
+        id: candidate.id,
+        status: candidate.status,
+        attemptId: candidate.attempt_id,
+        attemptChannel: candidate.attempt_channel
+      };
+      if (safeToClose.length < limit) {
+        safeToClose.push(closeCandidate);
+      } else {
+        const updated = await client.query(
           `UPDATE payment_attempts
            SET error_code = 'RECONCILIATION_CLOSE_CAPACITY_EXCEEDED',
                error_message = '本轮安全关单容量已满，等待下次处理',
                updated_at = now()
            WHERE id = $1
-             AND status IN ('CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED')`,
-          [outcome.safeToClose.attemptId]
+             AND status IN (
+               'CREATED',
+               'REDIRECT_READY',
+               'PENDING',
+               'FAILED'
+             )`,
+          [candidate.attempt_id]
         );
-        deferredByReason.closeCapacityExceeded += 1;
+        if (updated.rowCount) {
+          deferredByReason.closeCapacityExceeded += 1;
+        } else {
+          recordChangedState(false);
+        }
       }
     }
-  }
 
-  return withTransaction(async (client) => {
     const closedOrderIds =
       await closeExpiredCandidatesInTransaction(client, safeToClose);
     deferredByReason.unsafeOrChangedState +=
@@ -1980,7 +2182,7 @@ export const reconcileAndCloseExpiredOrders = async (input: {
       closedCount: closedOrderIds.length,
       providerConfirmedPaidCount,
       deferredCount,
-      terminalCount: closedRecovery.terminalCount,
+      terminalCount,
       hasMore: moreCandidates.rows[0]?.has_more ?? false,
       scheduledRecoveryCount: scheduledRecovery.rows[0]?.count ?? 0,
       deferredByReason,
