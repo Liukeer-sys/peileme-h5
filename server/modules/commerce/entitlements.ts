@@ -451,47 +451,53 @@ export const consumeEntitlement = async (
     consumeEntitlementInTransaction(client, usageIdInput)
   );
 
-export const releaseEntitlement = async (
+export const releaseEntitlementInTransaction = async (
+  client: pg.PoolClient,
   usageIdInput: string
 ): Promise<EntitlementUsageTransition> => {
   const usageId = requireUuid(usageIdInput);
-  return withTransaction(async (client) => {
-    const usage = await getLockedUsage(client, usageId);
-    if (usage.status === "released") {
-      return {
-        usageId: usage.id,
-        entitlementId: usage.entitlement_id,
-        status: usage.status
-      };
-    }
-    if (usage.status === "consumed") {
-      throw new CommerceError("ENTITLEMENT_USAGE_CLOSED");
-    }
-
-    await client.query(
-      `UPDATE entitlement_usages
-       SET status = 'released',
-           consumed_at = NULL
-       WHERE id = $1`,
-      [usage.id]
-    );
-    await client.query(
-      `UPDATE entitlements
-       SET remaining_uses = LEAST(total_uses, remaining_uses + 1),
-           status = CASE
-             WHEN status = 'revoked' THEN 'revoked'
-             ELSE 'active'
-           END,
-           reserved_for = NULL,
-           reserved_at = NULL,
-           updated_at = now()
-       WHERE id = $1`,
-      [usage.entitlement_id]
-    );
+  const usage = await getLockedUsage(client, usageId);
+  if (usage.status === "released") {
     return {
       usageId: usage.id,
       entitlementId: usage.entitlement_id,
-      status: "released"
+      status: usage.status
     };
-  });
+  }
+  if (usage.status === "consumed") {
+    throw new CommerceError("ENTITLEMENT_USAGE_CLOSED");
+  }
+
+  await client.query(
+    `UPDATE entitlement_usages
+     SET status = 'released',
+         consumed_at = NULL
+     WHERE id = $1`,
+    [usage.id]
+  );
+  await client.query(
+    `UPDATE entitlements
+     SET remaining_uses = LEAST(total_uses, remaining_uses + 1),
+         status = CASE
+           WHEN status = 'revoked' THEN 'revoked'
+           ELSE 'active'
+         END,
+         reserved_for = NULL,
+         reserved_at = NULL,
+         updated_at = now()
+     WHERE id = $1`,
+    [usage.entitlement_id]
+  );
+  return {
+    usageId: usage.id,
+    entitlementId: usage.entitlement_id,
+    status: "released"
+  };
 };
+
+export const releaseEntitlement = async (
+  usageIdInput: string
+): Promise<EntitlementUsageTransition> =>
+  withTransaction(async (client) => {
+    return releaseEntitlementInTransaction(client, usageIdInput);
+  });

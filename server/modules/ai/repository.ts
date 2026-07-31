@@ -2,7 +2,10 @@ import crypto from "node:crypto";
 import type pg from "pg";
 import { query, withTransaction } from "../../db.js";
 import { ApiError } from "../../errors.js";
-import { consumeEntitlementInTransaction } from "../commerce/entitlements.js";
+import {
+  consumeEntitlementInTransaction,
+  releaseEntitlementInTransaction
+} from "../commerce/entitlements.js";
 import type { AiProviderAttempt, AiJobKind } from "../llm/types.js";
 import type { AiReport } from "../llm/router.js";
 
@@ -335,6 +338,68 @@ export const failAiJob = async (input: {
 export const deleteQueuedAiJob = async (jobId: string) => {
   await query("DELETE FROM ai_jobs WHERE id = $1 AND status = 'QUEUED'", [jobId]);
 };
+
+export const recoverInterruptedAiJobs = async () =>
+  withTransaction(async (client) => {
+    await client.query(
+      "SELECT pg_advisory_xact_lock(hashtextextended('ai-job-startup-recovery', 0))"
+    );
+    const active = await client.query<{
+      id: string;
+      status: "QUEUED" | "AWAITING_ENTITLEMENT" | "RUNNING";
+    }>(
+      `SELECT id, status
+         FROM ai_jobs
+        WHERE status IN ('QUEUED', 'AWAITING_ENTITLEMENT', 'RUNNING')
+        ORDER BY created_at, id
+        FOR UPDATE`
+    );
+    let releasedUsages = 0;
+    let queuedDeleted = 0;
+    let runningFailed = 0;
+
+    for (const job of active.rows) {
+      const usages = await client.query<{ id: string }>(
+        `SELECT id
+           FROM entitlement_usages
+          WHERE business_type = 'commerce'
+            AND business_id = $1
+            AND status = 'reserved'
+          ORDER BY created_at, id
+          FOR UPDATE`,
+        [job.id]
+      );
+      for (const usage of usages.rows) {
+        await releaseEntitlementInTransaction(client, usage.id);
+        releasedUsages += 1;
+      }
+
+      if (job.status === "RUNNING") {
+        await transitionJob(client, {
+          jobId: job.id,
+          from: "RUNNING",
+          to: "FAILED_FINAL",
+          progress: 100,
+          detail: { failureCode: "AI_JOB_INTERRUPTED" }
+        });
+        await client.query(
+          `UPDATE ai_jobs
+              SET failure_code = 'AI_JOB_INTERRUPTED',
+                  failure_message = NULL,
+                  completed_at = now(),
+                  updated_at = now()
+            WHERE id = $1`,
+          [job.id]
+        );
+        runningFailed += 1;
+      } else {
+        await client.query("DELETE FROM ai_jobs WHERE id = $1", [job.id]);
+        queuedDeleted += 1;
+      }
+    }
+
+    return { releasedUsages, queuedDeleted, runningFailed };
+  });
 
 export const getOwnedAiJob = async (userId: string, jobId: string) => {
   const result = await query<AiJobRow>(
