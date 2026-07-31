@@ -294,7 +294,53 @@ const paymentSensitiveSentinels = () => ({
   cardholderName: `CardholderName-${randomUUID()}`,
   expiryDate: `ExpiryDate-${randomUUID()}`,
   expirationDate: `ExpirationDate-${randomUUID()}`,
-  serviceCode: `ServiceCode-${randomUUID()}`
+  serviceCode: `ServiceCode-${randomUUID()}`,
+  suffixedCvv: `SuffixedCvv-${randomUUID()}`,
+  wrappedCvv: `WrappedCvv-${randomUUID()}`,
+  suffixedPan: `SuffixedPan-${randomUUID()}`,
+  suffixedSecret: `SuffixedSecret-${randomUUID()}`,
+  magstripeData: `MagstripeData-${randomUUID()}`,
+  magstripeHash: `MagstripeHash-${randomUUID()}`,
+  expDate: `ExpDate-${randomUUID()}`,
+  expMonth: `ExpMonth-${randomUUID()}`,
+  expYear: `ExpYear-${randomUUID()}`,
+  expirationMonth: `ExpirationMonth-${randomUUID()}`,
+  expirationYear: `ExpirationYear-${randomUUID()}`,
+  expiryMonth: `ExpiryMonth-${randomUUID()}`,
+  expiryYear: `ExpiryYear-${randomUUID()}`,
+  nameOnCard: `NameOnCard-${randomUUID()}`,
+  cardHolder: `CardHolder-${randomUUID()}`,
+  magneticStripeData: `MagneticStripeData-${randomUUID()}`,
+  cav2: `Cav2-${randomUUID()}`,
+  cvn2: `Cvn2-${randomUUID()}`,
+  cid: `Cid-${randomUUID()}`,
+  csc: `Csc-${randomUUID()}`,
+  cvd: `Cvd-${randomUUID()}`,
+  cvd2: `Cvd2-${randomUUID()}`,
+  cardValidationCode: `CardValidationCode-${randomUUID()}`,
+  cardValidationValue: `CardValidationValue-${randomUUID()}`,
+  cardVerificationCode: `CardVerificationCode-${randomUUID()}`,
+  cardVerificationValue: `CardVerificationValue-${randomUUID()}`,
+  cardSecurityCode: `CardSecurityCode-${randomUUID()}`,
+  acctNumber: `AcctNumber-${randomUUID()}`,
+  ccNumber: `CcNumber-${randomUUID()}`,
+  ccNum: `CcNum-${randomUUID()}`,
+  ccNbr: `CcNbr-${randomUUID()}`,
+  cardNum: `CardNum-${randomUUID()}`,
+  cardNbr: `CardNbr-${randomUUID()}`,
+  creditCardNum: `CreditCardNum-${randomUUID()}`,
+  debitCardNum: `DebitCardNum-${randomUUID()}`,
+  cardContainer: `CardContainer-${randomUUID()}`,
+  fullTrack: `FullTrack-${randomUUID()}`,
+  trackContainer: `TrackContainer-${randomUUID()}`,
+  holderName: `HolderName-${randomUUID()}`,
+  holder: `Holder-${randomUUID()}`,
+  expiry: `Expiry-${randomUUID()}`,
+  expiration: `Expiration-${randomUUID()}`,
+  validThru: `ValidThru-${randomUUID()}`,
+  validUntil: `ValidUntil-${randomUUID()}`,
+  svcCode: `SvcCode-${randomUUID()}`,
+  splitAuthorization: `SplitAuthorization-${randomUUID()}`
 });
 
 const paymentSensitiveFields = (
@@ -372,7 +418,55 @@ const paymentSensitiveFields = (
   cardholder_name: sentinels.cardholderName,
   expiry_date: sentinels.expiryDate,
   expirationDate: sentinels.expirationDate,
-  service_code: sentinels.serviceCode
+  service_code: sentinels.serviceCode,
+  "c\0vv_hash": sentinels.suffixedCvv,
+  "raw_c\0vv_value": sentinels.wrappedCvv,
+  "p\0an_hash": sentinels.suffixedPan,
+  se_cret_value: sentinels.suffixedSecret,
+  mag_stripe_data: sentinels.magstripeData,
+  magStripeHash: sentinels.magstripeHash,
+  exp_date: sentinels.expDate,
+  expMonth: sentinels.expMonth,
+  exp_year: sentinels.expYear,
+  expiration_month: sentinels.expirationMonth,
+  expirationYear: sentinels.expirationYear,
+  expiry_month: sentinels.expiryMonth,
+  expiryYear: sentinels.expiryYear,
+  name_on_card: sentinels.nameOnCard,
+  card_holder: sentinels.cardHolder,
+  magneticStripeData: sentinels.magneticStripeData,
+  expanded_aliases: {
+    cav2: sentinels.cav2,
+    cvn2: sentinels.cvn2,
+    cid: sentinels.cid,
+    csc: sentinels.csc,
+    cvd: sentinels.cvd,
+    cvd2: sentinels.cvd2,
+    card_validation_code: sentinels.cardValidationCode,
+    cardValidationValue: sentinels.cardValidationValue,
+    card_verification_code: sentinels.cardVerificationCode,
+    cardVerificationValue: sentinels.cardVerificationValue,
+    card_security_code: sentinels.cardSecurityCode,
+    acct_number: sentinels.acctNumber,
+    cc_number: sentinels.ccNumber,
+    cc_num: sentinels.ccNum,
+    cc_nbr: sentinels.ccNbr,
+    card_num: sentinels.cardNum,
+    card_nbr: sentinels.cardNbr,
+    credit_card_num: sentinels.creditCardNum,
+    debit_card_num: sentinels.debitCardNum,
+    card: { number: sentinels.cardContainer },
+    full_track: sentinels.fullTrack,
+    track: { data: sentinels.trackContainer },
+    holder_name: sentinels.holderName,
+    holder: sentinels.holder,
+    expiry: sentinels.expiry,
+    expiration: sentinels.expiration,
+    valid_thru: sentinels.validThru,
+    validUntil: sentinels.validUntil,
+    svc_code: sentinels.svcCode,
+    a_u_t_h_o_r_i_z_a_t_i_o_n: sentinels.splitAuthorization
+  }
 });
 
 const paymentAuditFields = (prefix: "create" | "verify") => ({
@@ -390,7 +484,11 @@ const paymentAuditFields = (prefix: "create" | "verify") => ({
   key: `${prefix}-audit-key`,
   microphone_status: "enabled",
   tokenization_status: "complete",
-  shipping: "standard"
+  shipping: "standard",
+  microphone: "enabled",
+  tokenization: "complete",
+  opinion: "approved",
+  pineapple: "allowed"
 });
 
 const paymentUnicodeEvidence = () => ({
@@ -2800,7 +2898,7 @@ describe("atomic commerce orders and payments", () => {
         nested: {
           publicStatus: "accepted",
           audit: paymentAuditFields("create"),
-          providerDetails: {}
+          providerDetails: { expanded_aliases: {} }
         }
       });
       const serialized = JSON.stringify(
@@ -2888,7 +2986,7 @@ describe("atomic commerce orders and payments", () => {
           },
           nested: {
             audit: paymentAuditFields("verify"),
-            providerDetails: {}
+            providerDetails: { expanded_aliases: {} }
           }
         }
       });

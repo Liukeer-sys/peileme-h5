@@ -584,8 +584,67 @@ describe("payment evidence full-content digest", () => {
       expirationDate: "expiration-secret",
       service_code: "service-code-secret",
       serviceCode: "camel-service-code-secret",
+      "c\0vv_hash": "suffixed-cvv-secret",
+      "raw_c\0vv_value": "wrapped-cvv-secret",
+      "p\0an_hash": "suffixed-pan-secret",
+      se_cret_value: "suffixed-secret",
+      mag_stripe_data: "split-magstripe-data-secret",
+      magStripeHash: "camel-magstripe-hash-secret",
+      exp_date: "exp-date-secret",
+      expMonth: "exp-month-secret",
+      exp_year: "exp-year-secret",
+      expiration_month: "expiration-month-secret",
+      expirationYear: "expiration-year-secret",
+      expiry_month: "expiry-month-secret",
+      expiryYear: "expiry-year-secret",
+      name_on_card: "name-on-card-secret",
+      nameOnCard: "camel-name-on-card-secret",
+      card_holder: "card-holder-secret",
+      cardHolder: "camel-card-holder-secret",
+      magnetic_stripe_data: "magnetic-stripe-secret",
+      magneticStripeData: "camel-magnetic-stripe-secret",
+      cav2: "cav2-secret",
+      cvn2: "cvn2-secret",
+      cid: "cid-secret",
+      csc: "csc-secret",
+      cvd: "cvd-secret",
+      cvd2: "cvd2-secret",
+      card_validation_code: "card-validation-code-secret",
+      cardValidationValue: "card-validation-value-secret",
+      card_verification_code: "card-verification-code-secret",
+      cardVerificationValue: "card-verification-value-secret",
+      card_security_code: "card-security-code-secret",
+      acct_number: "account-number-secret",
+      cc_number: "cc-number-secret",
+      cc_num: "cc-num-secret",
+      cc_nbr: "cc-nbr-secret",
+      card_num: "card-num-secret",
+      card_nbr: "card-nbr-secret",
+      credit_card_num: "credit-card-num-secret",
+      debit_card_num: "debit-card-num-secret",
+      card: {
+        number: "nested-card-number-secret",
+        name: "nested-card-name-secret",
+        service: "nested-card-service-secret"
+      },
+      full_track: "full-track-secret",
+      track: { data: "nested-track-data-secret" },
+      holder_name: "holder-name-secret",
+      holder: "holder-container-secret",
+      expiry: "expiry-container-secret",
+      expiration: "expiration-container-secret",
+      valid_thru: "valid-thru-secret",
+      validUntil: "valid-until-secret",
+      svc_code: "svc-code-secret",
+      a_u_t_h_o_r_i_z_a_t_i_o_n: "split-authorization-secret",
+      [`${"x_".repeat(300)}tail`]: "overlong-key-secret",
       microphone_status: "enabled",
       tokenization_status: "complete",
+      shipping: "standard",
+      microphone: "enabled",
+      tokenization: "complete",
+      opinion: "approved",
+      pineapple: "allowed",
       name: "provider-audit",
       key: "provider-audit-key"
     });
@@ -593,6 +652,11 @@ describe("payment evidence full-content digest", () => {
     expect(sanitized).toEqual({
       microphone_status: "enabled",
       tokenization_status: "complete",
+      shipping: "standard",
+      microphone: "enabled",
+      tokenization: "complete",
+      opinion: "approved",
+      pineapple: "allowed",
       name: "provider-audit",
       key: "provider-audit-key"
     });
@@ -622,19 +686,48 @@ describe("payment evidence full-content digest", () => {
   });
 
   it("redacts sensitive values before hashing without reading accessors", () => {
-    const withCvv = (cvv: string, status = "accepted") => ({
+    const sensitiveKeys = [
+      "cvv",
+      "raw_c\0vv_value",
+      "p\0an_hash",
+      "se_cret_value",
+      "magStripeHash",
+      "exp_month",
+      "expiryYear",
+      "nameOnCard",
+      "card_holder",
+      "magneticStripeData",
+      "track_data",
+      "service_code",
+      "a_u_t_h_o_r_i_z_a_t_i_o_n_hash",
+      "c_a_v_2_hash",
+      "cc_num",
+      "card",
+      "full_track",
+      "holder",
+      "valid_until"
+    ];
+    const withSensitive = (
+      key: string,
+      sensitiveValue: string,
+      status = "accepted"
+    ) => ({
       oversized: "x".repeat(5_000),
-      nested: { cvv, status }
+      nested: { [key]: sensitiveValue, status }
     });
 
-    expect(hashOf(withCvv("cvv123"))).toBe(hashOf(withCvv("cvv124")));
-    expect(hashOf(withCvv("cvv123", "accepted"))).not.toBe(
-      hashOf(withCvv("cvv123", "declined"))
+    for (const key of sensitiveKeys) {
+      expect(hashOf(withSensitive(key, "secret-A")), key).toBe(
+        hashOf(withSensitive(key, "secret-B"))
+      );
+    }
+    expect(hashOf(withSensitive("cvv", "secret", "accepted"))).not.toBe(
+      hashOf(withSensitive("cvv", "secret", "declined"))
     );
 
     let getterCalls = 0;
     const nested = { status: "accepted" } as Record<string, unknown>;
-    Object.defineProperty(nested, "cvv", {
+    Object.defineProperty(nested, "a_u_t_h_o_r_i_z_a_t_i_o_n_hash", {
       enumerable: true,
       get: () => {
         getterCalls += 1;

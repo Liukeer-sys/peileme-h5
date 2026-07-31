@@ -120,7 +120,18 @@ const sensitiveKeySegments = new Set([
   "account",
   "track1",
   "track2",
-  "magstripe"
+  "track",
+  "magstripe",
+  "card",
+  "holder",
+  "expiry",
+  "expiration",
+  "cav2",
+  "cvn2",
+  "cid",
+  "csc",
+  "cvd",
+  "cvd2"
 ]);
 
 const sensitiveKeySequences = [
@@ -163,9 +174,36 @@ const sensitiveKeySequences = [
   ["track", "2"],
   ["cardholder", "name"],
   ["card", "holder", "name"],
+  ["card", "holder"],
+  ["card", "validation", "code"],
+  ["card", "validation", "value"],
+  ["card", "verification", "code"],
+  ["card", "verification", "value"],
+  ["card", "security", "code"],
+  ["acct", "number"],
+  ["cc", "number"],
+  ["cc", "num"],
+  ["cc", "nbr"],
+  ["card", "num"],
+  ["card", "nbr"],
+  ["credit", "card", "num"],
+  ["debit", "card", "num"],
+  ["name", "on", "card"],
+  ["exp", "date"],
+  ["exp", "month"],
+  ["exp", "year"],
   ["expiry", "date"],
+  ["expiry", "month"],
+  ["expiry", "year"],
   ["expiration", "date"],
-  ["service", "code"]
+  ["expiration", "month"],
+  ["expiration", "year"],
+  ["magnetic", "stripe"],
+  ["magnetic", "stripe", "data"],
+  ["service", "code"],
+  ["valid", "thru"],
+  ["valid", "until"],
+  ["svc", "code"]
 ] as const;
 
 const compactSensitiveKeys = new Set(
@@ -173,6 +211,10 @@ const compactSensitiveKeys = new Set(
     ...sensitiveKeySegments,
     ...sensitiveKeySequences.map((sequence) => sequence.join(""))
   ]
+);
+const MAX_SENSITIVE_KEY_CODE_UNITS = 512;
+const MAX_COMPACT_SENSITIVE_KEY_LENGTH = Math.max(
+  ...Array.from(compactSensitiveKeys, (key) => key.length)
 );
 
 const exceedsBigIntSafetyLimit = (value: bigint) =>
@@ -193,15 +235,32 @@ const includesTokenSequence = (
   return false;
 };
 
+const includesCompactSensitiveWindow = (segments: string[]) => {
+  for (let start = 0; start < segments.length; start += 1) {
+    let compactWindow = "";
+    for (let end = start; end < segments.length; end += 1) {
+      if (
+        compactWindow.length + segments[end].length >
+        MAX_COMPACT_SENSITIVE_KEY_LENGTH
+      ) {
+        break;
+      }
+      compactWindow += segments[end];
+      if (compactSensitiveKeys.has(compactWindow)) return true;
+    }
+  }
+  return false;
+};
+
 const isSensitiveKey = (key: string) => {
+  if (key.length > MAX_SENSITIVE_KEY_CODE_UNITS) return true;
   const segmented = key.replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase();
   const segments = segmented.split(/[^a-z0-9]+/).filter(Boolean);
   if (segments.some((segment) => sensitiveKeySegments.has(segment))) {
     return true;
   }
-  const normalized = segments.join("");
   return (
-    compactSensitiveKeys.has(normalized) ||
+    includesCompactSensitiveWindow(segments) ||
     sensitiveKeySequences.some((sequence) =>
       includesTokenSequence(segments, sequence)
     )
