@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useAuth } from "../auth/AuthContext";
 import AuthModal from "../components/AuthModal";
+import AnnouncementBanner from "../components/AnnouncementBanner";
 import AiAccountPanel from "./AiAccountPanel";
 import AiAnalysisWorkspace from "./AiAnalysisWorkspace";
 
@@ -8,6 +9,7 @@ export default function AiShell() {
   const { user, ready } = useAuth();
   const [authOpen, setAuthOpen] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
+  const [workspaceRevision, setWorkspaceRevision] = useState(0);
 
   const openWorkspace = () => {
     if (user) {
@@ -40,8 +42,9 @@ export default function AiShell() {
             </button>
           </div>
         </header>
+        <AnnouncementBanner />
         {user ? (
-          <AiAnalysisWorkspace key={user.id} />
+          <AiAnalysisWorkspace key={user.id} refreshKey={workspaceRevision} />
         ) : (
           <section className="ai-intro">
             <span className="status-pill">AI 深度分析版</span>
@@ -64,6 +67,7 @@ export default function AiShell() {
         key={user?.id ?? "signed-out"}
         open={accountOpen}
         onClose={() => setAccountOpen(false)}
+        onJobCreated={() => setWorkspaceRevision((revision) => revision + 1)}
       />
     </>
   );

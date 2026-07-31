@@ -40,7 +40,13 @@ const jobKindLabel: Record<AiJob["kind"], string> = {
   document_review: "文件签署审查"
 };
 
-export default function AiAnalysisWorkspace() {
+type AiAnalysisWorkspaceProps = {
+  refreshKey?: number;
+};
+
+export default function AiAnalysisWorkspace({
+  refreshKey = 0
+}: AiAnalysisWorkspaceProps) {
   const [situation, setSituation] = useState("");
   const [jobs, setJobs] = useState<AiJob[]>([]);
   const [activeJob, setActiveJob] = useState<AiJob | null>(null);
@@ -65,7 +71,7 @@ export default function AiAnalysisWorkspace() {
     const controller = new AbortController();
     void loadHistory(controller.signal);
     return () => controller.abort();
-  }, [loadHistory]);
+  }, [loadHistory, refreshKey]);
 
   const analyze = async () => {
     const normalized = situation.trim();

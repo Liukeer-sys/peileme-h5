@@ -28,6 +28,7 @@ type AiJob = {
 type AiAccountPanelProps = {
   open: boolean;
   onClose: () => void;
+  onJobCreated?: (jobId: string) => void;
 };
 
 const moduleNames: Record<GrantModule, string> = {
@@ -37,7 +38,8 @@ const moduleNames: Record<GrantModule, string> = {
 
 export default function AiAccountPanel({
   open,
-  onClose
+  onClose,
+  onJobCreated
 }: AiAccountPanelProps) {
   const { user, capabilities, grants, logout, redeemInvite, updateProfile } = useAuth();
   const [invite, setInvite] = useState("");
@@ -265,6 +267,7 @@ export default function AiAccountPanel({
         }
       });
       if (!guard.isCurrent(lifecycle) || controller.signal.aborted) return;
+      onJobCreated?.(job.id);
       setUploadMessage(
         job.report?.summary ||
           (job.failureCode === "AI_PROVIDER_NOT_CONFIGURED"

@@ -78,6 +78,36 @@ button {
   gap: 8px;
 }
 
+.public-announcements {
+  position: relative;
+  z-index: 2;
+  display: grid;
+  gap: 1px;
+  max-height: 148px;
+  overflow: auto;
+  border-bottom: 1px solid rgba(74, 65, 84, 0.08);
+  background: rgba(255, 248, 228, 0.9);
+}
+
+.public-announcements article {
+  padding: 10px 18px;
+  background: rgba(255, 252, 242, 0.86);
+}
+
+.public-announcements strong {
+  display: block;
+  color: #4b4056;
+  font-size: 13px;
+}
+
+.public-announcements p {
+  margin: 3px 0 0;
+  color: #74677e;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
 .brand-dot {
   width: 12px;
   height: 12px;
@@ -3877,6 +3907,5 @@ button {
   color: #5a5064;
   box-shadow: none;
 }
-
 
 

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useAuth } from "../auth/AuthContext";
 import AuthModal from "../components/AuthModal";
+import AnnouncementBanner from "../components/AnnouncementBanner";
 import MainAccountPanel from "./MainAccountPanel";
 import ChatBubble from "../components/ChatBubble";
 import OptionButtons from "../components/OptionButtons";
@@ -898,6 +899,8 @@ export default function MainApp() {
           </div>
         </header>
 
+        <AnnouncementBanner />
+
         {shareError && (
           <section className="shared-link-error" aria-labelledby="shared-link-error-title">
             <h1 id="shared-link-error-title">分享链接已失效</h1>
@@ -1217,6 +1220,7 @@ export default function MainApp() {
               }
               onRecalculate={restart}
               sharedReadOnly={Boolean(sharedToken)}
+              authenticated={Boolean(user)}
             />
             <div ref={bottomRef} />
           </div>

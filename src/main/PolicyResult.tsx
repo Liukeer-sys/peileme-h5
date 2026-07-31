@@ -12,6 +12,7 @@ type PolicyResultProps = {
   onOpenHistory: () => void;
   onRecalculate: () => void;
   sharedReadOnly?: boolean;
+  authenticated?: boolean;
 };
 
 const formatCny = (fen: number) =>
@@ -47,7 +48,8 @@ export default function PolicyResult({
   result,
   onOpenHistory,
   onRecalculate,
-  sharedReadOnly = false
+  sharedReadOnly = false,
+  authenticated = false
 }: PolicyResultProps) {
   const [shareMessage, setShareMessage] = useState("");
   const [activeShareId, setActiveShareId] = useState("");
@@ -64,7 +66,12 @@ export default function PolicyResult({
   );
 
   useEffect(() => {
-    if (sharedReadOnly) return;
+    if (sharedReadOnly || !authenticated) {
+      setActiveShareId("");
+      setShareMessage("");
+      setShareStatusLoading(false);
+      return;
+    }
     let active = true;
     setShareStatusLoading(true);
     void listPolicyShares(result.assessmentId)
@@ -94,7 +101,7 @@ export default function PolicyResult({
     return () => {
       active = false;
     };
-  }, [result.assessmentId, sharedReadOnly]);
+  }, [authenticated, result.assessmentId, sharedReadOnly]);
 
   const createAndPresentShare = async () => {
     const created = await createPolicyShare(result.assessmentId);
@@ -225,9 +232,17 @@ export default function PolicyResult({
       {!sharedReadOnly && (
         <div className="policy-result-actions">
           <button type="button" className="primary-button" onClick={onOpenHistory}>
-            查看历史
+            {authenticated ? "查看历史" : "登录并保存记录"}
           </button>
-          {activeShareId ? (
+          {!authenticated ? (
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={onOpenHistory}
+            >
+              登录后分享
+            </button>
+          ) : activeShareId ? (
             <>
               <button
                 type="button"
