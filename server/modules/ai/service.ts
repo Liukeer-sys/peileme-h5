@@ -2,6 +2,8 @@ import {
   releaseEntitlement,
   reserveEntitlement
 } from "../commerce/entitlements.js";
+import { CommerceError } from "../commerce/types.js";
+import { ApiError } from "../../errors.js";
 import { runProviderChain } from "../llm/router.js";
 import type { AiJobKind, AiProvider } from "../llm/types.js";
 import {
@@ -46,13 +48,14 @@ export const createAiAnalysisService = (
     });
     if (!persisted.created) return persisted;
 
+    const sku = input.kind === "severance_analysis"
+      ? "AI_SEVERANCE_ANALYSIS"
+      : "AI_DOCUMENT_REVIEW";
     let reservation;
     try {
       reservation = await reserveEntitlement(
         input.userId,
-        input.kind === "severance_analysis"
-          ? "AI_SEVERANCE_ANALYSIS"
-          : "AI_DOCUMENT_REVIEW",
+        sku,
         persisted.job.id
       );
       await attachEntitlementAndStart(
@@ -60,16 +63,44 @@ export const createAiAnalysisService = (
         reservation.usageId
       );
     } catch (error) {
+      if (reservation) {
+        await releaseEntitlement(reservation.usageId);
+      }
       await deleteQueuedAiJob(persisted.job.id);
+      if (
+        error instanceof CommerceError &&
+        error.code === "ENTITLEMENT_NOT_AVAILABLE"
+      ) {
+        throw new ApiError(
+          402,
+          "AI_ENTITLEMENT_REQUIRED",
+          "本次 AI 分析需要可用次数",
+          { sku }
+        );
+      }
       throw error;
     }
 
-    const routed = await runProviderChain(providers, {
-      jobId: persisted.job.id,
-      kind: input.kind,
-      input: input.payload,
-      uploads: uploadMetadata
-    });
+    let routed;
+    try {
+      routed = await runProviderChain(providers, {
+        jobId: persisted.job.id,
+        kind: input.kind,
+        input: input.payload,
+        uploads: uploadMetadata
+      });
+    } catch {
+      await releaseEntitlement(reservation.usageId);
+      await failAiJob({
+        jobId: persisted.job.id,
+        failureCode: "AI_PROVIDER_CONFIGURATION_ERROR",
+        attempts: []
+      });
+      return {
+        created: true,
+        job: await getOwnedAiJob(input.userId, persisted.job.id)
+      };
+    }
 
     if (routed.ok) {
       await completeAiJob({

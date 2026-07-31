@@ -87,9 +87,11 @@ beforeAll(async () => {
        sku, name, description, product_channel, fulfillment_type, status,
        entitlement_policy
      ) VALUES
-       ('AI_SEVERANCE_ANALYSIS', 'AI 离职分析', '测试商品', 'ai', 'ai_analysis', 'active', '{}'),
-       ('AI_DOCUMENT_REVIEW', 'AI 文件审查', '测试商品', 'ai', 'document_review', 'active', '{}')
-     ON CONFLICT (sku) DO UPDATE SET status = 'active'`
+       ('AI_SEVERANCE_ANALYSIS', 'AI 离职分析', '测试商品', 'ai', 'ai_analysis', 'active', '{"grantCount":1}'),
+       ('AI_DOCUMENT_REVIEW', 'AI 文件审查', '测试商品', 'ai', 'document_review', 'active', '{"grantCount":1}')
+     ON CONFLICT (sku) DO UPDATE
+       SET status = 'active',
+           entitlement_policy = EXCLUDED.entitlement_policy`
   );
   await grant(userA, "AI_SEVERANCE_ANALYSIS");
   await grant(userA, "AI_DOCUMENT_REVIEW");
@@ -267,9 +269,186 @@ describe("AI analysis provider fallback and persistence", () => {
       failureCode: "AI_PROVIDER_NOT_CONFIGURED"
     });
   });
+
+  it("releases a reservation and permits an identical retry when starting the job fails", async () => {
+    let calls = 0;
+    const app = createAiApp([
+      {
+        key: "controlled-start-retry",
+        model: "controlled-v1",
+        priority: 1,
+        analyze: async () => {
+          calls += 1;
+          return report("启动故障恢复后分析完成");
+        }
+      }
+    ]);
+    const body = {
+      kind: "severance_analysis",
+      idempotencyKey: "attach-fault-retry-1",
+      input: { situation: "公司提出解除劳动关系，工作三年，工资包含奖金，需要在启动故障恢复后继续分析。" }
+    };
+    await query(`
+      CREATE OR REPLACE FUNCTION test_fail_ai_running_event()
+      RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW.to_status = 'RUNNING' THEN
+          RAISE EXCEPTION 'controlled AI start failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $$;
+      CREATE TRIGGER test_fail_ai_running_event_trigger
+      BEFORE INSERT ON ai_job_events
+      FOR EACH ROW EXECUTE FUNCTION test_fail_ai_running_event();
+    `);
+    try {
+      await request(app)
+        .post("/api/ai/jobs")
+        .set("host", "ai.localhost")
+        .set("authorization", `Bearer ${tokenA}`)
+        .send(body)
+        .expect(500);
+    } finally {
+      await query("DROP TRIGGER IF EXISTS test_fail_ai_running_event_trigger ON ai_job_events");
+      await query("DROP FUNCTION IF EXISTS test_fail_ai_running_event()");
+    }
+
+    const leakedUsage = await query<{ status: string }>(
+      `SELECT status
+         FROM entitlement_usages
+        WHERE user_id = $1
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1`,
+      [userA]
+    );
+    expect(leakedUsage.rows[0].status).toBe("released");
+    const abandonedJob = await query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM ai_jobs WHERE user_id = $1 AND idempotency_key = $2",
+      [userA, body.idempotencyKey]
+    );
+    expect(abandonedJob.rows[0].count).toBe("0");
+
+    const retry = await request(app)
+      .post("/api/ai/jobs")
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${tokenA}`)
+      .send(body)
+      .expect(201);
+    expect(retry.body).toMatchObject({
+      status: "COMPLETED",
+      report: { summary: "启动故障恢复后分析完成" }
+    });
+    expect(calls).toBe(1);
+  });
+
+  it("turns an invalid provider registry into a released terminal failure", async () => {
+    const invalidRegistry = createAiApp([
+      {
+        key: "duplicate-provider",
+        model: "first",
+        priority: 1,
+        analyze: async () => report("不应调用")
+      },
+      {
+        key: "duplicate-provider",
+        model: "second",
+        priority: 2,
+        analyze: async () => report("不应调用")
+      }
+    ]);
+    const failed = await request(invalidRegistry)
+      .post("/api/ai/jobs")
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${tokenA}`)
+      .send({
+        kind: "severance_analysis",
+        idempotencyKey: "registry-invalid-1",
+        input: { situation: "需要确认异常 provider 配置不会造成永久运行任务或长期占用分析次数。" }
+      })
+      .expect(201);
+    expect(failed.body).toMatchObject({
+      status: "FAILED_FINAL",
+      failureCode: "AI_PROVIDER_CONFIGURATION_ERROR"
+    });
+    const usage = await query<{ status: string }>(
+      "SELECT status FROM entitlement_usages WHERE business_id = $1",
+      [failed.body.id]
+    );
+    expect(usage.rows[0].status).toBe("released");
+
+    const recovered = await request(createAiApp([
+      {
+        key: "recovered-provider",
+        model: "recovered-v1",
+        priority: 1,
+        analyze: async () => report("配置修复后成功")
+      }
+    ]))
+      .post("/api/ai/jobs")
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${tokenA}`)
+      .send({
+        kind: "severance_analysis",
+        idempotencyKey: "registry-recovered-1",
+        input: { situation: "provider 配置修复后使用新的任务幂等键重新发起分析并成功完成。" }
+      })
+      .expect(201);
+    expect(recovered.body.status).toBe("COMPLETED");
+  });
 });
 
 describe("AI analysis idempotency, document metadata and owned history", () => {
+  it("returns a resumable entitlement boundary without running a provider", async () => {
+    let calls = 0;
+    const app = createAiApp([
+      {
+        key: "entitlement-provider",
+        model: "entitlement-v1",
+        priority: 1,
+        analyze: async () => {
+          calls += 1;
+          return report("购买次数后完成文件审查");
+        }
+      }
+    ]);
+    const body = {
+      kind: "document_review",
+      idempotencyKey: "document-entitlement-1",
+      input: { objective: "检查离职协议中的权利放弃、补偿金额、付款期限和违约责任" },
+      uploadIds: [uploadB]
+    };
+    const required = await request(app)
+      .post("/api/ai/jobs")
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${tokenB}`)
+      .send(body)
+      .expect(402);
+    expect(required.body).toMatchObject({
+      error: "AI_ENTITLEMENT_REQUIRED",
+      detail: { sku: "AI_DOCUMENT_REVIEW" }
+    });
+    expect(calls).toBe(0);
+    const abandoned = await query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM ai_jobs WHERE user_id = $1 AND idempotency_key = $2",
+      [userB, body.idempotencyKey]
+    );
+    expect(abandoned.rows[0].count).toBe("0");
+
+    await grant(userB, "AI_DOCUMENT_REVIEW", 1);
+    const resumed = await request(app)
+      .post("/api/ai/jobs")
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${tokenB}`)
+      .send(body)
+      .expect(201);
+    expect(resumed.body).toMatchObject({
+      status: "COMPLETED",
+      report: { summary: "购买次数后完成文件审查" }
+    });
+    expect(calls).toBe(1);
+  });
+
   it("returns the same task for an identical retry and rejects a changed payload", async () => {
     let calls = 0;
     const app = createAiApp([
