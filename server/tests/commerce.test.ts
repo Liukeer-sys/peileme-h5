@@ -221,6 +221,70 @@ const paymentProviderWithResponse = (response: Record<string, unknown>) => ({
   }
 });
 
+const paymentSensitiveSentinels = () => ({
+  authorization: `Authorization-${randomUUID()}`,
+  signature: `Signature-${randomUUID()}`,
+  token: `Token-${randomUUID()}`,
+  secret: `Secret-${randomUUID()}`,
+  privateKey: `PrivateKey-${randomUUID()}`,
+  apiKey: `ApiKey-${randomUUID()}`,
+  payer: `Payer-${randomUUID()}`,
+  openid: `Openid-${randomUUID()}`,
+  buyerIds: `BuyerIds-${randomUUID()}`,
+  phone: `Phone-${randomUUID()}`,
+  email: `Email-${randomUUID()}`,
+  apiV3Key: `ApiV3Key-${randomUUID()}`,
+  password: `Password-${randomUUID()}`,
+  passwd: `Passwd-${randomUUID()}`,
+  pwd: `Pwd-${randomUUID()}`,
+  cookie: `Cookie-${randomUUID()}`,
+  setCookie: `SetCookie-${randomUUID()}`,
+  credential: `Credential-${randomUUID()}`,
+  credentials: `Credentials-${randomUUID()}`,
+  idCard: `IdCard-${randomUUID()}`,
+  identityNumber: `IdentityNumber-${randomUUID()}`,
+  idNumber: `IdNumber-${randomUUID()}`,
+  bankCard: `BankCard-${randomUUID()}`,
+  cardNumber: `CardNumber-${randomUUID()}`,
+  accountNumber: `AccountNumber-${randomUUID()}`,
+  certificate: `Certificate-${randomUUID()}`,
+  privateCertificate: `PrivateCertificate-${randomUUID()}`,
+  sessionKey: `SessionKey-${randomUUID()}`
+});
+
+const paymentSensitiveFields = (
+  sentinels: ReturnType<typeof paymentSensitiveSentinels>
+) => ({
+  authorization: sentinels.authorization,
+  "x-signature": sentinels.signature,
+  access_token: sentinels.token,
+  clientSecret: sentinels.secret,
+  private_key: sentinels.privateKey,
+  apiKey: sentinels.apiKey,
+  payer: sentinels.payer,
+  openid: sentinels.openid,
+  buyer_ids: sentinels.buyerIds,
+  phone_number: sentinels.phone,
+  emailAddress: sentinels.email,
+  "api-v3-key": sentinels.apiV3Key,
+  user_password: sentinels.password,
+  passwd: sentinels.passwd,
+  pwd: sentinels.pwd,
+  cookie: sentinels.cookie,
+  "set-cookie": sentinels.setCookie,
+  credential: sentinels.credential,
+  credentials: sentinels.credentials,
+  id_card: sentinels.idCard,
+  "identity-number": sentinels.identityNumber,
+  idNumber: sentinels.idNumber,
+  bank_card: sentinels.bankCard,
+  "card-number": sentinels.cardNumber,
+  accountNumber: sentinels.accountNumber,
+  certificate: sentinels.certificate,
+  private_certificate: sentinels.privateCertificate,
+  session_key: sentinels.sessionKey
+});
+
 const emptyClosedRecoverySummary = () => ({
   scannedCount: 0,
   recoveredCount: 0,
@@ -2580,19 +2644,7 @@ describe("atomic commerce orders and payments", () => {
         idempotencyKey: `create-evidence-${randomUUID()}`,
         businessDraftId: await insertPolicyDraft(userId)
       });
-      const sentinels = {
-        authorization: `Bearer-${randomUUID()}`,
-        signature: `Signature-${randomUUID()}`,
-        token: `Token-${randomUUID()}`,
-        secret: `Secret-${randomUUID()}`,
-        privateKey: `Private-${randomUUID()}`,
-        apiKey: `Api-${randomUUID()}`,
-        payer: `Payer-${randomUUID()}`,
-        openid: `Openid-${randomUUID()}`,
-        buyerIds: `Buyer-${randomUUID()}`,
-        phone: `Phone-${randomUUID()}`,
-        email: `Email-${randomUUID()}`
-      };
+      const sentinels = paymentSensitiveSentinels();
       await startPayment({
         userId,
         orderId: order.id,
@@ -2602,19 +2654,11 @@ describe("atomic commerce orders and payments", () => {
         notifyUrl: "https://peileme.test/notify",
         provider: paymentProviderWithResponse({
           safe: { code: "CREATE_OK" },
-          authorization: sentinels.authorization,
           nested: {
             publicStatus: "accepted",
-            "x-signature": sentinels.signature,
-            access_token: sentinels.token,
-            clientSecret: sentinels.secret,
-            private_key: sentinels.privateKey,
-            apiKey: sentinels.apiKey,
-            payer: { value: sentinels.payer },
-            openid: sentinels.openid,
-            buyer_ids: [sentinels.buyerIds],
-            phone_number: sentinels.phone,
-            emailAddress: sentinels.email
+            name: "provider-create-audit",
+            key: "create-audit-key",
+            providerDetails: paymentSensitiveFields(sentinels)
           }
         })
       });
@@ -2626,7 +2670,12 @@ describe("atomic commerce orders and payments", () => {
       );
       expect(persisted.rows[0].response_snapshot).toEqual({
         safe: { code: "CREATE_OK" },
-        nested: { publicStatus: "accepted" }
+        nested: {
+          publicStatus: "accepted",
+          name: "provider-create-audit",
+          key: "create-audit-key",
+          providerDetails: {}
+        }
       });
       const serialized = JSON.stringify(
         persisted.rows[0].response_snapshot
@@ -2657,7 +2706,7 @@ describe("atomic commerce orders and payments", () => {
         status: "PENDING"
       });
       const channelTransactionId = `verified-evidence-${randomUUID()}`;
-      const secret = `VERIFIED_SECRET_${randomUUID()}`;
+      const sentinels = paymentSensitiveSentinels();
       await markOrderPaid({
         orderId: order.id,
         paymentAttemptId: attempt.id,
@@ -2671,9 +2720,9 @@ describe("atomic commerce orders and payments", () => {
           raw: {
             safe: { providerState: "paid" },
             nested: {
-              authorization: secret,
-              buyer_ids: [secret],
-              contact: { phone: secret, email: secret }
+              name: "provider-verify-audit",
+              key: "verify-audit-key",
+              providerDetails: paymentSensitiveFields(sentinels)
             }
           }
         }
@@ -2699,12 +2748,17 @@ describe("atomic commerce orders and payments", () => {
         currency: "CNY",
         verified_payload: {
           safe: { providerState: "paid" },
-          nested: { contact: {} }
+          nested: {
+            name: "provider-verify-audit",
+            key: "verify-audit-key",
+            providerDetails: {}
+          }
         }
       });
-      expect(JSON.stringify(persisted.rows[0].verified_payload)).not.toContain(
-        secret
-      );
+      const serialized = JSON.stringify(persisted.rows[0].verified_payload);
+      for (const sentinel of Object.values(sentinels)) {
+        expect(serialized).not.toContain(sentinel);
+      }
     } finally {
       if (userId) await cleanupEntitlementTestUsers([userId]);
     }

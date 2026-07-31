@@ -412,4 +412,98 @@ describe("payment evidence full-content digest", () => {
       }
     );
   });
+
+  it("sanitizes array accessors as stable markers without invoking getters", () => {
+    let getterCalls = 0;
+    const evidence: unknown[] = [];
+    Object.defineProperty(evidence, "0", {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        getterCalls += 1;
+        return "must-not-be-read";
+      }
+    });
+
+    const first = sanitizePaymentEvidence(evidence);
+    const repeated = sanitizePaymentEvidence(evidence);
+
+    expect(first).toEqual(["[Accessor get=true set=false]"]);
+    expect(repeated).toEqual(first);
+    expect(getterCalls).toBe(0);
+  });
+
+  it("hashes proxy arrays without invoking their get trap", () => {
+    let getCalls = 0;
+    const evidence = new Proxy(
+      Array.from({ length: 51 }, (_, index) => index),
+      {
+        get: () => {
+          getCalls += 1;
+          throw new Error("array get trap must not run");
+        }
+      }
+    );
+
+    const first = hashOf(evidence);
+    expect(hashOf(evidence)).toBe(first);
+    expect(getCalls).toBe(0);
+  });
+
+  it("stably truncates proxy arrays whose item descriptors throw", () => {
+    let getCalls = 0;
+    const target = ["safe"];
+    const evidence = new Proxy(target, {
+      get: () => {
+        getCalls += 1;
+        throw new Error("array get trap must not run");
+      },
+      getOwnPropertyDescriptor: (current, key) => {
+        if (key === "length") {
+          return Reflect.getOwnPropertyDescriptor(current, key);
+        }
+        throw new Error("array item descriptor unavailable");
+      }
+    });
+
+    const first = hashOf(evidence);
+    expect(hashOf(evidence)).toBe(first);
+    expect(getCalls).toBe(0);
+  });
+
+  it("stably truncates when an object descriptor fails after Object.keys", () => {
+    let descriptorPhase = 0;
+    const target = { safe: "kept" };
+    const evidence = new Proxy(target, {
+      ownKeys: (current) => {
+        descriptorPhase = 0;
+        return Reflect.ownKeys(current);
+      },
+      getOwnPropertyDescriptor: (current, key) => {
+        descriptorPhase += 1;
+        if (descriptorPhase === 2) {
+          throw new Error("second descriptor unavailable");
+        }
+        return Reflect.getOwnPropertyDescriptor(current, key);
+      }
+    });
+
+    const first = hashOf(evidence);
+    expect(hashOf(evidence)).toBe(first);
+  });
+
+  it("sanitizes ordinary object accessors without invoking getters", () => {
+    let getterCalls = 0;
+    const evidence = { safe: "kept" } as Record<string, unknown>;
+    Object.defineProperty(evidence, "computed", {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        return "must-not-be-read";
+      }
+    });
+
+    expect(sanitizePaymentEvidence(evidence)).toEqual({ safe: "kept" });
+    expect(getterCalls).toBe(0);
+  });
 });

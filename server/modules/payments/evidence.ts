@@ -72,11 +72,41 @@ const MAX_STRING_BYTES = 2_048;
 const MAX_NODES = 1_000;
 const MAX_JSON_BYTES = 32_768;
 
-const sensitiveKeyPattern =
-  /authorization|signature|token|secret|privatekey|apikey|payer|openid|buyerids?|phone|email/;
+const sensitiveKeyRoots = [
+  "authorization",
+  "signature",
+  "token",
+  "secret",
+  "privatekey",
+  "apikey",
+  "payer",
+  "openid",
+  "buyerid",
+  "phone",
+  "email",
+  "apiv3key",
+  "password",
+  "passwd",
+  "pwd",
+  "cookie",
+  "setcookie",
+  "credential",
+  "credentials",
+  "idcard",
+  "identitynumber",
+  "idnumber",
+  "bankcard",
+  "cardnumber",
+  "accountnumber",
+  "certificate",
+  "privatecertificate",
+  "sessionkey"
+] as const;
 
-const isSensitiveKey = (key: string) =>
-  sensitiveKeyPattern.test(key.toLowerCase().replace(/[^a-z0-9]/g, ""));
+const isSensitiveKey = (key: string) => {
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+  return sensitiveKeyRoots.some((root) => normalized.includes(root));
+};
 
 const hashEvidence = (input: unknown) => {
   const hash = createHash("sha256");
@@ -396,13 +426,26 @@ const hashEvidence = (input: unknown) => {
     }
     if (isArray) {
       const arrayValue = value as unknown[];
-      let arrayLength: number;
+      let lengthDescriptor: PropertyDescriptor | undefined;
       try {
-        arrayLength = arrayValue.length;
+        lengthDescriptor = Object.getOwnPropertyDescriptor(
+          arrayValue,
+          "length"
+        );
       } catch {
-        writeToken("unreadable-object", String(objectId));
+        writeToken("array-length-unreadable", String(objectId));
         continue;
       }
+      if (
+        !lengthDescriptor ||
+        !("value" in lengthDescriptor) ||
+        !Number.isInteger(lengthDescriptor.value) ||
+        lengthDescriptor.value < 0
+      ) {
+        writeToken("array-length-invalid", String(objectId));
+        continue;
+      }
+      const arrayLength = lengthDescriptor.value as number;
       writeToken("array-start", `${objectId}:${arrayLength}`);
       tasks.push(
         ownPropertiesTask(value, objectId, "array-extras", arrayLength)
@@ -542,16 +585,53 @@ export const sanitizePaymentEvidence = (input: unknown): unknown => {
     }
     if (isArray) {
       const arrayValue = value as unknown[];
+      let lengthDescriptor: PropertyDescriptor | undefined;
       try {
-        if (arrayValue.length > MAX_ARRAY_ITEMS) {
-          limitExceeded = true;
-          return null;
-        }
-        return arrayValue.map((item) => visit(item, depth + 1));
+        lengthDescriptor = Object.getOwnPropertyDescriptor(
+          arrayValue,
+          "length"
+        );
       } catch {
         limitExceeded = true;
         return "[Unreadable Array]";
       }
+      if (
+        !lengthDescriptor ||
+        !("value" in lengthDescriptor) ||
+        !Number.isInteger(lengthDescriptor.value) ||
+        lengthDescriptor.value < 0
+      ) {
+        limitExceeded = true;
+        return "[Unreadable Array]";
+      }
+      const arrayLength = lengthDescriptor.value as number;
+      if (arrayLength > MAX_ARRAY_ITEMS) {
+        limitExceeded = true;
+        return null;
+      }
+      const sanitizedArray = new Array<unknown>(arrayLength);
+      for (let index = 0; index < arrayLength; index += 1) {
+        let descriptor: PropertyDescriptor | undefined;
+        try {
+          descriptor = Object.getOwnPropertyDescriptor(
+            arrayValue,
+            String(index)
+          );
+        } catch {
+          limitExceeded = true;
+          sanitizedArray[index] = "[Unreadable Array Item]";
+          continue;
+        }
+        if (!descriptor) continue;
+        if ("value" in descriptor) {
+          sanitizedArray[index] = visit(descriptor.value, depth + 1);
+        } else {
+          sanitizedArray[index] =
+            `[Accessor get=${Boolean(descriptor.get)} ` +
+            `set=${Boolean(descriptor.set)}]`;
+        }
+      }
+      return sanitizedArray;
     }
 
     let keys: string[];
@@ -568,7 +648,14 @@ export const sanitizePaymentEvidence = (input: unknown): unknown => {
     const sanitized: Record<string, unknown> = {};
     for (const key of keys) {
       if (isSensitiveKey(key)) continue;
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      let descriptor: PropertyDescriptor | undefined;
+      try {
+        descriptor = Object.getOwnPropertyDescriptor(value, key);
+      } catch {
+        limitExceeded = true;
+        sanitized[key] = "[Unreadable Property]";
+        continue;
+      }
       if (!descriptor || !("value" in descriptor)) continue;
       sanitized[key] = visit(descriptor.value, depth + 1);
     }
