@@ -8,6 +8,17 @@ import { z } from "zod";
 import { ApiError } from "../../errors.js";
 import { isGovernmentHttpsUrl } from "../../lib/official-source.js";
 import {
+  getEffectivePrice,
+  getProductBySku
+} from "../commerce/catalog.js";
+import {
+  consumeEntitlement,
+  releaseEntitlement,
+  reserveEntitlement,
+  type EntitlementReservation
+} from "../commerce/entitlements.js";
+import { CommerceError } from "../commerce/types.js";
+import {
   getRequestIdentity,
   requireAuth,
   requireCapability
@@ -88,8 +99,12 @@ const calculateSchema = z.object({
     .strict()
     .optional()
 });
+const calculateRequestSchema = calculateSchema.extend({
+  businessDraftId: z.string().uuid().optional()
+});
 
 type PolicyCalculate = (input: unknown) => PolicyOutput;
+const policyCalculationSku = "POLICY_CALC";
 
 const policyEngineMessage: Record<string, string> = {
   INVALID_POLICY_INPUT: "政策计算输入无效",
@@ -103,6 +118,60 @@ const policyEngineMessage: Record<string, string> = {
   INVALID_REGIONAL_PARAMETER: "地区参数无效",
   INVALID_ALREADY_PAID: "已支付金额无效",
   COMPUTATION_OVERFLOW: "计算金额超出安全范围"
+};
+
+const getPolicyCalculationPriceFen = async () => {
+  const product = await getProductBySku(policyCalculationSku);
+  const price = product
+    ? await getEffectivePrice(product.id, new Date())
+    : null;
+  if (!product || !price) {
+    throw new ApiError(
+      503,
+      "POLICY_PRICE_UNAVAILABLE",
+      "政策测算价格暂不可用"
+    );
+  }
+  return price.amountFen;
+};
+
+const commerceApiError = (error: CommerceError) => {
+  const errors: Partial<
+    Record<
+      CommerceError["code"],
+      { status: number; message: string }
+    >
+  > = {
+    IDENTITY_VERIFICATION_REQUIRED: {
+      status: 403,
+      message: "完成邮箱或手机验证后才可使用测算权益"
+    },
+    PRODUCT_NOT_FOUND: {
+      status: 503,
+      message: "政策测算商品暂不可用"
+    },
+    PRODUCT_INACTIVE: {
+      status: 503,
+      message: "政策测算商品暂不可用"
+    },
+    BUSINESS_ID_CONFLICT: {
+      status: 409,
+      message: "计算草稿的权益记录冲突"
+    },
+    ENTITLEMENT_USAGE_NOT_FOUND: {
+      status: 409,
+      message: "计算草稿的权益记录不存在"
+    },
+    ENTITLEMENT_USAGE_CLOSED: {
+      status: 409,
+      message: "计算草稿的权益记录已关闭"
+    }
+  };
+  const mapped = errors[error.code] ?? {
+    status: 400,
+    message: "政策测算权益请求无效"
+  };
+  return new ApiError(mapped.status, error.code, mapped.message);
 };
 
 export const createPolicyRouter = (
@@ -130,16 +199,83 @@ export const createPolicyRouter = (
 
   router.post("/calculate", requireAuth, async (request, response, next) => {
     try {
-      const facts = calculateSchema.parse(request.body) as PolicyFacts;
+      const parsed = calculateRequestSchema.parse(request.body);
+      const {
+        businessDraftId,
+        ...validatedFacts
+      } = parsed;
+      const facts = validatedFacts as PolicyFacts;
       const identity = getRequestIdentity(request);
-      const result = await repository.calculateAndPersist({
+      const draft = await repository.ensureCalculationDraft({
+        businessDraftId,
         userId: request.authUser!.id,
         visitorId: identity.visitorId,
         sessionId: identity.sessionId,
-        facts,
-        calculate
+        facts
       });
-      response.status(201).json(result);
+      if (draft.status === "completed") {
+        const replay = await repository.calculateAndPersist({
+          assessmentId: draft.assessmentId,
+          userId: request.authUser!.id,
+          facts,
+          calculate
+        });
+        response.status(201).json(replay);
+        return;
+      }
+
+      let reservation: EntitlementReservation;
+      try {
+        reservation = await reserveEntitlement(
+          request.authUser!.id,
+          policyCalculationSku,
+          draft.assessmentId
+        );
+      } catch (error) {
+        if (
+          error instanceof CommerceError &&
+          error.code === "ENTITLEMENT_NOT_AVAILABLE"
+        ) {
+          response.status(402).json({
+            error: "PAYMENT_REQUIRED",
+            message: "本次完整测算需要按次购买",
+            sku: policyCalculationSku,
+            businessDraftId: draft.assessmentId,
+            priceFen: await getPolicyCalculationPriceFen()
+          });
+          return;
+        }
+        throw error;
+      }
+
+      let consumptionCommitted = reservation.status === "consumed";
+      try {
+        const result = await repository.calculateAndPersist({
+          assessmentId: draft.assessmentId,
+          userId: request.authUser!.id,
+          facts,
+          calculate,
+          beforeComplete: async () => {
+            if (reservation.status === "reserved") {
+              await consumeEntitlement(reservation.usageId);
+              consumptionCommitted = true;
+            }
+          }
+        });
+        response.status(201).json(result);
+      } catch (error) {
+        if (
+          reservation.status === "reserved" &&
+          !consumptionCommitted
+        ) {
+          try {
+            await releaseEntitlement(reservation.usageId);
+          } catch (releaseError) {
+            request.log?.error(releaseError);
+          }
+        }
+        throw error;
+      }
     } catch (error) {
       if (error instanceof PolicyEngineError) {
         next(
@@ -150,6 +286,10 @@ export const createPolicyRouter = (
             error.details
           )
         );
+        return;
+      }
+      if (error instanceof CommerceError) {
+        next(commerceApiError(error));
         return;
       }
       next(error);

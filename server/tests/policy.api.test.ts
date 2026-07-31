@@ -12,6 +12,7 @@ import { createApp } from "../app.js";
 import { getConfig, resetConfigForTests } from "../config.js";
 import { closePool, getPool, query } from "../db.js";
 import { runMigrations } from "../migrate.js";
+import { reserveEntitlement } from "../modules/commerce/entitlements.js";
 import { seedPolicyFoundation } from "../modules/policy/seed.js";
 import { sha256, signAccessToken, type AuthUser } from "../security.js";
 import { importAdministrativeRegions } from "../../scripts/import-administrative-regions.js";
@@ -98,6 +99,8 @@ let adminToken = "";
 let analystToken = "";
 let userToken = "";
 let otherUserToken = "";
+let userId = "";
+let otherUserId = "";
 let passwordHash = "";
 
 beforeAll(async () => {
@@ -187,6 +190,26 @@ beforeEach(async () => {
   analystToken = await tokenFor("policy-analyst@peileme.test");
   userToken = await tokenFor("policy-user@peileme.test");
   otherUserToken = await tokenFor("other-policy-user@peileme.test");
+  userId = users.rows.find(
+    (row) => row.email === "policy-user@peileme.test"
+  )!.id;
+  otherUserId = users.rows.find(
+    (row) => row.email === "other-policy-user@peileme.test"
+  )!.id;
+  await query(
+    `INSERT INTO entitlements(
+       user_id,
+       product_id,
+       source_type,
+       total_uses,
+       remaining_uses,
+       status
+     )
+     SELECT $1, id, 'admin', 100, 100, 'active'
+       FROM products
+      WHERE sku = 'POLICY_CALC'`,
+    [userId]
+  );
 });
 
 afterAll(async () => {
@@ -837,6 +860,38 @@ describe("shared authentication sessions", () => {
 });
 
 describe("versioned policy public API", () => {
+  const createUnfundedDraft = async () => {
+    await query("DELETE FROM entitlements WHERE user_id = $1", [userId]);
+    await query(
+      `UPDATE promotion_rules
+          SET status = 'inactive'
+        WHERE code = 'FIRST_POLICY_CALC'`
+    );
+    const response = await request(createApp())
+      .post("/api/policy/calculate")
+      .set(authHeader(userToken))
+      .send(calculationBody())
+      .expect(402);
+    return response.body.businessDraftId as string;
+  };
+
+  const grantPolicyUses = async (totalUses: number) => {
+    await query(
+      `INSERT INTO entitlements(
+         user_id,
+         product_id,
+         source_type,
+         total_uses,
+         remaining_uses,
+         status
+       )
+       SELECT $1, id, 'admin', $2, $2, 'active'
+         FROM products
+        WHERE sku = 'POLICY_CALC'`,
+      [userId, totalUses]
+    );
+  };
+
   it("lists only the 31 active provinces and 333 active prefectures", async () => {
     const app = createApp();
     const all = await request(app).get("/api/policy/regions").expect(200);
@@ -892,6 +947,520 @@ describe("versioned policy public API", () => {
       .send(calculationBody())
       .expect(401);
     await request(app).get("/api/policy/history").expect(401);
+  });
+
+  it("persists one frozen owned draft and returns its dynamic string price on payment-required retries", async () => {
+    await query("DELETE FROM entitlements WHERE user_id = $1", [userId]);
+    await query(
+      `UPDATE promotion_rules
+          SET status = 'inactive'
+        WHERE code = 'FIRST_POLICY_CALC'`
+    );
+    await query(
+      `UPDATE product_prices
+          SET amount_fen = 1234
+        WHERE product_id = (
+          SELECT id FROM products WHERE sku = 'POLICY_CALC'
+        )
+          AND effective_to IS NULL`
+    );
+    try {
+      const first = await request(createApp())
+        .post("/api/policy/calculate")
+        .set(authHeader(userToken))
+        .send(calculationBody())
+        .expect(402);
+      expect(first.body).toEqual({
+        error: "PAYMENT_REQUIRED",
+        message: "本次完整测算需要按次购买",
+        sku: "POLICY_CALC",
+        businessDraftId: expect.any(String),
+        priceFen: "1234"
+      });
+
+      const draft = await query<{
+        user_id: string;
+        status: string;
+        current_step: string;
+        answers: {
+          policyDraft: {
+            facts: Record<string, unknown>;
+            factsHash: string;
+          };
+        };
+      }>(
+        `SELECT user_id, status, current_step, answers
+           FROM assessments
+          WHERE id = $1`,
+        [first.body.businessDraftId]
+      );
+      expect(draft.rows[0]).toMatchObject({
+        user_id: userId,
+        status: "in_progress",
+        current_step: "awaiting_entitlement",
+        answers: {
+          policyDraft: {
+            facts: {
+              regionCode: "420100",
+              alreadyPaidFen: 100_000
+            },
+            factsHash: expect.stringMatching(/^[a-f0-9]{64}$/)
+          }
+        }
+      });
+      expect(draft.rows[0].answers.policyDraft.facts).not.toHaveProperty(
+        "clientResult"
+      );
+      expect(draft.rows[0].answers.policyDraft.facts).not.toHaveProperty(
+        "businessDraftId"
+      );
+
+      const retry = await request(createApp())
+        .post("/api/policy/calculate")
+        .set(authHeader(userToken))
+        .send(
+          calculationBody({
+            businessDraftId: first.body.businessDraftId
+          })
+        )
+        .expect(402);
+      expect(retry.body).toEqual(first.body);
+
+      const drafts = await query<{ count: string }>(
+        `SELECT count(*)::text AS count
+           FROM assessments
+          WHERE user_id = $1
+            AND status = 'in_progress'`,
+        [userId]
+      );
+      expect(drafts.rows[0].count).toBe("1");
+      const history = await request(createApp())
+        .get("/api/policy/history")
+        .set(authHeader(userToken))
+        .expect(200);
+      expect(history.body.items).toEqual([]);
+      expect(history.body.pagination.total).toBe(0);
+    } finally {
+      await query(
+        `UPDATE promotion_rules
+            SET status = 'active'
+          WHERE code = 'FIRST_POLICY_CALC'`
+      );
+      await query(
+        `UPDATE product_prices
+            SET amount_fen = 990
+          WHERE product_id = (
+            SELECT id FROM products WHERE sku = 'POLICY_CALC'
+          )
+            AND effective_to IS NULL`
+      );
+    }
+  });
+
+  it("rejects changed facts and hides another user's policy draft", async () => {
+    await query("DELETE FROM entitlements WHERE user_id = $1", [userId]);
+    await query(
+      `UPDATE promotion_rules
+          SET status = 'inactive'
+        WHERE code = 'FIRST_POLICY_CALC'`
+    );
+    try {
+      const first = await request(createApp())
+        .post("/api/policy/calculate")
+        .set(authHeader(userToken))
+        .send(calculationBody())
+        .expect(402);
+      const businessDraftId = first.body.businessDraftId as string;
+
+      await request(createApp())
+        .post("/api/policy/calculate")
+        .set(authHeader(userToken))
+        .send(
+          calculationBody({
+            businessDraftId,
+            alreadyPaidFen: 200_000
+          })
+        )
+        .expect(409)
+        .expect({
+          error: "POLICY_DRAFT_FACTS_MISMATCH",
+          message: "该计算草稿的事实输入已冻结"
+        });
+
+      await request(createApp())
+        .post("/api/policy/calculate")
+        .set(authHeader(otherUserToken))
+        .send(calculationBody({ businessDraftId }))
+        .expect(404)
+        .expect({
+          error: "POLICY_DRAFT_NOT_FOUND",
+          message: "计算草稿不存在"
+        });
+
+      await request(createApp())
+        .post("/api/policy/calculate")
+        .set(authHeader(userToken))
+        .send(
+          calculationBody({
+            businessDraftId: "00000000-0000-4000-8000-000000000001"
+          })
+        )
+        .expect(404)
+        .expect({
+          error: "POLICY_DRAFT_NOT_FOUND",
+          message: "计算草稿不存在"
+        });
+    } finally {
+      await query(
+        `UPDATE promotion_rules
+            SET status = 'active'
+          WHERE code = 'FIRST_POLICY_CALC'`
+      );
+    }
+  });
+
+  it("consumes once, completes history, and replays the same completed draft", async () => {
+    const first = await request(createApp())
+      .post("/api/policy/calculate")
+      .set(authHeader(userToken))
+      .send(calculationBody())
+      .expect(201);
+    const replay = await request(createApp())
+      .post("/api/policy/calculate")
+      .set(authHeader(userToken))
+      .send(
+        calculationBody({
+          businessDraftId: first.body.assessmentId
+        })
+      )
+      .expect(201);
+    expect(replay.body).toEqual(first.body);
+
+    const state = await query<{
+      remaining_uses: number;
+      usages: string;
+      snapshots: string;
+      draft_status: string;
+    }>(
+      `SELECT
+         e.remaining_uses,
+         (
+           SELECT count(*)::text
+             FROM entitlement_usages eu
+            WHERE eu.business_type = 'commerce'
+              AND eu.business_id = $2
+         ) AS usages,
+         (
+           SELECT count(*)::text
+             FROM policy_calculation_snapshots pcs
+            WHERE pcs.assessment_id = $2
+         ) AS snapshots,
+         (
+           SELECT status
+             FROM assessments
+            WHERE id = $2
+         ) AS draft_status
+       FROM entitlements e
+       JOIN products p ON p.id = e.product_id
+       WHERE e.user_id = $1
+         AND p.sku = 'POLICY_CALC'
+         AND e.source_type = 'admin'`,
+      [userId, first.body.assessmentId]
+    );
+    expect(state.rows[0]).toEqual({
+      remaining_uses: 99,
+      usages: "1",
+      snapshots: "1",
+      draft_status: "completed"
+    });
+    const history = await request(createApp())
+      .get("/api/policy/history")
+      .set(authHeader(userToken))
+      .expect(200);
+    expect(history.body.items).toHaveLength(1);
+    expect(history.body.items[0].id).toBe(first.body.assessmentId);
+  });
+
+  it("serializes concurrent execution of one draft into one charge and one snapshot", async () => {
+    const businessDraftId = await createUnfundedDraft();
+    await grantPolicyUses(1);
+    try {
+      const [left, right] = await Promise.all([
+        request(createApp())
+          .post("/api/policy/calculate")
+          .set(authHeader(userToken))
+          .send(calculationBody({ businessDraftId })),
+        request(createApp())
+          .post("/api/policy/calculate")
+          .set(authHeader(userToken))
+          .send(calculationBody({ businessDraftId }))
+      ]);
+      expect(left.status).toBe(201);
+      expect(right.status).toBe(201);
+      expect(right.body).toEqual(left.body);
+
+      const state = await query<{
+        remaining_uses: number;
+        usages: string;
+        snapshots: string;
+      }>(
+        `SELECT
+           e.remaining_uses,
+           (
+             SELECT count(*)::text
+               FROM entitlement_usages eu
+              WHERE eu.business_type = 'commerce'
+                AND eu.business_id = $2
+           ) AS usages,
+           (
+             SELECT count(*)::text
+               FROM policy_calculation_snapshots pcs
+              WHERE pcs.assessment_id = $2
+           ) AS snapshots
+         FROM entitlements e
+         WHERE e.user_id = $1
+           AND e.source_type = 'admin'`,
+        [userId, businessDraftId]
+      );
+      expect(state.rows[0]).toEqual({
+        remaining_uses: 0,
+        usages: "1",
+        snapshots: "1"
+      });
+    } finally {
+      await query(
+        `UPDATE promotion_rules
+            SET status = 'active'
+          WHERE code = 'FIRST_POLICY_CALC'`
+      );
+    }
+  });
+
+  it("recovers an already-reserved draft through the public retry entrypoint", async () => {
+    const businessDraftId = await createUnfundedDraft();
+    await grantPolicyUses(1);
+    try {
+      const strandedReservation = await reserveEntitlement(
+        userId,
+        "POLICY_CALC",
+        businessDraftId
+      );
+      expect(strandedReservation.status).toBe("reserved");
+
+      const recovered = await request(createApp())
+        .post("/api/policy/calculate")
+        .set(authHeader(userToken))
+        .send(calculationBody({ businessDraftId }))
+        .expect(201);
+      expect(recovered.body.assessmentId).toBe(businessDraftId);
+
+      const state = await query<{
+        remaining_uses: number;
+        usage_status: string;
+        snapshots: string;
+      }>(
+        `SELECT
+           e.remaining_uses,
+           eu.status AS usage_status,
+           (
+             SELECT count(*)::text
+               FROM policy_calculation_snapshots pcs
+              WHERE pcs.assessment_id = $2
+           ) AS snapshots
+         FROM entitlement_usages eu
+         JOIN entitlements e ON e.id = eu.entitlement_id
+         WHERE eu.id = $1`,
+        [strandedReservation.usageId, businessDraftId]
+      );
+      expect(state.rows[0]).toEqual({
+        remaining_uses: 0,
+        usage_status: "consumed",
+        snapshots: "1"
+      });
+    } finally {
+      await query(
+        `UPDATE promotion_rules
+            SET status = 'active'
+          WHERE code = 'FIRST_POLICY_CALC'`
+      );
+    }
+  });
+
+  it("releases a reservation after engine failure and reuses the same draft safely", async () => {
+    const businessDraftId = await createUnfundedDraft();
+    await grantPolicyUses(100);
+    try {
+      const failed = await request(
+        createApp({
+          policyCalculate: () => {
+            throw new Error("recoverable policy failure");
+          }
+        })
+      )
+        .post("/api/policy/calculate")
+        .set(authHeader(userToken))
+        .send(calculationBody({ businessDraftId }))
+        .expect(500);
+      expect(failed.body.error).toBe("INTERNAL_ERROR");
+
+      const released = await query<{
+        usage_id: string;
+        usage_status: string;
+        remaining_uses: number;
+        draft_status: string;
+      }>(
+        `SELECT
+           eu.id AS usage_id,
+           eu.status AS usage_status,
+           e.remaining_uses,
+           a.status AS draft_status
+         FROM assessments a
+         JOIN entitlement_usages eu
+           ON eu.business_type = 'commerce'
+          AND eu.business_id = a.id
+         JOIN entitlements e ON e.id = eu.entitlement_id
+         WHERE a.id = $1`,
+        [businessDraftId]
+      );
+      expect(released.rows[0]).toMatchObject({
+        usage_status: "released",
+        remaining_uses: 100,
+        draft_status: "in_progress"
+      });
+
+      const recovered = await request(createApp())
+        .post("/api/policy/calculate")
+        .set(authHeader(userToken))
+        .send(calculationBody({ businessDraftId }))
+        .expect(201);
+      expect(recovered.body.assessmentId).toBe(businessDraftId);
+      const completed = await query<{
+        usage_id: string;
+        usage_status: string;
+        remaining_uses: number;
+      }>(
+        `SELECT
+           eu.id AS usage_id,
+           eu.status AS usage_status,
+           e.remaining_uses
+         FROM entitlement_usages eu
+         JOIN entitlements e ON e.id = eu.entitlement_id
+         WHERE eu.business_type = 'commerce'
+           AND eu.business_id = $1`,
+        [businessDraftId]
+      );
+      expect(completed.rows[0]).toEqual({
+        usage_id: released.rows[0].usage_id,
+        usage_status: "consumed",
+        remaining_uses: 99
+      });
+    } finally {
+      await query(
+        `UPDATE promotion_rules
+            SET status = 'active'
+          WHERE code = 'FIRST_POLICY_CALC'`
+      );
+    }
+  });
+
+  it("recovers completion after consume commits without charging the draft twice", async () => {
+    const businessDraftId = await createUnfundedDraft();
+    await grantPolicyUses(100);
+    await query(`
+      CREATE FUNCTION fail_policy_completion_for_task3b()
+      RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        RAISE EXCEPTION 'forced policy completion failure';
+      END;
+      $$;
+      CREATE TRIGGER fail_policy_completion_for_task3b_trigger
+      BEFORE INSERT ON policy_calculation_snapshots
+      FOR EACH ROW EXECUTE FUNCTION fail_policy_completion_for_task3b()
+    `);
+    try {
+      await request(createApp())
+        .post("/api/policy/calculate")
+        .set(authHeader(userToken))
+        .send(calculationBody({ businessDraftId }))
+        .expect(500);
+
+      const interrupted = await query<{
+        remaining_uses: number;
+        usage_status: string;
+        draft_status: string;
+        snapshots: string;
+      }>(
+        `SELECT
+           e.remaining_uses,
+           eu.status AS usage_status,
+           a.status AS draft_status,
+           (
+             SELECT count(*)::text
+               FROM policy_calculation_snapshots pcs
+              WHERE pcs.assessment_id = a.id
+           ) AS snapshots
+         FROM assessments a
+         JOIN entitlement_usages eu
+           ON eu.business_type = 'commerce'
+          AND eu.business_id = a.id
+         JOIN entitlements e ON e.id = eu.entitlement_id
+         WHERE a.id = $1`,
+        [businessDraftId]
+      );
+      expect(interrupted.rows[0]).toEqual({
+        remaining_uses: 99,
+        usage_status: "consumed",
+        draft_status: "in_progress",
+        snapshots: "0"
+      });
+    } finally {
+      await query(`
+        DROP TRIGGER IF EXISTS fail_policy_completion_for_task3b_trigger
+          ON policy_calculation_snapshots;
+        DROP FUNCTION IF EXISTS fail_policy_completion_for_task3b()
+      `);
+      await query(
+        `UPDATE promotion_rules
+            SET status = 'active'
+          WHERE code = 'FIRST_POLICY_CALC'`
+      );
+    }
+
+    const recovered = await request(createApp())
+      .post("/api/policy/calculate")
+      .set(authHeader(userToken))
+      .send(calculationBody({ businessDraftId }))
+      .expect(201);
+    expect(recovered.body.assessmentId).toBe(businessDraftId);
+    const finalState = await query<{
+      remaining_uses: number;
+      usages: string;
+      snapshots: string;
+    }>(
+      `SELECT
+         e.remaining_uses,
+         (
+           SELECT count(*)::text
+             FROM entitlement_usages eu2
+            WHERE eu2.business_type = 'commerce'
+              AND eu2.business_id = $2
+         ) AS usages,
+         (
+           SELECT count(*)::text
+             FROM policy_calculation_snapshots pcs
+            WHERE pcs.assessment_id = $2
+         ) AS snapshots
+       FROM entitlements e
+       JOIN entitlement_usages eu ON eu.entitlement_id = e.id
+       WHERE e.user_id = $1
+         AND eu.business_id = $2`,
+      [userId, businessDraftId]
+    );
+    expect(finalState.rows[0]).toEqual({
+      remaining_uses: 99,
+      usages: "1",
+      snapshots: "1"
+    });
   });
 
   it.each([
@@ -1474,9 +2043,9 @@ describe("versioned policy public API", () => {
            JOIN users u ON u.id = a.user_id
           WHERE u.email = 'policy-user@peileme.test'`
       );
-      expect(Number(after.rows[0].count) - Number(before.rows[0].count)).toBe(
-        calculation.status === 201 ? 1 : 0
-      );
+      expect(
+        Number(after.rows[0].count) - Number(before.rows[0].count)
+      ).toBe(1);
     } finally {
       if (transactionOpen) await retireClient.query("ROLLBACK");
       retireClient.release();
@@ -1549,7 +2118,7 @@ describe("versioned policy public API", () => {
     expect(sentinel.body).not.toHaveProperty("stack");
   });
 
-  it("rolls back the assessment when snapshot persistence fails", async () => {
+  it("keeps a recoverable hidden draft when snapshot persistence fails", async () => {
     const before = await query<{ count: string }>(
       "SELECT count(*)::text AS count FROM assessments"
     );
@@ -1577,10 +2146,30 @@ describe("versioned policy public API", () => {
         DROP FUNCTION IF EXISTS fail_policy_snapshot_for_test()
       `);
     }
-    const after = await query<{ count: string }>(
-      "SELECT count(*)::text AS count FROM assessments"
+    const after = await query<{
+      count: string;
+      in_progress: string;
+      snapshots: string;
+    }>(
+      `SELECT
+         count(*)::text AS count,
+         count(*) FILTER (WHERE status = 'in_progress')::text AS in_progress,
+         (
+           SELECT count(*)::text
+             FROM policy_calculation_snapshots
+         ) AS snapshots
+       FROM assessments`
     );
-    expect(after.rows[0].count).toBe(before.rows[0].count);
+    expect(Number(after.rows[0].count)).toBe(
+      Number(before.rows[0].count) + 1
+    );
+    expect(after.rows[0].in_progress).toBe("1");
+    expect(after.rows[0].snapshots).toBe("0");
+    const history = await request(createApp())
+      .get("/api/policy/history")
+      .set(authHeader(userToken))
+      .expect(200);
+    expect(history.body.items).toEqual([]);
   });
 
   it("keeps full parameter provenance immutable in owner-only history", async () => {

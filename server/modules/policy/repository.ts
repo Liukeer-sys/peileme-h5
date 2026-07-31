@@ -298,6 +298,11 @@ export type CalculationResult = {
   result: PolicyOutput;
 };
 
+export type PolicyCalculationDraft = {
+  assessmentId: string;
+  status: "in_progress" | "completed";
+};
+
 type PolicyCalculator = (
   input: unknown,
   rules?: EnginePolicyRules
@@ -314,6 +319,42 @@ const stableJson = (value: unknown): string => {
       .join(",")}}`;
   }
   return JSON.stringify(value);
+};
+
+type PolicyDraftAnswers = {
+  policyDraft?: {
+    facts?: unknown;
+    factsHash?: unknown;
+  };
+};
+
+const normalizePolicyFacts = (facts: PolicyFacts): PolicyFacts =>
+  JSON.parse(JSON.stringify(facts)) as PolicyFacts;
+
+const policyFactsHash = (facts: PolicyFacts) =>
+  crypto
+    .createHash("sha256")
+    .update(stableJson(facts))
+    .digest("hex");
+
+const assertFrozenPolicyFacts = (
+  answers: PolicyDraftAnswers,
+  facts: PolicyFacts
+) => {
+  const frozenFacts = answers.policyDraft?.facts;
+  const frozenHash = answers.policyDraft?.factsHash;
+  const requestedHash = policyFactsHash(facts);
+  if (
+    typeof frozenHash !== "string" ||
+    frozenHash !== requestedHash ||
+    stableJson(frozenFacts) !== stableJson(facts)
+  ) {
+    throw new ApiError(
+      409,
+      "POLICY_DRAFT_FACTS_MISMATCH",
+      "该计算草稿的事实输入已冻结"
+    );
+  }
 };
 
 const normalizeHistoryInput = (input: unknown) => {
@@ -474,20 +515,168 @@ export class PolicyRepository {
     });
   }
 
-  async calculateAndPersist({
+  async ensureCalculationDraft({
+    businessDraftId,
     userId,
     visitorId,
     sessionId,
-    facts,
-    calculate
+    facts
   }: {
+    businessDraftId?: string;
     userId: string;
     visitorId: string;
     sessionId: string;
     facts: PolicyFacts;
-    calculate: PolicyCalculator;
-  }): Promise<CalculationResult> {
+  }): Promise<PolicyCalculationDraft> {
+    const normalizedFacts = normalizePolicyFacts(facts);
+    const factsHash = policyFactsHash(normalizedFacts);
     return withTransaction(async (client) => {
+      if (businessDraftId) {
+        const existing = await client.query<{
+          id: string;
+          user_id: string | null;
+          status: "in_progress" | "completed" | "abandoned";
+          answers: PolicyDraftAnswers;
+        }>(
+          `SELECT id, user_id, status, answers
+             FROM assessments
+            WHERE id = $1
+              AND product_channel = 'main'
+            FOR UPDATE`,
+          [businessDraftId]
+        );
+        const draft = existing.rows[0];
+        if (
+          !draft ||
+          draft.user_id !== userId ||
+          draft.status === "abandoned"
+        ) {
+          throw new ApiError(
+            404,
+            "POLICY_DRAFT_NOT_FOUND",
+            "计算草稿不存在"
+          );
+        }
+        assertFrozenPolicyFacts(draft.answers, normalizedFacts);
+        return {
+          assessmentId: draft.id,
+          status: draft.status
+        };
+      }
+
+      const inserted = await client.query<{ id: string }>(
+        `INSERT INTO assessments(
+           user_id,
+           visitor_id,
+           session_id,
+           status,
+           current_step,
+           answers,
+           product_channel
+         )
+         VALUES (
+           $1,
+           $2,
+           $3,
+           'in_progress',
+           'awaiting_entitlement',
+           $4::jsonb,
+           'main'
+         )
+         RETURNING id`,
+        [
+          userId,
+          visitorId,
+          sessionId,
+          JSON.stringify({
+            policyDraft: {
+              facts: normalizedFacts,
+              factsHash
+            }
+          })
+        ]
+      );
+      return {
+        assessmentId: inserted.rows[0].id,
+        status: "in_progress"
+      };
+    });
+  }
+
+  async calculateAndPersist({
+    assessmentId,
+    userId,
+    facts,
+    calculate,
+    beforeComplete
+  }: {
+    assessmentId: string;
+    userId: string;
+    facts: PolicyFacts;
+    calculate: PolicyCalculator;
+    beforeComplete?: () => Promise<void>;
+  }): Promise<CalculationResult> {
+    const normalizedFacts = normalizePolicyFacts(facts);
+    return withTransaction(async (client) => {
+      const draftResult = await client.query<{
+        id: string;
+        user_id: string | null;
+        status: "in_progress" | "completed" | "abandoned";
+        answers: PolicyDraftAnswers;
+      }>(
+        `SELECT id, user_id, status, answers
+           FROM assessments
+          WHERE id = $1
+            AND product_channel = 'main'
+          FOR UPDATE`,
+        [assessmentId]
+      );
+      const draft = draftResult.rows[0];
+      if (
+        !draft ||
+        draft.user_id !== userId ||
+        draft.status === "abandoned"
+      ) {
+        throw new ApiError(
+          404,
+          "POLICY_DRAFT_NOT_FOUND",
+          "计算草稿不存在"
+        );
+      }
+      assertFrozenPolicyFacts(draft.answers, normalizedFacts);
+      if (draft.status === "completed") {
+        const completed = await client.query<{
+          accuracy_level: CalculationResult["accuracy"];
+          version: number;
+          output: PolicyOutput;
+          parameter_provenance: CalculationResult["parameters"];
+        }>(
+          `SELECT
+             a.accuracy_level,
+             prv.version,
+             pcs.output,
+             pcs.parameter_provenance
+           FROM assessments a
+           JOIN policy_calculation_snapshots pcs
+             ON pcs.assessment_id = a.id
+           JOIN policy_rule_versions prv
+             ON prv.id = pcs.rule_version_id
+           WHERE a.id = $1`,
+          [assessmentId]
+        );
+        const snapshot = completed.rows[0];
+        if (!snapshot) {
+          throw new Error("Completed policy draft is missing its snapshot");
+        }
+        return {
+          assessmentId,
+          ruleVersion: snapshot.version,
+          accuracy: snapshot.accuracy_level,
+          parameters: snapshot.parameter_provenance,
+          result: snapshot.output
+        };
+      }
+
       const discovery = await client.query<{
         code: string;
         name: string;
@@ -497,7 +686,7 @@ export class PolicyRepository {
         `SELECT code, name, level, parent_code
            FROM administrative_regions
           WHERE code = $1`,
-        [facts.regionCode]
+        [normalizedFacts.regionCode]
       );
       const discoveredRegion = discovery.rows[0];
       if (!discoveredRegion) {
@@ -571,7 +760,7 @@ export class PolicyRepository {
           ORDER BY prv.version DESC
           LIMIT 1
           FOR SHARE OF prv`,
-        [facts.endDate]
+        [normalizedFacts.endDate]
       );
       const version = versionResult.rows[0];
       if (!version) {
@@ -592,7 +781,7 @@ export class PolicyRepository {
         );
       }
 
-      const endYear = Number(facts.endDate.slice(0, 4));
+      const endYear = Number(normalizedFacts.endDate.slice(0, 4));
       const selectParameter = async (
         regionCode: string,
         parameterType: ParameterType,
@@ -640,13 +829,13 @@ export class PolicyRepository {
       const missing: string[] = [];
       if (
         !minimum &&
-        facts.manualParameters?.minimumMonthlyWageFen === undefined
+        normalizedFacts.manualParameters?.minimumMonthlyWageFen === undefined
       ) {
         missing.push("minimumMonthlyWageFen");
       }
       if (
         !average &&
-        facts.manualParameters?.employeeAverageMonthlyWageFen === undefined
+        normalizedFacts.manualParameters?.employeeAverageMonthlyWageFen === undefined
       ) {
         missing.push("employeeAverageMonthlyWageFen");
       }
@@ -701,13 +890,13 @@ export class PolicyRepository {
         ? databaseProvenance(minimum, minimumFallback)
         : manualProvenance(
             "minimum_monthly_wage",
-            facts.manualParameters!.minimumMonthlyWageFen!
+            normalizedFacts.manualParameters!.minimumMonthlyWageFen!
           );
       const averageProvenance = average
         ? databaseProvenance(average, false)
         : manualProvenance(
             "employee_average_monthly_wage",
-            facts.manualParameters!.employeeAverageMonthlyWageFen!
+            normalizedFacts.manualParameters!.employeeAverageMonthlyWageFen!
           );
       const parameters = {
         minimumMonthlyWage: minimumProvenance,
@@ -729,14 +918,14 @@ export class PolicyRepository {
       const canonicalInput: PolicyInput = {
         regionCode: region.code,
         regionName: region.name,
-        startDate: facts.startDate,
-        endDate: facts.endDate,
-        terminationScenario: facts.terminationScenario,
-        monthlyEarnedWagesFen: facts.monthlyEarnedWagesFen,
-        wageDataConfirmation: facts.wageDataConfirmation,
+        startDate: normalizedFacts.startDate,
+        endDate: normalizedFacts.endDate,
+        terminationScenario: normalizedFacts.terminationScenario,
+        monthlyEarnedWagesFen: normalizedFacts.monthlyEarnedWagesFen,
+        wageDataConfirmation: normalizedFacts.wageDataConfirmation,
         minimumMonthlyWageFen: minimumProvenance.amountFen,
         employeeAverageMonthlyWageFen: averageProvenance.amountFen,
-        alreadyPaidFen: facts.alreadyPaidFen ?? 0
+        alreadyPaidFen: normalizedFacts.alreadyPaidFen ?? 0
       };
       const output = calculate(
         canonicalInput,
@@ -745,30 +934,33 @@ export class PolicyRepository {
       const parameterIds = provenanceValues.flatMap((item) =>
         item.source === "database" ? [item.parameterId] : []
       );
-      const assessment = await client.query<{ id: string }>(
-        `INSERT INTO assessments(
-           user_id, visitor_id, session_id, status, current_step,
-           answers, result, completed_at, product_channel, accuracy_level,
-           rule_version_id, input_snapshot, result_snapshot
-         )
-         VALUES (
-           $1, $2, $3, 'completed', 'result',
-           $4::jsonb, $5::jsonb, now(), 'main', $6, $7,
-           $8::jsonb, $5::jsonb
-         )
-         RETURNING id`,
+      await beforeComplete?.();
+      await client.query(
+        `UPDATE assessments
+            SET status = 'completed',
+                current_step = 'result',
+                answers = answers || jsonb_build_object(
+                  'parameterProvenance',
+                  $2::jsonb
+                ),
+                result = $3::jsonb,
+                completed_at = now(),
+                accuracy_level = $4,
+                rule_version_id = $5,
+                input_snapshot = $6::jsonb,
+                result_snapshot = $3::jsonb,
+                updated_at = now()
+          WHERE id = $1
+            AND status = 'in_progress'`,
         [
-          userId,
-          visitorId,
-          sessionId,
-          JSON.stringify({ parameterProvenance: parameters }),
+          assessmentId,
+          JSON.stringify(parameters),
           JSON.stringify(output),
           accuracy,
           version.id,
           JSON.stringify(canonicalInput)
         ]
       );
-      const assessmentId = assessment.rows[0].id;
       const inputHash = crypto
         .createHash("sha256")
         .update(stableJson(canonicalInput))
