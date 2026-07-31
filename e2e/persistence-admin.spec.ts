@@ -3,7 +3,10 @@ import { expect, test } from "@playwright/test";
 const aiBaseUrl = process.env.E2E_AI_BASE_URL?.trim().replace(/\/$/, "");
 const userEmail = process.env.E2E_USER_EMAIL;
 const userPassword = process.env.E2E_USER_PASSWORD;
-const userButtonName = process.env.E2E_USER_BUTTON_NAME || "生产走查";
+const userButtonName =
+  process.env.E2E_AI_USER_BUTTON_NAME ||
+  process.env.E2E_USER_BUTTON_NAME ||
+  "生产走查";
 const adminEmail = process.env.E2E_ADMIN_EMAIL || "admin@peileme.art";
 const adminPassword = process.env.E2E_ADMIN_PASSWORD;
 const expectNotifierConfigured =

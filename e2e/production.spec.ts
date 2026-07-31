@@ -3,7 +3,10 @@ import { expect, test, type Page } from "@playwright/test";
 const baseUrl = process.env.E2E_BASE_URL;
 const userEmail = process.env.E2E_USER_EMAIL;
 const userPassword = process.env.E2E_USER_PASSWORD;
-const userButtonName = process.env.E2E_USER_BUTTON_NAME || "核心验收";
+const userButtonName =
+  process.env.E2E_MAIN_USER_BUTTON_NAME ||
+  process.env.E2E_USER_BUTTON_NAME ||
+  "核心验收";
 
 const sendInput = async (page: Page, label: string, value: string) => {
   await page.getByLabel(label).fill(value);

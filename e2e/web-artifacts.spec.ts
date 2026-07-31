@@ -13,6 +13,8 @@ const mainBaseUrl = requiredUrl("E2E_MAIN_ARTIFACT_URL");
 const aiBaseUrl = requiredUrl("E2E_AI_ARTIFACT_URL");
 const adminEmail = requiredValue("E2E_ADMIN_EMAIL");
 const adminPassword = requiredValue("E2E_ADMIN_PASSWORD");
+const userEmail = process.env.E2E_USER_EMAIL?.trim();
+const userPassword = process.env.E2E_USER_PASSWORD;
 
 const securityHeaders = [
   "content-security-policy",
@@ -211,26 +213,34 @@ test.describe("separate main and AI web artifacts", () => {
   test("a refresh session created on main is accepted by the AI site", async ({
     page
   }) => {
-    const target = `dual-artifact-${Date.now()}@peileme.test`;
     const origin = new URL(mainBaseUrl).origin;
-    const sent = await page.request.post(`${mainBaseUrl}/api/auth/send-code`, {
-      headers: { Origin: origin },
-      data: { target, purpose: "register" }
-    });
-    expect(sent.status()).toBe(201);
-    const { debugCode } = (await sent.json()) as { debugCode?: string };
-    expect(debugCode).toMatch(/^\d{6}$/);
+    if (userEmail && userPassword) {
+      const loggedIn = await page.request.post(`${mainBaseUrl}/api/auth/login`, {
+        headers: { Origin: origin },
+        data: { identifier: userEmail, password: userPassword }
+      });
+      expect(loggedIn.status()).toBe(200);
+    } else {
+      const target = `dual-artifact-${Date.now()}@peileme.test`;
+      const sent = await page.request.post(`${mainBaseUrl}/api/auth/send-code`, {
+        headers: { Origin: origin },
+        data: { target, purpose: "register" }
+      });
+      expect(sent.status()).toBe(201);
+      const { debugCode } = (await sent.json()) as { debugCode?: string };
+      expect(debugCode).toMatch(/^\d{6}$/);
 
-    const registered = await page.request.post(`${mainBaseUrl}/api/auth/register`, {
-      headers: { Origin: origin },
-      data: {
-        target,
-        code: debugCode,
-        password: "DualArtifact123",
-        displayName: "双站验收用户"
-      }
-    });
-    expect(registered.status()).toBe(201);
+      const registered = await page.request.post(`${mainBaseUrl}/api/auth/register`, {
+        headers: { Origin: origin },
+        data: {
+          target,
+          code: debugCode,
+          password: "DualArtifact123",
+          displayName: "双站验收用户"
+        }
+      });
+      expect(registered.status()).toBe(201);
+    }
 
     const meResponse = page.waitForResponse(
       (response) =>

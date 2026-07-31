@@ -5,6 +5,8 @@ const userEmail = process.env.E2E_USER_EMAIL;
 const userPassword = process.env.E2E_USER_PASSWORD;
 const adminEmail = process.env.E2E_ADMIN_EMAIL;
 const adminPassword = process.env.E2E_ADMIN_PASSWORD;
+const skipAccountSetup = process.env.E2E_SKIP_ACCOUNT_SETUP === "true";
+const skipProfileMutation = process.env.E2E_SKIP_PROFILE_MUTATION === "true";
 const noEntitlementPassword = "NoEntitlementE2e123";
 const noEntitlementEmail = `ai-no-entitlement-${Date.now()}@peileme.test`;
 
@@ -53,6 +55,7 @@ test.describe.configure({ mode: "serial", timeout: 120_000 });
 
 test.beforeAll(async () => {
   requiredEnvironment();
+  if (skipAccountSetup) return;
   const context = await playwrightRequest.newContext({
     baseURL: aiBaseUrl,
     extraHTTPHeaders: { origin: new URL(aiBaseUrl!).origin }
@@ -143,7 +146,9 @@ test("真实用户完成 AI 分析、PDF 审查、历史、下载、资料与邀
   await expect(page.getByRole("heading", { name: "分析报告" })).toBeVisible();
 
   await page.locator(".ai-top-actions button").click();
-  const account = page.getByRole("dialog", { name: /赔了么 AI 用户|核心验收/ });
+  const account = page.getByRole("dialog").filter({
+    has: page.locator("#ai-document-upload-input")
+  });
   const uploadInput = account.getByLabel("上传劳动文件");
   await uploadInput.setInputFiles({
     name: "unsupported-e2e.txt",
@@ -213,13 +218,15 @@ test("真实用户完成 AI 分析、PDF 审查、历史、下载、资料与邀
   const profileSection = account.locator(".account-panel-section").filter({
     hasText: "个人资料"
   });
-  const profileInput = profileSection.getByPlaceholder("设置你的称呼");
-  await profileInput.fill("核心验收改名");
-  await profileSection.getByRole("button", { name: "保存" }).click();
-  await expect(account.getByRole("status").last()).toContainText("称呼已更新");
-  await profileInput.fill("核心验收用户");
-  await profileSection.getByRole("button", { name: "保存" }).click();
-  await expect(account.getByRole("status").last()).toContainText("称呼已更新");
+  if (!skipProfileMutation) {
+    const profileInput = profileSection.getByPlaceholder("设置你的称呼");
+    await profileInput.fill("核心验收改名");
+    await profileSection.getByRole("button", { name: "保存" }).click();
+    await expect(account.getByRole("status").last()).toContainText("称呼已更新");
+    await profileInput.fill("核心验收用户");
+    await profileSection.getByRole("button", { name: "保存" }).click();
+    await expect(account.getByRole("status").last()).toContainText("称呼已更新");
+  }
 
   const inviteSection = account.locator(".account-panel-section").filter({
     hasText: "邀请码兑换"
@@ -242,6 +249,7 @@ test("真实用户完成 AI 分析、PDF 审查、历史、下载、资料与邀
 });
 
 test("无可用次数用户收到可恢复的分析与文件审查边界", async ({ page }) => {
+  test.skip(skipAccountSetup, "外部环境不创建无权益账号");
   const expectNoRuntimeFailures = watchRuntime(page);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(aiBaseUrl!);
@@ -291,6 +299,7 @@ test("无可用次数用户收到可恢复的分析与文件审查边界", async
 });
 
 test("忘记密码覆盖弱密码拒绝、验证码重置和新密码登录", async ({ page }) => {
+  test.skip(skipAccountSetup, "外部环境不创建或重置测试账号");
   const expectNoRuntimeFailures = watchRuntime(page);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(aiBaseUrl!);
