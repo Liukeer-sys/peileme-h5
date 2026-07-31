@@ -922,6 +922,11 @@ describe("effective commerce catalog", () => {
       await expect(
         getEffectivePrice(productId, new Date("2026-02-28T16:00:00.000Z"))
       ).resolves.toBeNull();
+      await expect(
+        getEffectivePrice(productId, "2026-02-01" as never)
+      ).rejects.toMatchObject({
+        code: "INVALID_COMMERCE_INPUT"
+      });
     } finally {
       await query("DELETE FROM products WHERE id = $1", [productId]);
     }
@@ -1057,7 +1062,9 @@ describe("atomic commerce entitlements", () => {
     });
   });
 
-  it.each(["disabled", "expired"] as const)(
+  it.each(
+    ["disabled", "expired", "future", "trigger_mismatch"] as const
+  )(
     "does not grant first-free use from a %s promotion",
     async (promotionState) => {
       await seedPolicyFoundation();
@@ -1072,12 +1079,29 @@ describe("atomic commerce entitlements", () => {
                     ends_at = NULL
               WHERE code = 'FIRST_POLICY_CALC'`
           );
-        } else {
+        } else if (promotionState === "expired") {
           await query(
             `UPDATE promotion_rules
                 SET status = 'active',
                     starts_at = now() - interval '2 days',
                     ends_at = now() - interval '1 day'
+              WHERE code = 'FIRST_POLICY_CALC'`
+          );
+        } else if (promotionState === "future") {
+          await query(
+            `UPDATE promotion_rules
+                SET status = 'active',
+                    starts_at = now() + interval '1 day',
+                    ends_at = now() + interval '2 days'
+              WHERE code = 'FIRST_POLICY_CALC'`
+          );
+        } else {
+          await query(
+            `UPDATE promotion_rules
+                SET status = 'active',
+                    trigger_type = 'admin_grant',
+                    starts_at = NULL,
+                    ends_at = NULL
               WHERE code = 'FIRST_POLICY_CALC'`
           );
         }
@@ -1103,6 +1127,7 @@ describe("atomic commerce entitlements", () => {
         await query(
           `UPDATE promotion_rules
               SET status = 'active',
+                  trigger_type = 'first_verified_user',
                   starts_at = NULL,
                   ends_at = NULL,
                   updated_at = now()
@@ -1115,9 +1140,10 @@ describe("atomic commerce entitlements", () => {
 
   it("returns one reservation for concurrent retries of the same business", async () => {
     await seedPolicyFoundation();
-    const userId = await createEntitlementTestUser(true);
+    let userId: string | undefined;
     const businessId = randomUUID();
     try {
+      userId = await createEntitlementTestUser(true);
       const reservations = await Promise.all([
         reserveEntitlement(userId, "POLICY_CALC", businessId),
         reserveEntitlement(userId, "POLICY_CALC", businessId)
@@ -1141,16 +1167,76 @@ describe("atomic commerce entitlements", () => {
         remaining_uses: 0
       });
     } finally {
-      await cleanupEntitlementTestUsers([userId]);
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("re-reserves a released business atomically with the same usage ID", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(false);
+      const entitlementId = await insertAdminEntitlement(
+        userId,
+        "AI_SEVERANCE_ANALYSIS",
+        1
+      );
+      const businessId = randomUUID();
+      const initial = await reserveEntitlement(
+        userId,
+        "AI_SEVERANCE_ANALYSIS",
+        businessId
+      );
+      await releaseEntitlement(initial.usageId);
+
+      const retried = await reserveEntitlement(
+        userId,
+        "AI_SEVERANCE_ANALYSIS",
+        businessId
+      );
+      expect(retried).toEqual({
+        ...initial,
+        status: "reserved"
+      });
+
+      const persisted = await query<{
+        remaining_uses: number;
+        entitlement_status: string;
+        usage_status: string;
+        usages: string;
+      }>(
+        `SELECT
+           e.remaining_uses,
+           e.status AS entitlement_status,
+           eu.status AS usage_status,
+           count(*) OVER ()::text AS usages
+         FROM entitlements e
+         JOIN entitlement_usages eu ON eu.entitlement_id = e.id
+         WHERE e.id = $1`,
+        [entitlementId]
+      );
+      expect(persisted.rows).toEqual([
+        {
+          remaining_uses: 0,
+          entitlement_status: "reserved",
+          usage_status: "reserved",
+          usages: "1"
+        }
+      ]);
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
     }
   });
 
   it("does not reuse one business ID across users or SKUs", async () => {
     await seedPolicyFoundation();
-    const userA = await createEntitlementTestUser(true);
-    const userB = await createEntitlementTestUser(true);
+    const userIds: string[] = [];
     const businessId = randomUUID();
     try {
+      const userA = await createEntitlementTestUser(true);
+      userIds.push(userA);
+      const userB = await createEntitlementTestUser(true);
+      userIds.push(userB);
       await insertAdminEntitlement(userA, "AI_SEVERANCE_ANALYSIS", 1);
       await reserveEntitlement(userA, "POLICY_CALC", businessId);
 
@@ -1189,15 +1275,18 @@ describe("atomic commerce entitlements", () => {
         user_b_entitlements: "0"
       });
     } finally {
-      await cleanupEntitlementTestUsers([userA, userB]);
+      await cleanupEntitlementTestUsers(userIds);
     }
   });
 
   it("lets two verified users each receive the first-free promotion", async () => {
     await seedPolicyFoundation();
-    const userA = await createEntitlementTestUser(true);
-    const userB = await createEntitlementTestUser(true);
+    const userIds: string[] = [];
     try {
+      const userA = await createEntitlementTestUser(true);
+      userIds.push(userA);
+      const userB = await createEntitlementTestUser(true);
+      userIds.push(userB);
       const reservations = await Promise.all([
         reserveEntitlement(userA, "POLICY_CALC", randomUUID()),
         reserveEntitlement(userB, "POLICY_CALC", randomUUID())
@@ -1221,22 +1310,23 @@ describe("atomic commerce entitlements", () => {
           .map((userId) => ({ user_id: userId, count: "1" }))
       );
     } finally {
-      await cleanupEntitlementTestUsers([userA, userB]);
+      await cleanupEntitlementTestUsers(userIds);
     }
   });
 
   it("keeps multi-use reserve, consume and release transitions atomic and idempotent", async () => {
     await seedPolicyFoundation();
-    const userId = await createEntitlementTestUser(false);
-    const entitlementId = await insertAdminEntitlement(
-      userId,
-      "AI_SEVERANCE_ANALYSIS",
-      2
-    );
+    let userId: string | undefined;
     const businessA = randomUUID();
     const businessB = randomUUID();
     const businessC = randomUUID();
     try {
+      userId = await createEntitlementTestUser(false);
+      const entitlementId = await insertAdminEntitlement(
+        userId,
+        "AI_SEVERANCE_ANALYSIS",
+        2
+      );
       const [reservationA, reservationB] = await Promise.all([
         reserveEntitlement(
           userId,
@@ -1318,15 +1408,161 @@ describe("atomic commerce entitlements", () => {
         { status: "released", count: "1" }
       ]);
     } finally {
-      await cleanupEntitlementTestUsers([userId]);
+      if (userId) await cleanupEntitlementTestUsers([userId]);
     }
   });
 
+  it("allows only one terminal result when consume races release", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(false);
+      const entitlementId = await insertAdminEntitlement(
+        userId,
+        "AI_SEVERANCE_ANALYSIS",
+        1
+      );
+      const reservation = await reserveEntitlement(
+        userId,
+        "AI_SEVERANCE_ANALYSIS",
+        randomUUID()
+      );
+
+      const transitions = await Promise.allSettled([
+        consumeEntitlement(reservation.usageId),
+        releaseEntitlement(reservation.usageId)
+      ]);
+      const fulfilled = transitions.filter(
+        (item) => item.status === "fulfilled"
+      );
+      const rejected = transitions.filter(
+        (item) => item.status === "rejected"
+      );
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toEqual([
+        expect.objectContaining({
+          reason: expect.objectContaining({
+            code: "ENTITLEMENT_USAGE_CLOSED"
+          })
+        })
+      ]);
+
+      const terminalStatus =
+        (fulfilled[0] as PromiseFulfilledResult<{ status: string }>).value
+          .status;
+      const persisted = await query<{
+        remaining_uses: number;
+        entitlement_status: string;
+        usage_status: string;
+      }>(
+        `SELECT
+           e.remaining_uses,
+           e.status AS entitlement_status,
+           eu.status AS usage_status
+         FROM entitlements e
+         JOIN entitlement_usages eu ON eu.entitlement_id = e.id
+         WHERE e.id = $1`,
+        [entitlementId]
+      );
+      expect(persisted.rows[0]).toEqual(
+        terminalStatus === "consumed"
+          ? {
+              remaining_uses: 0,
+              entitlement_status: "consumed",
+              usage_status: "consumed"
+            }
+          : {
+              remaining_uses: 1,
+              entitlement_status: "active",
+              usage_status: "released"
+            }
+      );
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it.each(["consume", "release"] as const)(
+    "rolls back usage and entitlement when %s persistence fails",
+    async (transition) => {
+      await seedPolicyFoundation();
+      let userId: string | undefined;
+      let triggerInstalled = false;
+      try {
+        userId = await createEntitlementTestUser(false);
+        const entitlementId = await insertAdminEntitlement(
+          userId,
+          "AI_SEVERANCE_ANALYSIS",
+          1
+        );
+        const reservation = await reserveEntitlement(
+          userId,
+          "AI_SEVERANCE_ANALYSIS",
+          randomUUID()
+        );
+        await query(`
+          CREATE OR REPLACE FUNCTION fail_entitlement_transition_for_task2()
+          RETURNS trigger
+          LANGUAGE plpgsql
+          AS $$
+          BEGIN
+            RAISE EXCEPTION 'forced entitlement transition failure';
+          END
+          $$
+        `);
+        await query(`
+          CREATE TRIGGER fail_entitlement_transition_for_task2_trigger
+          BEFORE UPDATE ON entitlements
+          FOR EACH ROW
+          EXECUTE FUNCTION fail_entitlement_transition_for_task2()
+        `);
+        triggerInstalled = true;
+
+        const operation =
+          transition === "consume"
+            ? consumeEntitlement(reservation.usageId)
+            : releaseEntitlement(reservation.usageId);
+        await expect(operation).rejects.toMatchObject({ code: "P0001" });
+
+        const persisted = await query<{
+          remaining_uses: number;
+          entitlement_status: string;
+          usage_status: string;
+        }>(
+          `SELECT
+             e.remaining_uses,
+             e.status AS entitlement_status,
+             eu.status AS usage_status
+           FROM entitlements e
+           JOIN entitlement_usages eu ON eu.entitlement_id = e.id
+           WHERE e.id = $1`,
+          [entitlementId]
+        );
+        expect(persisted.rows[0]).toEqual({
+          remaining_uses: 0,
+          entitlement_status: "reserved",
+          usage_status: "reserved"
+        });
+      } finally {
+        if (triggerInstalled) {
+          await query(
+            "DROP TRIGGER IF EXISTS fail_entitlement_transition_for_task2_trigger ON entitlements"
+          );
+        }
+        await query(
+          "DROP FUNCTION IF EXISTS fail_entitlement_transition_for_task2()"
+        );
+        if (userId) await cleanupEntitlementTestUsers([userId]);
+      }
+    }
+  );
+
   it("rolls back first-free grant when usage persistence fails", async () => {
     await seedPolicyFoundation();
-    const userId = await createEntitlementTestUser(true);
+    let userId: string | undefined;
     let triggerInstalled = false;
     try {
+      userId = await createEntitlementTestUser(true);
       await query(`
         CREATE OR REPLACE FUNCTION fail_entitlement_usage_for_task2()
         RETURNS trigger
@@ -1371,7 +1607,7 @@ describe("atomic commerce entitlements", () => {
       await query(
         "DROP FUNCTION IF EXISTS fail_entitlement_usage_for_task2()"
       );
-      await cleanupEntitlementTestUsers([userId]);
+      if (userId) await cleanupEntitlementTestUsers([userId]);
     }
   });
 });

@@ -177,6 +177,7 @@ const grantFirstPolicyEntitlement = async (
      WHERE code = 'FIRST_POLICY_CALC'
        AND product_id = $1
        AND status = 'active'
+       AND trigger_type = 'first_verified_user'
        AND (starts_at IS NULL OR starts_at <= now())
        AND (ends_at IS NULL OR ends_at > now())
      LIMIT 1
@@ -225,7 +226,7 @@ const reserveInTransaction = async (
   );
 
   const existing = await findExistingUsage(client, userId, sku, businessId);
-  if (existing) return existing;
+  if (existing && existing.status !== "released") return existing;
   if (product.status !== "active") {
     throw new CommerceError("PRODUCT_INACTIVE");
   }
@@ -242,18 +243,29 @@ const reserveInTransaction = async (
     throw new CommerceError("ENTITLEMENT_NOT_AVAILABLE");
   }
 
-  const usage = await client.query<{ id: string }>(
-    `INSERT INTO entitlement_usages(
-       entitlement_id,
-       user_id,
-       business_type,
-       business_id,
-       status
-     )
-     VALUES ($1, $2, $3, $4, 'reserved')
-     RETURNING id`,
-    [entitlement.id, userId, usageBusinessType, businessId]
-  );
+  const usage = existing
+    ? await client.query<{ id: string }>(
+        `UPDATE entitlement_usages
+         SET entitlement_id = $2,
+             status = 'reserved',
+             consumed_at = NULL
+         WHERE id = $1
+           AND status = 'released'
+         RETURNING id`,
+        [existing.usageId, entitlement.id]
+      )
+    : await client.query<{ id: string }>(
+        `INSERT INTO entitlement_usages(
+           entitlement_id,
+           user_id,
+           business_type,
+           business_id,
+           status
+         )
+         VALUES ($1, $2, $3, $4, 'reserved')
+         RETURNING id`,
+        [entitlement.id, userId, usageBusinessType, businessId]
+      );
   await client.query(
     `UPDATE entitlements
      SET remaining_uses = remaining_uses - 1,
@@ -318,15 +330,21 @@ const getLockedUsage = async (
        eu.entitlement_id,
        eu.status
      FROM entitlement_usages eu
-     JOIN entitlements e ON e.id = eu.entitlement_id
      WHERE eu.id = $1
-     FOR UPDATE OF eu, e`,
+     FOR UPDATE`,
     [usageId]
   );
   const usage = result.rows[0];
   if (!usage) {
     throw new CommerceError("ENTITLEMENT_USAGE_NOT_FOUND");
   }
+  await client.query(
+    `SELECT id
+     FROM entitlements
+     WHERE id = $1
+     FOR UPDATE`,
+    [usage.entitlement_id]
+  );
   return usage;
 };
 

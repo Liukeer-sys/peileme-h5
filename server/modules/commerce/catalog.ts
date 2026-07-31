@@ -110,7 +110,11 @@ export const getEffectivePrice = async (
   productId: string,
   at: Date
 ): Promise<EffectivePrice | null> => {
-  if (!uuidPattern.test(productId) || Number.isNaN(at.getTime())) {
+  if (
+    !uuidPattern.test(productId) ||
+    !(at instanceof Date) ||
+    Number.isNaN(at.getTime())
+  ) {
     throw new CommerceError("INVALID_COMMERCE_INPUT");
   }
   const result = await query<PriceRow>(
