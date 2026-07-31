@@ -423,6 +423,16 @@ describe("operational readiness", () => {
         failedOtpDeliveries: expect.any(Number)
       }
     });
+    expect(system.body.aiProviders).toEqual([
+      { key: "tuzi", model: "gpt-5.4", enabled: false, primary: true },
+      {
+        key: "dataeyes",
+        model: "gemini-2.5-pro",
+        enabled: false,
+        primary: false
+      }
+    ]);
+    expect(JSON.stringify(system.body)).not.toContain("API_KEY");
   });
 
   it("stores structured internal errors and capability-protects job summaries", async () => {

@@ -11,6 +11,7 @@ type ControlledProvider = {
   model: string;
   priority: number;
   enabled?: boolean;
+  materialMode?: "metadata" | "content";
   analyze: (input: unknown) => Promise<unknown>;
 };
 
@@ -399,6 +400,51 @@ describe("AI analysis provider fallback and persistence", () => {
 });
 
 describe("AI analysis idempotency, document metadata and owned history", () => {
+  it("cleans up a first-time task when provider material is unavailable without reserving a use", async () => {
+    let calls = 0;
+    const idempotencyKey = "document-material-unavailable-1";
+    const usageCountBefore = await query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM entitlement_usages WHERE user_id = $1",
+      [userA]
+    );
+    const app = createAiApp([
+      {
+        key: "content-provider",
+        model: "content-v1",
+        priority: 1,
+        materialMode: "content",
+        analyze: async () => {
+          calls += 1;
+          return report("不应调用");
+        }
+      }
+    ]);
+    const unavailable = await request(app)
+      .post("/api/ai/jobs")
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${tokenA}`)
+      .send({
+        kind: "document_review",
+        idempotencyKey,
+        input: { objective: "文件存储缺失时应允许用户重新上传后使用相同幂等键重试" },
+        uploadIds: [uploadA]
+      })
+      .expect(409);
+    expect(unavailable.body.error).toBe("AI_MATERIAL_UNAVAILABLE");
+    expect(calls).toBe(0);
+
+    const jobs = await query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM ai_jobs WHERE user_id = $1 AND idempotency_key = $2",
+      [userA, idempotencyKey]
+    );
+    expect(jobs.rows[0].count).toBe("0");
+    const usages = await query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM entitlement_usages WHERE user_id = $1",
+      [userA]
+    );
+    expect(usages.rows[0].count).toBe(usageCountBefore.rows[0].count);
+  });
+
   it("returns a resumable entitlement boundary without running a provider", async () => {
     let calls = 0;
     const app = createAiApp([

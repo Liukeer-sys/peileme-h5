@@ -6,6 +6,7 @@ import { CommerceError } from "../commerce/types.js";
 import { ApiError } from "../../errors.js";
 import { runProviderChain } from "../llm/router.js";
 import type { AiJobKind, AiProvider } from "../llm/types.js";
+import { loadOwnedProviderMaterials } from "./materials.js";
 import {
   attachEntitlementAndStart,
   completeAiJob,
@@ -48,6 +49,19 @@ export const createAiAnalysisService = (
     });
     if (!persisted.created) return persisted;
 
+    let providerUploads = uploadMetadata;
+    if (providers.some((provider) => provider.materialMode === "content")) {
+      try {
+        providerUploads = await loadOwnedProviderMaterials(
+          input.userId,
+          input.uploadIds
+        );
+      } catch (error) {
+        await deleteQueuedAiJob(persisted.job.id);
+        throw error;
+      }
+    }
+
     const sku = input.kind === "severance_analysis"
       ? "AI_SEVERANCE_ANALYSIS"
       : "AI_DOCUMENT_REVIEW";
@@ -87,7 +101,7 @@ export const createAiAnalysisService = (
         jobId: persisted.job.id,
         kind: input.kind,
         input: input.payload,
-        uploads: uploadMetadata
+        uploads: providerUploads
       });
     } catch {
       await releaseEntitlement(reservation.usageId);

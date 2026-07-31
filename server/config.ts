@@ -109,6 +109,34 @@ const paymentProviderList = z
     return providers as RealPaymentChannel[];
   });
 
+const llmBaseUrl = z
+  .string()
+  .url()
+  .transform((value, context) => {
+    const parsed = new URL(value);
+    if (
+      !["http:", "https:"].includes(parsed.protocol) ||
+      parsed.username ||
+      parsed.password ||
+      parsed.search ||
+      parsed.hash
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "LLM base URL must be a canonical HTTP(S) URL"
+      });
+      return z.NEVER;
+    }
+    return value.replace(/\/+$/, "");
+  });
+
+const llmApiKey = z
+  .string()
+  .default("")
+  .refine((value) => value === value.trim(), {
+    message: "LLM API keys must not contain surrounding whitespace"
+  });
+
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   PAYMENT_MODE: z.enum(["disabled", "live", "fake"]).default("disabled"),
@@ -129,6 +157,16 @@ const envSchema = z.object({
   ALIPAY_PRIVATE_KEY_SECRET_REF: z.string().optional(),
   ALIPAY_PUBLIC_KEY_FILE: z.string().optional(),
   ALIPAY_PUBLIC_KEY_SECRET_REF: z.string().optional(),
+  LLM_PRIMARY: z.enum(["tuzi", "dataeyes"]).default("tuzi"),
+  LLM_TUZI_BASE_URL: llmBaseUrl.default("https://api.tu-zi.com"),
+  LLM_TUZI_API_KEY: llmApiKey,
+  LLM_TUZI_MODEL: z.string().trim().min(1).max(160).default("gpt-5.4"),
+  LLM_DATAEYES_BASE_URL: llmBaseUrl.default("https://cloud.dataeyes.ai"),
+  LLM_DATAEYES_API_KEY: llmApiKey,
+  LLM_DATAEYES_MODEL: z.string().trim().min(1).max(160).default("gemini-2.5-pro"),
+  LLM_MAX_RETRIES: z.coerce.number().int().min(1).max(5).default(3),
+  LLM_RETRY_BACKOFF_MS: z.coerce.number().int().min(0).max(10_000).default(800),
+  LLM_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(240_000).default(90_000),
   PORT: z.coerce.number().int().positive().default(3001),
   DATABASE_URL: z.string().min(1).default("postgresql://peileme:peileme@127.0.0.1:5432/peileme"),
   APP_ORIGIN: corsOriginList,

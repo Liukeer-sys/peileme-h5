@@ -9,6 +9,8 @@ export type AiProviderRequest = {
     originalName: string;
     mimeType: string;
     sizeBytes: string;
+    extractedText?: string;
+    imageDataUrl?: string;
   }>;
 };
 
@@ -17,6 +19,7 @@ export type AiProvider = {
   model: string;
   priority: number;
   enabled?: boolean;
+  materialMode?: "metadata" | "content";
   analyze: (request: AiProviderRequest) => Promise<unknown>;
 };
 

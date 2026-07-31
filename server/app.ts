@@ -21,6 +21,7 @@ import { createCommerceRouters } from "./modules/commerce/routes.js";
 import { createAiRouter } from "./modules/ai/routes.js";
 import { listOwnedAiJobs } from "./modules/ai/repository.js";
 import type { AiProvider } from "./modules/llm/types.js";
+import { createConfiguredAiProviders } from "./modules/llm/openai-compatible.js";
 import type { PaymentProvider } from "./modules/payments/provider.js";
 import { getChannelStatus } from "./notifier.js";
 import {
@@ -231,6 +232,44 @@ export const createApp = (
 ) => {
   const config = getConfig();
   const aiHistorySource = options.aiHistorySource ?? persistedAiHistorySource;
+  const aiProviders = options.aiProviders ?? createConfiguredAiProviders({
+    primary: config.LLM_PRIMARY,
+    maxRetries: config.LLM_MAX_RETRIES,
+    retryBackoffMs: config.LLM_RETRY_BACKOFF_MS,
+    requestTimeoutMs: config.LLM_REQUEST_TIMEOUT_MS,
+    tuzi: {
+      baseUrl: config.LLM_TUZI_BASE_URL,
+      apiKey: config.LLM_TUZI_API_KEY,
+      model: config.LLM_TUZI_MODEL
+    },
+    dataeyes: {
+      baseUrl: config.LLM_DATAEYES_BASE_URL,
+      apiKey: config.LLM_DATAEYES_API_KEY,
+      model: config.LLM_DATAEYES_MODEL
+    }
+  });
+  const aiProviderStatus = [
+    {
+      key: "tuzi",
+      model: config.LLM_TUZI_MODEL,
+      enabled: aiProviders.some((provider) => provider.key === "tuzi"),
+      primary: config.LLM_PRIMARY === "tuzi"
+    },
+    {
+      key: "dataeyes",
+      model: config.LLM_DATAEYES_MODEL,
+      enabled: aiProviders.some((provider) => provider.key === "dataeyes"),
+      primary: config.LLM_PRIMARY === "dataeyes"
+    },
+    ...aiProviders
+      .filter((provider) => !["tuzi", "dataeyes"].includes(provider.key))
+      .map((provider) => ({
+        key: provider.key,
+        model: provider.model,
+        enabled: provider.enabled !== false,
+        primary: false
+      }))
+  ];
   const { uploadDir, middleware: upload } = uploadConfig();
   const app = express();
 
@@ -289,7 +328,7 @@ export const createApp = (
     createPolicyRouter({ calculate: options.policyCalculate })
   );
   app.use("/api/admin/policy", createAdminPolicyRouter());
-  app.use("/api/ai", requireAiProductHost, createAiRouter(options.aiProviders));
+  app.use("/api/ai", requireAiProductHost, createAiRouter(aiProviders));
 
   app.get("/api/health", async (_request, response) => {
     const started = Date.now();
@@ -1397,6 +1436,7 @@ export const createApp = (
         uptimeSeconds: Math.round(process.uptime()),
         environment: config.NODE_ENV
       },
+      aiProviders: aiProviderStatus,
       operational: {
         errors: {
           last24Hours: Number(errorSummary.rows[0]?.last_24_hours || 0),
