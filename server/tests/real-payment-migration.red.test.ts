@@ -10,6 +10,20 @@ import { enableIdentityPaymentWrites } from "../modules/payments/write-contract.
 
 const { Client } = pg;
 
+const promiseStateAfter = async (
+  promise: Promise<unknown>,
+  delayMs = 100
+) =>
+  Promise.race([
+    promise.then(
+      () => "settled" as const,
+      () => "settled" as const
+    ),
+    new Promise<"pending">((resolve) => {
+      setTimeout(() => resolve("pending"), delayMs);
+    })
+  ]);
+
 const runMigrationProcess = (
   databaseUrl: string,
   timeoutMs = 12_000
@@ -1249,6 +1263,181 @@ describe("Task 4 real payment migration behavior (RED)", () => {
     }
   });
 
+  it("makes canonical_attempt_id unique and index-backed", async () => {
+    const fixture = await createOrderFixture();
+    try {
+      const owner = await insertAttempt(
+        fixture.orderId,
+        "wechat_h5",
+        "CLOSED",
+        `WX${randomUUID().replaceAll("-", "").slice(0, 28).toUpperCase()}`
+      );
+      const indexes = await query<{
+        index_name: string;
+        is_unique: boolean;
+      }>(
+        `SELECT cls.relname AS index_name,
+                idx.indisunique AS is_unique
+           FROM pg_index idx
+           JOIN pg_class table_cls ON table_cls.oid = idx.indrelid
+           JOIN pg_class cls ON cls.oid = idx.indexrelid
+          WHERE table_cls.oid = 'provider_payment_orders'::regclass
+            AND idx.indnkeyatts = 1
+            AND idx.indkey::text = (
+              SELECT attnum::text
+                FROM pg_attribute
+               WHERE attrelid = table_cls.oid
+                 AND attname = 'canonical_attempt_id'
+            )`
+      );
+      expect(indexes.rows).toEqual([
+        {
+          index_name: "provider_payment_orders_canonical_attempt_unique",
+          is_unique: true
+        }
+      ]);
+
+      const explained = await withTransaction(async (client) => {
+        await client.query("SET LOCAL enable_seqscan = off");
+        return client.query<{ "QUERY PLAN": unknown }>(
+          `EXPLAIN (FORMAT JSON)
+           SELECT id
+             FROM provider_payment_orders
+            WHERE canonical_attempt_id = $1`,
+          [owner.id]
+        );
+      });
+      expect(JSON.stringify(explained.rows[0]["QUERY PLAN"])).toContain(
+        "provider_payment_orders_canonical_attempt_unique"
+      );
+
+      await expect(
+        withTransaction(async (client) => {
+          await client.query("SET CONSTRAINTS ALL DEFERRED");
+          await client.query(
+            `INSERT INTO provider_payment_orders(
+               id,
+               order_id,
+               channel,
+               provider_order_no,
+               origin,
+               allocated_at,
+               canonical_attempt_id,
+               manual_review_required
+             )
+             VALUES ($1, $2, 'wechat_h5', $3, 'attempt_v1', now(), $4, false)`,
+            [
+              randomUUID(),
+              fixture.orderId,
+              `WX${randomUUID().replaceAll("-", "").slice(0, 28).toUpperCase()}`,
+              owner.id
+            ]
+          );
+        })
+      ).rejects.toMatchObject({ code: "23505" });
+    } finally {
+      await cleanupOrderFixture(fixture);
+    }
+  });
+
+  it("short-circuits payment attempt owner checks for status-only updates", async () => {
+    const functionDefinition = await query<{ definition: string }>(
+      `SELECT pg_get_functiondef(
+         'payment_attempt_provider_owner_guard()'::regprocedure
+       ) AS definition`
+    );
+    const normalized = functionDefinition.rows[0].definition.replace(
+      /\s+/g,
+      " "
+    );
+    const fastPathPosition = normalized.indexOf("TG_OP = 'UPDATE'");
+    const relationshipLookupPosition = normalized.indexOf(
+      "FROM provider_payment_orders"
+    );
+    expect(fastPathPosition).toBeGreaterThan(-1);
+    expect(fastPathPosition).toBeLessThan(relationshipLookupPosition);
+    for (const field of [
+      "id",
+      "order_id",
+      "channel",
+      "provider_payment_order_id",
+      "provider_identity_role"
+    ]) {
+      expect(normalized).toContain(
+        `NEW.${field} IS NOT DISTINCT FROM OLD.${field}`
+      );
+    }
+
+    const fixture = await createOrderFixture();
+    try {
+      const attempt = await insertAttempt(
+        fixture.orderId,
+        "wechat_h5",
+        "CLOSED",
+        `WX${randomUUID().replaceAll("-", "").slice(0, 28).toUpperCase()}`
+      );
+      await expect(
+        withIdentityWriteContract((client) =>
+          client.query(
+            `UPDATE payment_attempts
+                SET status = 'RECONCILING',
+                    reconciliation_state = 'RETRY_SCHEDULED',
+                    reconciliation_next_at = now(),
+                    reconciliation_deadline_at = now() + interval '1 hour',
+                    reconciliation_last_result = 'NO_PAYMENT'
+              WHERE id = $1`,
+            [attempt.id]
+          )
+        )
+      ).resolves.toMatchObject({ rowCount: 1 });
+    } finally {
+      await cleanupOrderFixture(fixture);
+    }
+  });
+
+  it("short-circuits provider identity owner checks for non-relational updates", async () => {
+    const functionDefinition = await query<{ definition: string }>(
+      `SELECT pg_get_functiondef(
+         'provider_payment_owner_guard()'::regprocedure
+       ) AS definition`
+    );
+    const normalized = functionDefinition.rows[0].definition.replace(
+      /\s+/g,
+      " "
+    );
+    const fastPathPosition = normalized.indexOf("TG_OP = 'UPDATE'");
+    const relationshipLookupPosition = normalized.indexOf(
+      "FROM payment_attempts"
+    );
+    expect(fastPathPosition).toBeGreaterThan(-1);
+    expect(fastPathPosition).toBeLessThan(relationshipLookupPosition);
+    for (const field of ["id", "order_id", "channel", "canonical_attempt_id"]) {
+      expect(normalized).toContain(
+        `NEW.${field} IS NOT DISTINCT FROM OLD.${field}`
+      );
+    }
+
+    const fixture = await createOrderFixture();
+    try {
+      const owner = await insertAttempt(
+        fixture.orderId,
+        "wechat_h5",
+        "CLOSED",
+        `WX${randomUUID().replaceAll("-", "").slice(0, 28).toUpperCase()}`
+      );
+      await expect(
+        query(
+          `UPDATE provider_payment_orders
+              SET manual_review_required = true
+            WHERE id = $1`,
+          [owner.providerPaymentOrderId]
+        )
+      ).resolves.toMatchObject({ rowCount: 1 });
+    } finally {
+      await cleanupOrderFixture(fixture);
+    }
+  });
+
   it.each([
     ["channel", "alipay_wap"],
     ["origin", "legacy_order_no"],
@@ -1615,6 +1804,230 @@ describe("Task 4 real payment migration behavior (RED)", () => {
         })
       ).rejects.toMatchObject({ code: expect.stringMatching(/^23/) });
     } finally {
+      await cleanupOrderFixture(fixture);
+    }
+  });
+
+  it("locks a SUCCESS fact until an uncommitted refund insert commits", async () => {
+    const fixture = await createOrderFixture();
+    const refundWriter = new Client({
+      connectionString: process.env.DATABASE_URL
+    });
+    const factWriter = new Client({
+      connectionString: process.env.DATABASE_URL
+    });
+    try {
+      const attempt = await insertAttempt(
+        fixture.orderId,
+        "wechat_h5",
+        "SUCCEEDED",
+        `WX${randomUUID().replaceAll("-", "").slice(0, 28).toUpperCase()}`
+      );
+      const transaction = await query<{ id: string }>(
+        `INSERT INTO payment_transactions(
+           order_id,
+           payment_attempt_id,
+           channel,
+           channel_transaction_id,
+           amount_fen,
+           currency,
+           status,
+           verified_payload,
+           paid_at
+         )
+         VALUES ($1, $2, 'wechat_h5', $3, 100, 'CNY', 'SUCCESS', '{}'::jsonb, now())
+         RETURNING id`,
+        [fixture.orderId, attempt.id, `WX-REFUND-RACE-A-${randomUUID()}`]
+      );
+      await Promise.all([refundWriter.connect(), factWriter.connect()]);
+      await Promise.all([
+        refundWriter.query("SET statement_timeout = '5s'"),
+        factWriter.query("SET statement_timeout = '5s'")
+      ]);
+      await refundWriter.query("BEGIN");
+      await factWriter.query("BEGIN");
+      await refundWriter.query(
+        `INSERT INTO refunds(
+           refund_no,
+           provider_refund_no,
+           order_id,
+           payment_attempt_id,
+           payment_transaction_id,
+           channel,
+           amount_fen,
+           reason,
+           status,
+           provider_operation_eligible,
+           request_snapshot
+         )
+         VALUES ($1, $1, $2, $3, $4, 'wechat_h5', 100, 'race', 'PENDING', true, '{}'::jsonb)`,
+        [
+          `RF-RACE-A-${randomUUID()}`,
+          fixture.orderId,
+          attempt.id,
+          transaction.rows[0].id
+        ]
+      );
+
+      const factUpdate = factWriter.query(
+        `UPDATE payment_transactions
+            SET status = 'CLOSED'
+          WHERE id = $1`,
+        [transaction.rows[0].id]
+      );
+      expect(await promiseStateAfter(factUpdate)).toBe("pending");
+
+      await refundWriter.query("COMMIT");
+      await expect(factUpdate).rejects.toMatchObject({
+        code: "23514",
+        constraint: "payment_transactions_refund_fact_immutable"
+      });
+      await factWriter.query("ROLLBACK");
+
+      const state = await query<{
+        transaction_status: string;
+        active_refunds: string;
+        invalid_pairs: string;
+      }>(
+        `SELECT
+           transaction.status AS transaction_status,
+           count(refund.id) FILTER (
+             WHERE refund.provider_operation_eligible
+           )::text AS active_refunds,
+           count(refund.id) FILTER (
+             WHERE refund.provider_operation_eligible
+               AND transaction.status <> 'SUCCESS'
+           )::text AS invalid_pairs
+         FROM payment_transactions transaction
+         LEFT JOIN refunds refund
+           ON refund.payment_transaction_id = transaction.id
+         WHERE transaction.id = $1
+         GROUP BY transaction.status`,
+        [transaction.rows[0].id]
+      );
+      expect(state.rows[0]).toEqual({
+        transaction_status: "SUCCESS",
+        active_refunds: "1",
+        invalid_pairs: "0"
+      });
+    } finally {
+      await Promise.allSettled([
+        refundWriter.query("ROLLBACK"),
+        factWriter.query("ROLLBACK")
+      ]);
+      await Promise.allSettled([refundWriter.end(), factWriter.end()]);
+      await cleanupOrderFixture(fixture);
+    }
+  });
+
+  it("rechecks a payment fact after a concurrent non-SUCCESS update commits", async () => {
+    const fixture = await createOrderFixture();
+    const refundWriter = new Client({
+      connectionString: process.env.DATABASE_URL
+    });
+    const factWriter = new Client({
+      connectionString: process.env.DATABASE_URL
+    });
+    try {
+      const attempt = await insertAttempt(
+        fixture.orderId,
+        "wechat_h5",
+        "SUCCEEDED",
+        `WX${randomUUID().replaceAll("-", "").slice(0, 28).toUpperCase()}`
+      );
+      const transaction = await query<{ id: string }>(
+        `INSERT INTO payment_transactions(
+           order_id,
+           payment_attempt_id,
+           channel,
+           channel_transaction_id,
+           amount_fen,
+           currency,
+           status,
+           verified_payload,
+           paid_at
+         )
+         VALUES ($1, $2, 'wechat_h5', $3, 100, 'CNY', 'SUCCESS', '{}'::jsonb, now())
+         RETURNING id`,
+        [fixture.orderId, attempt.id, `WX-REFUND-RACE-B-${randomUUID()}`]
+      );
+      await Promise.all([refundWriter.connect(), factWriter.connect()]);
+      await Promise.all([
+        refundWriter.query("SET statement_timeout = '5s'"),
+        factWriter.query("SET statement_timeout = '5s'")
+      ]);
+      await refundWriter.query("BEGIN");
+      await factWriter.query("BEGIN");
+      await factWriter.query(
+        `UPDATE payment_transactions
+            SET status = 'CLOSED'
+          WHERE id = $1`,
+        [transaction.rows[0].id]
+      );
+
+      const refundInsert = refundWriter.query(
+        `INSERT INTO refunds(
+           refund_no,
+           provider_refund_no,
+           order_id,
+           payment_attempt_id,
+           payment_transaction_id,
+           channel,
+           amount_fen,
+           reason,
+           status,
+           provider_operation_eligible,
+           request_snapshot
+         )
+         VALUES ($1, $1, $2, $3, $4, 'wechat_h5', 100, 'race', 'PENDING', true, '{}'::jsonb)`,
+        [
+          `RF-RACE-B-${randomUUID()}`,
+          fixture.orderId,
+          attempt.id,
+          transaction.rows[0].id
+        ]
+      );
+      expect(await promiseStateAfter(refundInsert)).toBe("pending");
+
+      await factWriter.query("COMMIT");
+      await expect(refundInsert).rejects.toMatchObject({
+        code: "23514",
+        constraint: "refunds_payment_fact_guard"
+      });
+      await refundWriter.query("ROLLBACK");
+
+      const state = await query<{
+        transaction_status: string;
+        active_refunds: string;
+        invalid_pairs: string;
+      }>(
+        `SELECT
+           transaction.status AS transaction_status,
+           count(refund.id) FILTER (
+             WHERE refund.provider_operation_eligible
+           )::text AS active_refunds,
+           count(refund.id) FILTER (
+             WHERE refund.provider_operation_eligible
+               AND transaction.status <> 'SUCCESS'
+           )::text AS invalid_pairs
+         FROM payment_transactions transaction
+         LEFT JOIN refunds refund
+           ON refund.payment_transaction_id = transaction.id
+         WHERE transaction.id = $1
+         GROUP BY transaction.status`,
+        [transaction.rows[0].id]
+      );
+      expect(state.rows[0]).toEqual({
+        transaction_status: "CLOSED",
+        active_refunds: "0",
+        invalid_pairs: "0"
+      });
+    } finally {
+      await Promise.allSettled([
+        refundWriter.query("ROLLBACK"),
+        factWriter.query("ROLLBACK")
+      ]);
+      await Promise.allSettled([refundWriter.end(), factWriter.end()]);
       await cleanupOrderFixture(fixture);
     }
   });

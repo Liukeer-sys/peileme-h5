@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
+import pg from "pg";
 import request from "supertest";
 import { createApp } from "../app.js";
 import { resetConfigForTests } from "../config.js";
@@ -35,6 +36,8 @@ import {
   paymentWriteQuery,
   ScriptedRealPaymentProvider
 } from "./helpers/identity-payment.js";
+
+const { Client } = pg;
 
 type CatalogRow = {
   sku: string;
@@ -199,6 +202,24 @@ const createScheduledClosedPaymentOrder = async (
   );
   return failed;
 };
+
+const paymentProviderWithResponse = (response: Record<string, unknown>) => ({
+  channel: "wechat_h5" as const,
+  async createPayment(input: { providerOrderNo: string }) {
+    return {
+      prepayId: `evidence-${input.providerOrderNo}`,
+      launchUrl: `https://payments.test/evidence/${input.providerOrderNo}`,
+      launchExpiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
+      response
+    };
+  },
+  async queryPayment() {
+    return null;
+  },
+  async refund() {
+    return { channelRefundId: "unused", raw: {} };
+  }
+});
 
 const emptyClosedRecoverySummary = () => ({
   scannedCount: 0,
@@ -2544,6 +2565,262 @@ describe("atomic commerce orders and payments", () => {
       });
     } finally {
       if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("sanitizes nested provider create evidence before persisting it", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const order = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `create-evidence-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      const sentinels = {
+        authorization: `Bearer-${randomUUID()}`,
+        signature: `Signature-${randomUUID()}`,
+        token: `Token-${randomUUID()}`,
+        secret: `Secret-${randomUUID()}`,
+        privateKey: `Private-${randomUUID()}`,
+        apiKey: `Api-${randomUUID()}`,
+        payer: `Payer-${randomUUID()}`,
+        openid: `Openid-${randomUUID()}`,
+        buyerIds: `Buyer-${randomUUID()}`,
+        phone: `Phone-${randomUUID()}`,
+        email: `Email-${randomUUID()}`
+      };
+      await startPayment({
+        userId,
+        orderId: order.id,
+        productChannel: "main",
+        clientIp: "127.0.0.1",
+        returnUrl: "https://peileme.test/return",
+        notifyUrl: "https://peileme.test/notify",
+        provider: paymentProviderWithResponse({
+          safe: { code: "CREATE_OK" },
+          authorization: sentinels.authorization,
+          nested: {
+            publicStatus: "accepted",
+            "x-signature": sentinels.signature,
+            access_token: sentinels.token,
+            clientSecret: sentinels.secret,
+            private_key: sentinels.privateKey,
+            apiKey: sentinels.apiKey,
+            payer: { value: sentinels.payer },
+            openid: sentinels.openid,
+            buyer_ids: [sentinels.buyerIds],
+            phone_number: sentinels.phone,
+            emailAddress: sentinels.email
+          }
+        })
+      });
+      const persisted = await query<{ response_snapshot: unknown }>(
+        `SELECT response_snapshot
+           FROM payment_attempts
+          WHERE order_id = $1`,
+        [order.id]
+      );
+      expect(persisted.rows[0].response_snapshot).toEqual({
+        safe: { code: "CREATE_OK" },
+        nested: { publicStatus: "accepted" }
+      });
+      const serialized = JSON.stringify(
+        persisted.rows[0].response_snapshot
+      );
+      for (const sentinel of Object.values(sentinels)) {
+        expect(serialized).not.toContain(sentinel);
+      }
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("sanitizes verified evidence while preserving structured payment facts", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const order = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `verified-evidence-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      const attempt = await insertIdentityAwarePaymentAttempt({
+        orderId: order.id,
+        channel: "wechat_h5",
+        status: "PENDING"
+      });
+      const channelTransactionId = `verified-evidence-${randomUUID()}`;
+      const secret = `VERIFIED_SECRET_${randomUUID()}`;
+      await markOrderPaid({
+        orderId: order.id,
+        paymentAttemptId: attempt.id,
+        verified: {
+          providerOrderNo: attempt.providerOrderNo,
+          channel: "wechat_h5",
+          channelTransactionId,
+          amountFen: order.amountFen,
+          currency: "CNY",
+          paidAt: new Date().toISOString(),
+          raw: {
+            safe: { providerState: "paid" },
+            nested: {
+              authorization: secret,
+              buyer_ids: [secret],
+              contact: { phone: secret, email: secret }
+            }
+          }
+        }
+      });
+      const persisted = await query<{
+        channel_transaction_id: string;
+        amount_fen: string;
+        currency: string;
+        verified_payload: unknown;
+      }>(
+        `SELECT
+           channel_transaction_id,
+           amount_fen,
+           currency,
+           verified_payload
+         FROM payment_transactions
+         WHERE order_id = $1`,
+        [order.id]
+      );
+      expect(persisted.rows[0]).toEqual({
+        channel_transaction_id: channelTransactionId,
+        amount_fen: order.amountFen,
+        currency: "CNY",
+        verified_payload: {
+          safe: { providerState: "paid" },
+          nested: { contact: {} }
+        }
+      });
+      expect(JSON.stringify(persisted.rows[0].verified_payload)).not.toContain(
+        secret
+      );
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("persists circular and BigInt evidence without serialization failures", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const order = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `cyclic-evidence-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      const cyclic: Record<string, unknown> = {
+        safe: "kept",
+        largeCounter: 9_007_199_254_740_993n
+      };
+      cyclic.self = cyclic;
+      await expect(
+        startPayment({
+          userId,
+          orderId: order.id,
+          productChannel: "main",
+          clientIp: "127.0.0.1",
+          returnUrl: "https://peileme.test/return",
+          notifyUrl: "https://peileme.test/notify",
+          provider: paymentProviderWithResponse(cyclic)
+        })
+      ).resolves.toMatchObject({ status: "PAYING" });
+      const persisted = await query<{ response_snapshot: unknown }>(
+        `SELECT response_snapshot
+           FROM payment_attempts
+          WHERE order_id = $1`,
+        [order.id]
+      );
+      expect(persisted.rows[0].response_snapshot).toEqual({
+        safe: "kept",
+        largeCounter: "9007199254740993",
+        self: "[Circular]"
+      });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("replaces every oversized evidence shape with a bounded hash marker", async () => {
+    await seedPolicyFoundation();
+    const userIds: string[] = [];
+    const deep: Record<string, unknown> = {};
+    let cursor = deep;
+    for (let depth = 0; depth < 12; depth += 1) {
+      const next: Record<string, unknown> = {};
+      cursor.next = next;
+      cursor = next;
+    }
+    const tooManyKeys = Object.fromEntries(
+      Array.from({ length: 150 }, (_, index) => [`key${index}`, index])
+    );
+    const largeTotal = Object.fromEntries(
+      Array.from(
+        { length: 90 },
+        (_, index) => [`chunk${index}`, "x".repeat(1_000)]
+      )
+    );
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["depth", deep],
+      ["array", { items: Array.from({ length: 101 }, (_, index) => index) }],
+      ["keys", tooManyKeys],
+      ["string", { message: "x".repeat(5_000) }],
+      ["total", largeTotal]
+    ];
+    try {
+      for (const [name, response] of cases) {
+        const userId = await createEntitlementTestUser(true);
+        userIds.push(userId);
+        const order = await createOrder({
+          userId,
+          sku: "POLICY_CALC",
+          channel: "main",
+          idempotencyKey: `oversized-${name}-${randomUUID()}`,
+          businessDraftId: await insertPolicyDraft(userId)
+        });
+        await startPayment({
+          userId,
+          orderId: order.id,
+          productChannel: "main",
+          clientIp: "127.0.0.1",
+          returnUrl: "https://peileme.test/return",
+          notifyUrl: "https://peileme.test/notify",
+          provider: paymentProviderWithResponse(response)
+        });
+        const persisted = await query<{ response_snapshot: unknown }>(
+          `SELECT response_snapshot
+             FROM payment_attempts
+            WHERE order_id = $1`,
+          [order.id]
+        );
+        expect(persisted.rows[0].response_snapshot, name).toEqual({
+          _truncated: true,
+          _reason: "evidence_limits_exceeded",
+          _sha256: expect.stringMatching(/^[0-9a-f]{64}$/)
+        });
+        expect(
+          Buffer.byteLength(
+            JSON.stringify(persisted.rows[0].response_snapshot),
+            "utf8"
+          ),
+          name
+        ).toBeLessThan(256);
+      }
+    } finally {
+      await cleanupEntitlementTestUsers(userIds);
     }
   });
 
@@ -6862,22 +7139,56 @@ describe("atomic commerce orders and payments", () => {
   it(
     "keeps CLOSED reconciliation index-bounded with fifty thousand ineligible attempts",
     async () => {
-      let userId: string | undefined;
+      const originalDatabaseUrl = process.env.DATABASE_URL!;
+      const baseUrl = new URL(originalDatabaseUrl);
+      const databaseName =
+        `peileme_plan_${randomUUID().replaceAll("-", "")}`;
+      const adminUrl = new URL(baseUrl);
+      adminUrl.pathname = "/postgres";
+      const isolatedUrl = new URL(baseUrl);
+      isolatedUrl.pathname = `/${databaseName}`;
+      const admin = new Client({ connectionString: adminUrl.toString() });
+      let databaseCreated = false;
       try {
+        await admin.connect();
+        await admin.query(`CREATE DATABASE "${databaseName}"`);
+        databaseCreated = true;
+        await closePool();
+        process.env.DATABASE_URL = isolatedUrl.toString();
+        resetConfigForTests();
+        await runMigrations();
         await query("VACUUM (ANALYZE) orders, payment_attempts");
-        userId = await createEntitlementTestUser(true);
+        const user = await query<{ id: string }>(
+          `INSERT INTO users(email, email_verified_at)
+           VALUES ($1, now())
+           RETURNING id`,
+          [`plan-${randomUUID()}@peileme.test`]
+        );
+        const userId = user.rows[0].id;
+        const initialGuards = await query<{
+          tgname: string;
+          tgenabled: string;
+        }>(
+          `SELECT tgname, tgenabled
+             FROM pg_trigger
+            WHERE tgname IN (
+              'provider_payment_owner_guard_trigger',
+              'payment_attempt_provider_owner_guard_trigger'
+            )
+            ORDER BY tgname`
+        );
+        expect(initialGuards.rows).toEqual([
+          {
+            tgname: "payment_attempt_provider_owner_guard_trigger",
+            tgenabled: "O"
+          },
+          {
+            tgname: "provider_payment_owner_guard_trigger",
+            tgenabled: "O"
+          }
+        ]);
         await withTransaction(async (client) => {
-          // The migration contract suite exercises these deferred guards row
-          // by row. This query-plan fixture validates the same owner invariant
-          // once, set-wise, so 50k PL/pgSQL callbacks do not dominate runtime.
-          await client.query(
-            `ALTER TABLE provider_payment_orders
-             DISABLE TRIGGER provider_payment_owner_guard_trigger`
-          );
-          await client.query(
-            `ALTER TABLE payment_attempts
-             DISABLE TRIGGER payment_attempt_provider_owner_guard_trigger`
-          );
+          await client.query("SET LOCAL statement_timeout = '20s'");
           await enableIdentityPaymentWrites(client);
           await client.query(
             `WITH generated_orders AS (
@@ -7011,38 +7322,55 @@ describe("atomic commerce orders and payments", () => {
           );
           expect(invariant.rows[0]?.invalid_count).toBe("0");
           await client.query("SET CONSTRAINTS ALL IMMEDIATE");
-          await client.query(
-            `ALTER TABLE payment_attempts
-             ENABLE TRIGGER payment_attempt_provider_owner_guard_trigger`
-          );
-          await client.query(
-            `ALTER TABLE provider_payment_orders
-             ENABLE TRIGGER provider_payment_owner_guard_trigger`
-          );
-          const enabledGuards = await client.query<{
-            tgname: string;
-            tgenabled: string;
-          }>(
-            `SELECT tgname, tgenabled
-             FROM pg_trigger
-             WHERE tgname IN (
-               'provider_payment_owner_guard_trigger',
-               'payment_attempt_provider_owner_guard_trigger'
-             )
-             ORDER BY tgname`
-          );
-          expect(enabledGuards.rows).toEqual([
-            {
-              tgname: "payment_attempt_provider_owner_guard_trigger",
-              tgenabled: "O"
-            },
-            {
-              tgname: "provider_payment_owner_guard_trigger",
-              tgenabled: "O"
-            }
-          ]);
         });
+
+        const statusUpdateStartedAt = Date.now();
+        await withTransaction(async (client) => {
+          await client.query("SET LOCAL statement_timeout = '20s'");
+          await enableIdentityPaymentWrites(client);
+          const updated = await client.query(
+            `UPDATE payment_attempts attempt
+                SET status = 'CLOSED',
+                    updated_at = attempt.updated_at
+               FROM orders order_row
+              WHERE order_row.id = attempt.order_id
+                AND order_row.user_id = $1
+                AND order_row.idempotency_key LIKE 'reconciliation-plan-%'`,
+            [userId]
+          );
+          expect(updated.rowCount).toBe(50_010);
+          await client.query("SET CONSTRAINTS ALL IMMEDIATE");
+        });
+        expect(Date.now() - statusUpdateStartedAt).toBeLessThan(20_000);
+
+        const enabledGuards = await query<{
+          tgname: string;
+          tgenabled: string;
+        }>(
+          `SELECT tgname, tgenabled
+             FROM pg_trigger
+            WHERE tgname IN (
+              'provider_payment_owner_guard_trigger',
+              'payment_attempt_provider_owner_guard_trigger'
+            )
+            ORDER BY tgname`
+        );
+        expect(enabledGuards.rows).toEqual(initialGuards.rows);
+
         await query("ANALYZE orders, payment_attempts");
+        const ownerLookup = await query<{ "QUERY PLAN": unknown }>(
+          `EXPLAIN (FORMAT JSON)
+           SELECT id
+             FROM provider_payment_orders
+            WHERE canonical_attempt_id = (
+              SELECT id
+                FROM payment_attempts
+               LIMIT 1
+            )`
+        );
+        expect(JSON.stringify(ownerLookup.rows[0]["QUERY PLAN"])).toContain(
+          "provider_payment_orders_canonical_attempt_unique"
+        );
         const explained = await query<{ "QUERY PLAN": unknown }>(
           `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
            WITH due_attempts AS MATERIALIZED (
@@ -7152,16 +7480,27 @@ describe("atomic commerce orders and payments", () => {
           stats.rows.every((row) => Number(row.idx_scan) > 0)
         ).toBe(true);
       } finally {
-        if (userId) {
-          await withTransaction(async (client) => {
-            // This file runs in Vitest's single fork against its dedicated
-            // database. Cascading row deletes across the 50k circular
-            // identity fixtures spend minutes in deferred FK checks, while a
-            // transactional truncate keeps the boundary test deterministic.
-            await client.query("TRUNCATE TABLE orders CASCADE");
-            await client.query("DELETE FROM users WHERE id = $1", [userId]);
-          });
+        await closePool();
+        process.env.DATABASE_URL = originalDatabaseUrl;
+        resetConfigForTests();
+        if (databaseCreated) {
+          await admin.query(
+            `SELECT pg_terminate_backend(pid)
+               FROM pg_stat_activity
+              WHERE datname = $1
+                AND pid <> pg_backend_pid()`,
+            [databaseName]
+          );
+          await admin.query(`DROP DATABASE IF EXISTS "${databaseName}"`);
         }
+        const leftover = await admin.query<{ count: string }>(
+          `SELECT count(*)::text AS count
+             FROM pg_database
+            WHERE datname = $1`,
+          [databaseName]
+        );
+        expect(leftover.rows[0].count).toBe("0");
+        await admin.end();
       }
     },
     240_000

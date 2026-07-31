@@ -5,6 +5,7 @@ import type {
   PaymentProvider,
   VerifiedPayment
 } from "../payments/provider.js";
+import { sanitizePaymentEvidence } from "../payments/evidence.js";
 import { enableIdentityPaymentWrites } from "../payments/write-contract.js";
 import { parseProductSku } from "./catalog.js";
 import {
@@ -862,7 +863,7 @@ const persistVerifiedPaymentTransactionInTransaction = async (
       input.verified.channelTransactionId,
       input.amountFen,
       input.verified.currency,
-      JSON.stringify(input.verified.raw),
+      JSON.stringify(sanitizePaymentEvidence(input.verified.raw)),
       input.paidAt.toISOString()
     ]
   );
@@ -2795,7 +2796,7 @@ export const startPayment = async (
           created.prepayId ?? null,
           created.launchUrl,
           launchExpiresAt.toISOString(),
-          JSON.stringify(created.response),
+          JSON.stringify(sanitizePaymentEvidence(created.response)),
           prepared.generation
         ]
       );

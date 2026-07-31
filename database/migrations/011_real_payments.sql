@@ -498,6 +498,8 @@ ALTER TABLE payment_attempts
     DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE provider_payment_orders
+  ADD CONSTRAINT provider_payment_orders_canonical_attempt_unique
+    UNIQUE (canonical_attempt_id),
   ADD CONSTRAINT provider_payment_orders_owner_fk
     FOREIGN KEY (canonical_attempt_id, order_id, channel)
     REFERENCES payment_attempts(id, order_id, channel)
@@ -615,6 +617,13 @@ AS $$
 DECLARE
   owner_attempt payment_attempts%ROWTYPE;
 BEGIN
+  IF TG_OP = 'UPDATE'
+     AND NEW.id IS NOT DISTINCT FROM OLD.id
+     AND NEW.order_id IS NOT DISTINCT FROM OLD.order_id
+     AND NEW.channel IS NOT DISTINCT FROM OLD.channel
+     AND NEW.canonical_attempt_id IS NOT DISTINCT FROM OLD.canonical_attempt_id THEN
+    RETURN NULL;
+  END IF;
   SELECT * INTO owner_attempt
     FROM payment_attempts
    WHERE id = NEW.canonical_attempt_id;
@@ -644,6 +653,14 @@ AS $$
 DECLARE
   identity provider_payment_orders%ROWTYPE;
 BEGIN
+  IF TG_OP = 'UPDATE'
+     AND NEW.id IS NOT DISTINCT FROM OLD.id
+     AND NEW.order_id IS NOT DISTINCT FROM OLD.order_id
+     AND NEW.channel IS NOT DISTINCT FROM OLD.channel
+     AND NEW.provider_payment_order_id IS NOT DISTINCT FROM OLD.provider_payment_order_id
+     AND NEW.provider_identity_role IS NOT DISTINCT FROM OLD.provider_identity_role THEN
+    RETURN NULL;
+  END IF;
   SELECT * INTO identity
     FROM provider_payment_orders
    WHERE id = NEW.provider_payment_order_id;
@@ -822,7 +839,8 @@ DECLARE
 BEGIN
   SELECT * INTO payment_fact
     FROM payment_transactions
-   WHERE id = NEW.payment_transaction_id;
+   WHERE id = NEW.payment_transaction_id
+   FOR UPDATE;
   IF NOT FOUND
      OR payment_fact.status <> 'SUCCESS'
      OR payment_fact.order_id <> NEW.order_id

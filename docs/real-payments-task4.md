@@ -76,6 +76,8 @@ interface PaymentProvider {
 
 `VerifiedPayment` 保存 `providerOrderNo`，不再把本地 `orders.order_no` 当作支付机构订单号。微信查单返回 `REFUND` 时使用独立 `state=REFUND`，同时仍携带原成功支付的 transaction id、金额、币种和支付时间；恢复任务据此补齐本地成功交易及退款状态，禁止把它降格成未付款。只有原始非 2xx 响应通过微信签名验证，且 404 body 明确表示订单不存在时才映射为 `NOT_FOUND`；unsigned/tampered 404 必须映射 `UNKNOWN` 或抛出未知结果错误并保持锁。创建请求发出后遇到超时、断链或无法验证的响应映射为 `CREATE_UNKNOWN`；其余无法判定状态映射为 `UNKNOWN`。Provider 不读数据库；订单与尝试的对应关系由 commerce service 完成。
 
+`created.response -> response_snapshot` 与 `verified.raw -> verified_payload` 共用同一持久化 sanitizer：递归删除 authorization/signature/token/secret/private key/api key/payer/openid/buyer id/phone/email 类 key，安全处理循环引用与 BigInt，并限制深度、数组长度、对象键数、字符串字节数、节点数和最终 JSON 字节数。任一形状或总量超限只保存 `_truncated=true`、稳定 SHA-256 与原因；金额、币种、provider transaction id 等结算字段继续写入独立结构化列。
+
 ### 3.2 Transport 和 SDK port
 
 - 微信 provider 只依赖注入的 `PaymentHttpTransport`。生产 transport 使用 HTTPS；测试 transport 返回脚本化的原始状态码、响应头和响应体。
@@ -124,7 +126,7 @@ ALIPAY_PUBLIC_KEY_FILE=/run/secrets/alipay_public_key.pem
 支付机构商户单号拥有独立身份表：
 
 - `id UUID PRIMARY KEY`、`order_id`、`channel`、`provider_order_no`、`origin`（`legacy_order_no|attempt_v1`）、`allocated_at`、`canonical_attempt_id`、`manual_review_required`；
-- `UNIQUE(channel, provider_order_no)`，`channel/provider_order_no/origin/allocated_at` 在创建后由数据库 trigger 禁止修改；
+- `UNIQUE(channel, provider_order_no)` 与 `UNIQUE(canonical_attempt_id)`；`channel/provider_order_no/origin/allocated_at` 在创建后由数据库 trigger 禁止修改；
 - `canonical_attempt_id` 是唯一允许自动查单、关单、恢复的 owner，并与 identity 其他业务字段一样创建后不可修改。owner 关系使用可延迟外键，保证 identity 与 owner attempt 在同一事务提交；
 - `origin=attempt_v1` 的新 identity 必须与一个新 attempt 一对一，channel 只允许 `wechat_h5|alipay_wap`，禁止 `fake` 和 `audit_alias`；商户支付单号由渠道前缀、时间和随机数组成，最长 32 字符；
 - `origin=legacy_order_no` 可由同一 `order_id + channel` 的多个历史 attempt 共享；attempt 使用 `(provider_payment_order_id, order_id, channel)` 可延迟复合外键引用 identity，canonical owner 使用 `(canonical_attempt_id, order_id, channel)` 反向可延迟复合外键，数据库保证同 identity 全部 attempts 同 order/channel。`payment_attempts.provider_identity_role` 仅允许 `canonical_owner|audit_alias`，部分唯一索引保证每个 identity 只有一个 canonical owner；alias 只供审计。
@@ -150,7 +152,7 @@ ALIPAY_PUBLIC_KEY_FILE=/run/secrets/alipay_public_key.pem
 - `launch_expires_at TIMESTAMPTZ`：记录 H5/WAP 启动链接的本地可复用截止时间，微信不得超过官方 5 分钟；
 - 状态增加 `CREATE_UNKNOWN`、`RECONCILING`、`CLOSE_UNKNOWN`。创建响应不确定、查单/关单进行中和关单结果不确定均持续占用全渠道锁；
 - 部分唯一索引 `UNIQUE(order_id) WHERE status IN ('CREATED','REDIRECT_READY','PENDING','CREATE_UNKNOWN','RECONCILING','CLOSE_UNKNOWN')`，数据库层保证每个业务订单全渠道最多一个 active attempt；
-- owner guard trigger 保证 identity 的 `canonical_attempt_id`、渠道和 attempt role 一致，且 `attempt_v1` identity 无 alias。
+- owner guard trigger 保证 identity 的 `canonical_attempt_id`、渠道和 attempt role 一致，且 `attempt_v1` identity 无 alias；非关系字段 UPDATE 在比较 `id/order/channel/identity/role` 后直接返回，关系创建或变更仍执行完整校验。
 - legacy alias 统一终态化为 `status=CLOSED`、`reconciliation_state=TERMINAL`、`reconciliation_last_result=LEGACY_PROVIDER_IDENTITY_ALIAS`，清空 `reconciliation_next_at/deadline_at`；它不再占 active 索引、schedule 或 worker claim。若原 schedule/claim 仍有必要，只保留或原子转移到 canonical owner。
 
 创建接口超时后只允许 canonical owner 沿 `provider_payment_order_id` 取得原商户支付单号查单，禁止生成新单号盲目重试。
@@ -187,7 +189,7 @@ ALIPAY_PUBLIC_KEY_FILE=/run/secrets/alipay_public_key.pem
 新增：
 
 - `payment_attempt_id`、`payment_transaction_id`、`provider_refund_no` 最终均为 `NOT NULL`；
-- `(payment_transaction_id, order_id, payment_attempt_id, channel)` 复合外键直连同一付款事实，refund INSERT/UPDATE guard 要求 transaction `status=SUCCESS`；`CLOSED|REFUND` transaction 均不可绑定；
+- `(payment_transaction_id, order_id, payment_attempt_id, channel)` 复合外键直连同一付款事实，refund INSERT/UPDATE guard 以 `SELECT ... FOR UPDATE` 锁定付款事实并要求 transaction `status=SUCCESS`；`CLOSED|REFUND` transaction 均不可绑定，并发 refund INSERT 与 transaction 状态 UPDATE 必须串行复核；
 - 一旦被 refund 引用，原 `SUCCESS` payment transaction 是 append-only 财务事实，transaction UPDATE 反向 guard 以 `23514` 和稳定 constraint 名 `payment_transactions_refund_fact_immutable` 拒绝修改 `status/order_id/payment_attempt_id/channel/amount_fen/currency/channel_transaction_id`。退款结果只写 refund 事实，不把原 `SUCCESS` transaction 改成 `REFUND`；
 - `UNIQUE(channel, provider_refund_no)` 精确限定商户退款单号：同渠道重复返回 `23505`，不同渠道可使用同一文本单号；
 - `request_snapshot`、`failure_code`、`failure_message`、`succeeded_at`；
@@ -316,6 +318,7 @@ ALIPAY_PUBLIC_KEY_FILE=/run/secrets/alipay_public_key.pem
 - alias 强制 `CLOSED + TERMINAL + LEGACY_PROVIDER_IDENTITY_ALIAS` 且无 schedule/deadline；同 identity 全部 attempts 必须与 owner 同 order，必要 reconciliation 工作只归 owner；
 - 011 后每个新 attempt 一对一创建 `attempt_v1` identity，商户支付单号与 `orders.order_no` 分离且不可变；
 - owner 指针、identity 关联、channel、role、eligibility 和 identity 全字段具有数据库负例；旧版缺 identity 的 INSERT 在 011 后失败；冲突迁移断言 schema/data/version 全事务回滚；
+- 50,010 条 identity/attempt 的索引与状态更新门禁在一次性隔离数据库运行，两个 owner guard 全程保持 `tgenabled='O'`，结束后 terminate/drop 并验证无数据库或会话残留；
 - transaction-local `identity_v1:<txid_current()>` GUC kill-switch 同时拒绝静态 session token、跨事务过期 token、旧 preparePayment 与旧 reconciliation UPDATE；providerOrderNo 不匹配也拒绝；
 - legacy real/fake refund 精确保留 refund_no 并绑定唯一一致 `SUCCESS` transaction；0/多 SUCCESS、空 attempt、不一致付款事实 fail-fast，冲突诊断逐一列出实际相关 order/attempt/transaction/refund id，三张旧表的整行 JSON 快照与 schema/version 一起回滚；
 - `UNIQUE(channel, provider_refund_no)` 拒绝同渠道重号并允许跨渠道同号；refund INSERT/UPDATE 均拒绝 `CLOSED|REFUND` transaction，已被 refund 引用的 `SUCCESS` transaction 关键财务字段不可修改；真实进行中 eligibility 必须为 true，fake/终态必须为 false；
