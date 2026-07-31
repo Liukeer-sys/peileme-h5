@@ -88,7 +88,8 @@ export const commerceErrorCodes = [
   "PAYMENT_INITIALIZING",
   "PAYMENT_TOKEN_INVALID",
   "PAYMENT_TOKEN_USED",
-  "INVOICE_NOT_ALLOWED"
+  "INVOICE_NOT_ALLOWED",
+  "INVOICE_CONFLICT"
 ] as const;
 export type CommerceErrorCode = (typeof commerceErrorCodes)[number];
 

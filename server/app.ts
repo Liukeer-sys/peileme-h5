@@ -222,6 +222,7 @@ export const createApp = (
   app.use(optionalAuth);
   const commerceRouters = createCommerceRouters(options.paymentProvider);
   app.use("/api/commerce", commerceRouters.router);
+  app.use("/api/admin/commerce", commerceRouters.adminRouter);
   if (config.NODE_ENV === "test") {
     app.use("/api/test-payments", commerceRouters.testRouter);
   }

@@ -19,6 +19,7 @@ import {
 import {
   closeExpiredOrders,
   createOrder,
+  fulfillOrder,
   listOwnedOrders,
   markOrderPaid,
   startPayment
@@ -96,7 +97,10 @@ const insertAdminEntitlement = async (
   return entitlement.rows[0].id;
 };
 
-const insertPolicyDraft = async (userId: string) => {
+const insertPolicyDraft = async (
+  userId: string,
+  channel: "main" | "ai" = "main"
+) => {
   const draft = await query<{ id: string }>(
     `INSERT INTO assessments(
        user_id,
@@ -113,15 +117,39 @@ const insertPolicyDraft = async (userId: string) => {
        'visitor_commerce_test',
        'session_commerce_test',
        'in_progress',
-       'payment',
+       'awaiting_entitlement',
        '{"facts":{}}'::jsonb,
-       'main',
+       $2,
        '{}'::jsonb
      )
      RETURNING id`,
-    [userId]
+    [userId, channel]
   );
   return draft.rows[0].id;
+};
+
+const createFailedPaymentOrder = async (
+  userId: string,
+  marker: string
+) => {
+  const order = await createOrder({
+    userId,
+    sku: "POLICY_CALC",
+    channel: "main",
+    idempotencyKey: `${marker}-${randomUUID()}`,
+    businessDraftId: await insertPolicyDraft(userId)
+  });
+  const attempt = await query<{ id: string }>(
+    `INSERT INTO payment_attempts(order_id, channel, status)
+     VALUES ($1, 'fake', 'FAILED')
+     RETURNING id`,
+    [order.id]
+  );
+  await query(
+    "UPDATE orders SET status = 'PAYMENT_FAILED' WHERE id = $1",
+    [order.id]
+  );
+  return { order, attemptId: attempt.rows[0].id };
 };
 
 beforeAll(async () => {
@@ -1666,6 +1694,134 @@ describe("atomic commerce entitlements", () => {
 });
 
 describe("atomic commerce orders and payments", () => {
+  it("rejects completed, abandoned and wrong-step policy drafts without writes", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const drafts = await query<{ id: string; status: string }>(
+        `INSERT INTO assessments(
+           user_id,
+           visitor_id,
+           session_id,
+           status,
+           current_step,
+           answers,
+           product_channel,
+           input_snapshot,
+           completed_at
+         )
+         VALUES
+           (
+             $1, 'visitor_completed', 'session_completed', 'completed',
+             'result', '{}', 'main', '{}', now()
+           ),
+           (
+             $1, 'visitor_abandoned', 'session_abandoned', 'abandoned',
+             'awaiting_entitlement', '{}', 'main', '{}', NULL
+           ),
+           (
+             $1, 'visitor_wrong_step', 'session_wrong_step', 'in_progress',
+             'questionnaire', '{}', 'main', '{}', NULL
+           )
+         RETURNING id, status`,
+        [userId]
+      );
+      for (const draft of drafts.rows) {
+        await expect(
+          createOrder({
+            userId,
+            sku: "POLICY_CALC",
+            channel: "main",
+            idempotencyKey: `invalid-draft-${draft.status}-${draft.id}`,
+            businessDraftId: draft.id
+          })
+        ).rejects.toMatchObject({
+          code: "BUSINESS_DRAFT_NOT_FOUND"
+        });
+      }
+      const persisted = await query<{ orders: string; items: string }>(
+        `SELECT
+           (SELECT count(*)::text FROM orders WHERE user_id = $1) AS orders,
+           (
+             SELECT count(*)::text
+             FROM order_items oi
+             JOIN orders o ON o.id = oi.order_id
+             WHERE o.user_id = $1
+           ) AS items`,
+        [userId]
+      );
+      expect(persisted.rows[0]).toEqual({ orders: "0", items: "0" });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("requires an owned ready business draft for every SKU and channel", async () => {
+    await seedPolicyFoundation();
+    const userIds: string[] = [];
+    try {
+      const ownerId = await createEntitlementTestUser(true);
+      const otherUserId = await createEntitlementTestUser(true);
+      userIds.push(ownerId, otherUserId);
+      const aiDraftId = await insertPolicyDraft(ownerId, "ai");
+      const otherAiDraftId = await insertPolicyDraft(otherUserId, "ai");
+
+      for (const businessDraftId of [undefined, randomUUID(), otherAiDraftId]) {
+        await expect(
+          createOrder({
+            userId: ownerId,
+            sku: "AI_DOCUMENT_REVIEW",
+            channel: "ai",
+            idempotencyKey: `invalid-ai-draft-${randomUUID()}`,
+            businessDraftId
+          })
+        ).rejects.toMatchObject({
+          code: "BUSINESS_DRAFT_NOT_FOUND"
+        });
+      }
+      await expect(
+        createOrder({
+          userId: ownerId,
+          sku: "AI_DOCUMENT_REVIEW",
+          channel: "main",
+          idempotencyKey: `channel-draft-${randomUUID()}`,
+          businessDraftId: aiDraftId
+        })
+      ).rejects.toMatchObject({
+        code: "BUSINESS_DRAFT_NOT_FOUND"
+      });
+
+      await expect(
+        createOrder({
+          userId: ownerId,
+          sku: "AI_DOCUMENT_REVIEW",
+          channel: "ai",
+          idempotencyKey: `valid-ai-document-${randomUUID()}`,
+          businessDraftId: aiDraftId
+        })
+      ).resolves.toMatchObject({
+        sku: "AI_DOCUMENT_REVIEW",
+        channel: "ai",
+        businessDraftId: aiDraftId
+      });
+      await expect(
+        createOrder({
+          userId: ownerId,
+          sku: "AI_SEVERANCE_ANALYSIS",
+          channel: "ai",
+          idempotencyKey: `valid-ai-analysis-${randomUUID()}`,
+          businessDraftId: await insertPolicyDraft(ownerId, "ai")
+        })
+      ).resolves.toMatchObject({
+        sku: "AI_SEVERANCE_ANALYSIS",
+        channel: "ai"
+      });
+    } finally {
+      await cleanupEntitlementTestUsers(userIds);
+    }
+  });
+
   it("creates one order for concurrent retries and rejects changed intent", async () => {
     await seedPolicyFoundation();
     let userId: string | undefined;
@@ -1701,17 +1857,20 @@ describe("atomic commerce orders and payments", () => {
           userId,
           sku: "AI_DOCUMENT_REVIEW",
           channel: "main",
-          idempotencyKey: `wrong-site-${randomUUID()}`
+          idempotencyKey: `wrong-site-${randomUUID()}`,
+          businessDraftId: await insertPolicyDraft(userId, "main")
         })
       ).rejects.toMatchObject({
         code: "ORDER_CHANNEL_MISMATCH"
       });
+      const aiBusinessDraftId = await insertPolicyDraft(userId, "ai");
       await expect(
         createOrder({
           userId,
           sku: "AI_DOCUMENT_REVIEW",
           channel: "ai",
-          idempotencyKey: `ai-document-${randomUUID()}`
+          idempotencyKey: `ai-document-${randomUUID()}`,
+          businessDraftId: aiBusinessDraftId
         })
       ).resolves.toMatchObject({
         sku: "AI_DOCUMENT_REVIEW",
@@ -1893,6 +2052,183 @@ describe("atomic commerce orders and payments", () => {
     }
   });
 
+  it("rejects provider payments made after expiry without persisting settlement", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const order = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `late-provider-payment-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      const attempt = await query<{ id: string }>(
+        `INSERT INTO payment_attempts(order_id, channel, status)
+         VALUES ($1, 'fake', 'PENDING')
+         RETURNING id`,
+        [order.id]
+      );
+      await query(
+        `UPDATE orders
+         SET status = 'PAYING',
+             created_at = now() - interval '2 minutes',
+             expires_at = now() - interval '1 minute'
+         WHERE id = $1`,
+        [order.id]
+      );
+      const baseVerified = {
+        orderNo: order.orderNo,
+        channel: "fake" as const,
+        channelTransactionId: `late-${randomUUID()}`,
+        amountFen: order.amountFen,
+        currency: "CNY" as const,
+        raw: { source: "late-provider-payment" }
+      };
+      await expect(
+        markOrderPaid({
+          orderId: order.id,
+          paymentAttemptId: attempt.rows[0].id,
+          verified: {
+            ...baseVerified,
+            paidAt: new Date().toISOString()
+          }
+        })
+      ).rejects.toMatchObject({
+        code: "PAYMENT_VERIFICATION_FAILED"
+      });
+      const rejected = await query<{
+        transactions: string;
+        entitlements: string;
+      }>(
+        `SELECT
+           (SELECT count(*)::text FROM payment_transactions WHERE order_id = $1)
+             AS transactions,
+           (SELECT count(*)::text FROM entitlements WHERE source_id = $1)
+             AS entitlements`,
+        [order.id]
+      );
+      expect(rejected.rows[0]).toEqual({
+        transactions: "0",
+        entitlements: "0"
+      });
+
+      await expect(
+        markOrderPaid({
+          orderId: order.id,
+          paymentAttemptId: attempt.rows[0].id,
+          verified: {
+            ...baseVerified,
+            paidAt: new Date(Date.now() - 120_000).toISOString()
+          }
+        })
+      ).resolves.toMatchObject({ status: "COMPLETED" });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("recovers a paid order through the exported idempotent fulfillment entry", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const order = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `fulfillment-recovery-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      const attempt = await query<{ id: string }>(
+        `INSERT INTO payment_attempts(order_id, channel, status)
+         VALUES ($1, 'fake', 'SUCCEEDED')
+         RETURNING id`,
+        [order.id]
+      );
+      await query(
+        "UPDATE orders SET status = 'PAID', paid_at = now() WHERE id = $1",
+        [order.id]
+      );
+      await expect(fulfillOrder(order.id)).rejects.toMatchObject({
+        code: "ORDER_STATE_CONFLICT"
+      });
+      await query(
+        `INSERT INTO payment_transactions(
+           order_id,
+           payment_attempt_id,
+           channel,
+           channel_transaction_id,
+           amount_fen,
+           currency,
+           status,
+           verified_payload,
+           paid_at
+         )
+         VALUES ($1, $2, 'fake', $3, $4, 'CNY', 'SUCCESS', '{}', now())`,
+        [
+          order.id,
+          attempt.rows[0].id,
+          `fulfill-${randomUUID()}`,
+          order.amountFen
+        ]
+      );
+      await query(
+        `UPDATE order_items
+         SET entitlement_policy = '{"grantCount":"invalid"}'::jsonb
+         WHERE order_id = $1`,
+        [order.id]
+      );
+      await expect(fulfillOrder(order.id)).rejects.toMatchObject({
+        code: "INVALID_ENTITLEMENT_POLICY"
+      });
+      const afterFailure = await query<{
+        status: string;
+        entitlements: string;
+      }>(
+        `SELECT
+           status,
+           (SELECT count(*)::text FROM entitlements WHERE source_id = $1)
+             AS entitlements
+         FROM orders
+         WHERE id = $1`,
+        [order.id]
+      );
+      expect(afterFailure.rows[0]).toEqual({
+        status: "PAID",
+        entitlements: "0"
+      });
+      await query(
+        `UPDATE order_items
+         SET entitlement_policy = '{"grantCount":1}'::jsonb
+         WHERE order_id = $1`,
+        [order.id]
+      );
+
+      const first = await fulfillOrder(order.id);
+      await expect(fulfillOrder(order.id)).resolves.toEqual(first);
+      const persisted = await query<{
+        status: string;
+        entitlements: string;
+      }>(
+        `SELECT
+           status,
+           (SELECT count(*)::text FROM entitlements WHERE source_id = $1)
+             AS entitlements
+         FROM orders
+         WHERE id = $1`,
+        [order.id]
+      );
+      expect(persisted.rows[0]).toEqual({
+        status: "COMPLETED",
+        entitlements: "1"
+      });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
   it("keeps provider I/O outside order row locks", async () => {
     await seedPolicyFoundation();
     let userId: string | undefined;
@@ -2041,6 +2377,267 @@ describe("atomic commerce orders and payments", () => {
     }
   });
 
+  it("times out a hanging provider call and retries the same attempt", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const order = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `provider-timeout-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      const seenAttempts: string[] = [];
+      let calls = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment(input: {
+          attemptId: string;
+          orderNo: string;
+        }) {
+          seenAttempts.push(input.attemptId);
+          calls += 1;
+          if (calls === 1) {
+            return await new Promise<never>(() => undefined);
+          }
+          return {
+            prepayId: `timeout-retry-${input.attemptId}`,
+            launchUrl: `/timeout-retry/${input.orderNo}`,
+            response: {}
+          };
+        },
+        async queryPayment() {
+          return null;
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      const start = () =>
+        startPayment({
+          userId: userId!,
+          orderId: order.id,
+          provider,
+          clientIp: "127.0.0.1",
+          returnUrl: "http://peileme.test/return",
+          notifyUrl: "http://peileme.test/notify",
+          providerTimeoutMs: 20
+        });
+
+      const startedAt = Date.now();
+      await expect(start()).rejects.toMatchObject({
+        code: "PAYMENT_PROVIDER_FAILED"
+      });
+      expect(Date.now() - startedAt).toBeLessThan(1_000);
+      const retried = await start();
+      expect(seenAttempts).toEqual([
+        retried.paymentAttemptId,
+        retried.paymentAttemptId
+      ]);
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("recovers a provider-confirmed failed payment without creating a new prepay", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const failed = await createFailedPaymentOrder(
+        userId,
+        "query-paid-recovery"
+      );
+      let createCalls = 0;
+      let queryCalls = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          createCalls += 1;
+          throw new Error("must not create");
+        },
+        async queryPayment(orderNo: string) {
+          queryCalls += 1;
+          return {
+            orderNo,
+            channel: "fake" as const,
+            channelTransactionId: `query-paid-${randomUUID()}`,
+            amountFen: failed.order.amountFen,
+            currency: "CNY" as const,
+            paidAt: new Date().toISOString(),
+            raw: { source: "provider-query" }
+          };
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      await expect(
+        startPayment({
+          userId,
+          orderId: failed.order.id,
+          provider,
+          clientIp: "127.0.0.1",
+          returnUrl: "http://peileme.test/return",
+          notifyUrl: "http://peileme.test/notify",
+          providerTimeoutMs: 100
+        })
+      ).resolves.toMatchObject({
+        status: "COMPLETED",
+        paymentAttemptId: failed.attemptId,
+        launchUrl: "http://peileme.test/return"
+      });
+      expect({ createCalls, queryCalls }).toEqual({
+        createCalls: 0,
+        queryCalls: 1
+      });
+      const persisted = await query<{
+        attempts: string;
+        transactions: string;
+        entitlements: string;
+      }>(
+        `SELECT
+           (SELECT count(*)::text FROM payment_attempts WHERE order_id = $1)
+             AS attempts,
+           (SELECT count(*)::text FROM payment_transactions WHERE order_id = $1)
+             AS transactions,
+           (SELECT count(*)::text FROM entitlements WHERE source_id = $1)
+             AS entitlements`,
+        [failed.order.id]
+      );
+      expect(persisted.rows[0]).toEqual({
+        attempts: "1",
+        transactions: "1",
+        entitlements: "1"
+      });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("reuses the failed attempt when provider query reports no payment", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const failed = await createFailedPaymentOrder(
+        userId,
+        "query-null-retry"
+      );
+      let createCalls = 0;
+      let queryCalls = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment(input: {
+          attemptId: string;
+          orderNo: string;
+        }) {
+          createCalls += 1;
+          return {
+            prepayId: `query-null-${input.attemptId}`,
+            launchUrl: `/query-null/${input.orderNo}`,
+            response: {}
+          };
+        },
+        async queryPayment() {
+          queryCalls += 1;
+          return null;
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      const retried = await startPayment({
+        userId,
+        orderId: failed.order.id,
+        provider,
+        clientIp: "127.0.0.1",
+        returnUrl: "http://peileme.test/return",
+        notifyUrl: "http://peileme.test/notify",
+        providerTimeoutMs: 100
+      });
+      expect(retried).toMatchObject({
+        status: "PAYING",
+        paymentAttemptId: failed.attemptId
+      });
+      expect({ createCalls, queryCalls }).toEqual({
+        createCalls: 1,
+        queryCalls: 1
+      });
+      const attempts = await query<{ count: string }>(
+        "SELECT count(*)::text AS count FROM payment_attempts WHERE order_id = $1",
+        [failed.order.id]
+      );
+      expect(attempts.rows[0].count).toBe("1");
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("keeps a failed order unchanged when provider query errors", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const failed = await createFailedPaymentOrder(
+        userId,
+        "query-error-safe"
+      );
+      let createCalls = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          createCalls += 1;
+          throw new Error("must not create");
+        },
+        async queryPayment() {
+          throw new Error("provider query unavailable secret");
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      await expect(
+        startPayment({
+          userId,
+          orderId: failed.order.id,
+          provider,
+          clientIp: "127.0.0.1",
+          returnUrl: "http://peileme.test/return",
+          notifyUrl: "http://peileme.test/notify",
+          providerTimeoutMs: 100
+        })
+      ).rejects.toMatchObject({
+        code: "PAYMENT_PROVIDER_FAILED"
+      });
+      expect(createCalls).toBe(0);
+      const persisted = await query<{
+        status: string;
+        attempts: string;
+        transactions: string;
+      }>(
+        `SELECT
+           status,
+           (SELECT count(*)::text FROM payment_attempts WHERE order_id = $1)
+             AS attempts,
+           (SELECT count(*)::text FROM payment_transactions WHERE order_id = $1)
+             AS transactions
+         FROM orders
+         WHERE id = $1`,
+        [failed.order.id]
+      );
+      expect(persisted.rows[0]).toEqual({
+        status: "PAYMENT_FAILED",
+        attempts: "1",
+        transactions: "0"
+      });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
   it("allows one of two orders to own a concurrent provider transaction ID", async () => {
     await seedPolicyFoundation();
     const userIds: string[] = [];
@@ -2169,6 +2766,9 @@ describe("atomic commerce orders and payments", () => {
         closeExpiredOrders()
       ]);
       expect(outcomes[1].status).toBe("fulfilled");
+      if (outcomes[0].status === "rejected") {
+        await closeExpiredOrders();
+      }
 
       const persisted = await query<{
         status: string;
@@ -2204,9 +2804,10 @@ describe("atomic commerce orders and payments", () => {
             }
       );
       if (outcomes[0].status === "rejected") {
-        expect(outcomes[0].reason).toMatchObject({
-          code: "ORDER_STATE_CONFLICT"
-        });
+        expect([
+          "ORDER_STATE_CONFLICT",
+          "PAYMENT_VERIFICATION_FAILED"
+        ]).toContain(outcomes[0].reason.code);
       }
     } finally {
       if (userId) await cleanupEntitlementTestUsers([userId]);
@@ -2238,6 +2839,7 @@ describe("atomic commerce orders and payments", () => {
       };
       const paid = await makeOrderWithAttempt("paid-expiry");
       const pending = await makeOrderWithAttempt("pending-expiry");
+      const failed = await makeOrderWithAttempt("failed-expiry");
       await markOrderPaid({
         orderId: paid.order.id,
         paymentAttemptId: paid.attemptId,
@@ -2257,15 +2859,32 @@ describe("atomic commerce orders and payments", () => {
                 expires_at = now() - interval '1 second',
                 status = CASE
                   WHEN id = $2 THEN 'PAYING'
+                  WHEN id = $3 THEN 'PAYMENT_FAILED'
                   ELSE status
                 END
           WHERE id = ANY($1::uuid[])`,
-        [[paid.order.id, pending.order.id], pending.order.id]
+        [
+          [paid.order.id, pending.order.id, failed.order.id],
+          pending.order.id,
+          failed.order.id
+        ]
+      );
+      await query(
+        "UPDATE payment_attempts SET status = 'FAILED' WHERE id = $1",
+        [failed.attemptId]
       );
 
-      await expect(closeExpiredOrders()).resolves.toEqual([
-        pending.order.id
-      ]);
+      await expect(closeExpiredOrders(0)).rejects.toMatchObject({
+        code: "INVALID_COMMERCE_INPUT"
+      });
+      await expect(closeExpiredOrders(501)).rejects.toMatchObject({
+        code: "INVALID_COMMERCE_INPUT"
+      });
+      const firstBatch = await closeExpiredOrders(1);
+      const secondBatch = await closeExpiredOrders(1);
+      expect([...firstBatch, ...secondBatch].sort()).toEqual(
+        [pending.order.id, failed.order.id].sort()
+      );
       const states = await query<{
         id: string;
         order_status: string;
@@ -2279,7 +2898,7 @@ describe("atomic commerce orders and payments", () => {
          JOIN payment_attempts pa ON pa.order_id = o.id
          WHERE o.id = ANY($1::uuid[])
          ORDER BY o.id`,
-        [[paid.order.id, pending.order.id]]
+        [[paid.order.id, pending.order.id, failed.order.id]]
       );
       expect(
         new Map(states.rows.map((row) => [row.id, row]))
@@ -2297,6 +2916,14 @@ describe("atomic commerce orders and payments", () => {
             pending.order.id,
             {
               id: pending.order.id,
+              order_status: "CLOSED",
+              attempt_status: "CLOSED"
+            }
+          ],
+          [
+            failed.order.id,
+            {
+              id: failed.order.id,
               order_status: "CLOSED",
               attempt_status: "CLOSED"
             }
@@ -2322,6 +2949,101 @@ describe("atomic commerce orders and payments", () => {
         delete process.env.PAYMENT_MODE;
       } else {
         process.env.PAYMENT_MODE = previousPaymentMode;
+      }
+      resetConfigForTests();
+    }
+  });
+
+  it("uses the matching main and AI site origins for payment returns", async () => {
+    await seedPolicyFoundation();
+    const previousOrigin = process.env.APP_ORIGIN;
+    const userIds: string[] = [];
+    try {
+      process.env.APP_ORIGIN =
+        "https://peileme.art,https://ai.peileme.art";
+      resetConfigForTests();
+      const userId = await createEntitlementTestUser(true);
+      userIds.push(userId);
+      const user = await query<{ email: string }>(
+        "SELECT email FROM users WHERE id = $1",
+        [userId]
+      );
+      const token = await signAccessToken({
+        id: userId,
+        role: "user",
+        email: user.rows[0].email,
+        phone: null,
+        displayName: null,
+        status: "active"
+      });
+      const orders = await Promise.all([
+        createOrder({
+          userId,
+          sku: "POLICY_CALC",
+          channel: "main",
+          idempotencyKey: `return-main-${randomUUID()}`,
+          businessDraftId: await insertPolicyDraft(userId, "main")
+        }),
+        createOrder({
+          userId,
+          sku: "AI_DOCUMENT_REVIEW",
+          channel: "ai",
+          idempotencyKey: `return-ai-${randomUUID()}`,
+          businessDraftId: await insertPolicyDraft(userId, "ai")
+        })
+      ]);
+      const seen = new Map<string, string>();
+      const provider = {
+        channel: "fake" as const,
+        async createPayment(input: {
+          attemptId: string;
+          orderNo: string;
+          returnUrl: string;
+        }) {
+          seen.set(input.orderNo, input.returnUrl);
+          return {
+            prepayId: input.attemptId,
+            launchUrl: `/return/${input.orderNo}`,
+            response: {}
+          };
+        },
+        async queryPayment() {
+          return null;
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      const app = createApp({ paymentProvider: provider });
+      for (const order of orders) {
+        await request(app)
+          .post(`/api/commerce/orders/${order.id}/pay`)
+          .set("authorization", `Bearer ${token}`)
+          .send({ channel: "fake" })
+          .expect(200);
+      }
+      expect(seen.get(orders[0].orderNo)).toBe(
+        `https://peileme.art/orders/${orders[0].id}`
+      );
+      expect(seen.get(orders[1].orderNo)).toBe(
+        `https://ai.peileme.art/orders/${orders[1].id}`
+      );
+
+      process.env.APP_ORIGIN = "https://peileme.art";
+      resetConfigForTests();
+      const misconfiguredApp = createApp({ paymentProvider: provider });
+      await request(misconfiguredApp)
+        .post(`/api/commerce/orders/${orders[1].id}/pay`)
+        .set("authorization", `Bearer ${token}`)
+        .send({ channel: "fake" })
+        .expect(503);
+      expect(seen.size).toBe(2);
+    } finally {
+      await cleanupEntitlementTestUsers(userIds);
+      if (previousOrigin === undefined) {
+        delete process.env.APP_ORIGIN;
+      } else {
+        process.env.APP_ORIGIN = previousOrigin;
       }
       resetConfigForTests();
     }
@@ -2430,11 +3152,48 @@ describe("atomic commerce orders and payments", () => {
         .post(`${launch.pathname}${launch.search}`)
         .send({ amountFen: "1" })
         .expect(400);
-      const completed = await request(app)
+      await query(
+        `UPDATE order_items
+         SET entitlement_policy = '{"grantCount":"invalid"}'::jsonb
+         WHERE order_id = $1`,
+        [order.body.id]
+      );
+      await request(app)
         .post(`${launch.pathname}${launch.search}`)
         .send({})
-        .expect(200);
-      expect(completed.body.status).toBe("COMPLETED");
+        .expect(500);
+      const afterFailedSettlement = await query<{
+        transactions: string;
+        entitlements: string;
+      }>(
+        `SELECT
+           (SELECT count(*)::text FROM payment_transactions WHERE order_id = $1)
+             AS transactions,
+           (SELECT count(*)::text FROM entitlements WHERE source_id = $1)
+             AS entitlements`,
+        [order.body.id]
+      );
+      expect(afterFailedSettlement.rows[0]).toEqual({
+        transactions: "0",
+        entitlements: "0"
+      });
+      await query(
+        `UPDATE order_items
+         SET entitlement_policy = '{"grantCount":1}'::jsonb
+         WHERE order_id = $1`,
+        [order.body.id]
+      );
+      const concurrentCompletions = await Promise.all([
+        request(app).post(`${launch.pathname}${launch.search}`).send({}),
+        request(app).post(`${launch.pathname}${launch.search}`).send({})
+      ]);
+      expect(concurrentCompletions.map((item) => item.status).sort()).toEqual([
+        200,
+        409
+      ]);
+      expect(
+        concurrentCompletions.find((item) => item.status === 200)?.body.status
+      ).toBe("COMPLETED");
       await request(app)
         .post(`${launch.pathname}${launch.search}`)
         .send({})
@@ -2457,6 +3216,14 @@ describe("atomic commerce orders and payments", () => {
         })
         .expect(201);
       expect(repeatedInvoice.body.id).toBe(invoice.body.id);
+      await request(app)
+        .post(`/api/commerce/orders/${order.body.id}/invoice`)
+        .set("authorization", `Bearer ${token}`)
+        .send({
+          title: "变更后的抬头",
+          email: "invoice@peileme.test"
+        })
+        .expect(409);
 
       const persisted = await query<{
         attempts: string;
@@ -2489,6 +3256,77 @@ describe("atomic commerce orders and payments", () => {
         process.env.PAYMENT_MODE = previousPaymentMode;
       }
       resetConfigForTests();
+    }
+  });
+
+  it("mounts a minimal authenticated admin commerce status endpoint", async () => {
+    await seedPolicyFoundation();
+    const userIds: string[] = [];
+    try {
+      const userId = await createEntitlementTestUser(true);
+      userIds.push(userId);
+      const adminId = await createEntitlementTestUser(true);
+      userIds.push(adminId);
+      await query("UPDATE users SET role = 'admin' WHERE id = $1", [adminId]);
+      const tokenFor = async (id: string, role: "user" | "admin") => {
+        const user = await query<{ email: string }>(
+          "SELECT email FROM users WHERE id = $1",
+          [id]
+        );
+        return signAccessToken({
+          id,
+          role,
+          email: user.rows[0].email,
+          phone: null,
+          displayName: null,
+          status: "active"
+        });
+      };
+      const app = createApp();
+      await request(app)
+        .get("/api/admin/commerce/status")
+        .set("authorization", `Bearer ${await tokenFor(userId, "user")}`)
+        .expect(403);
+      const admin = await request(app)
+        .get("/api/admin/commerce/status")
+        .set("authorization", `Bearer ${await tokenFor(adminId, "admin")}`)
+        .expect(200);
+      expect(admin.body).toMatchObject({ paymentMode: "disabled" });
+      expect(admin.body.counts).toEqual({
+        openOrders: expect.stringMatching(/^\d+$/),
+        pendingAttempts: expect.stringMatching(/^\d+$/)
+      });
+
+      const expiredOrder = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `admin-close-expired-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      await query(
+        `UPDATE orders
+         SET created_at = now() - interval '2 seconds',
+             expires_at = now() - interval '1 second'
+         WHERE id = $1`,
+        [expiredOrder.id]
+      );
+      await request(app)
+        .post("/api/admin/commerce/close-expired")
+        .set("authorization", `Bearer ${await tokenFor(userId, "user")}`)
+        .send({ limit: 1 })
+        .expect(403);
+      const closed = await request(app)
+        .post("/api/admin/commerce/close-expired")
+        .set("authorization", `Bearer ${await tokenFor(adminId, "admin")}`)
+        .send({ limit: 1 })
+        .expect(200);
+      expect(closed.body).toEqual({
+        closedCount: 1,
+        closedOrderIds: [expiredOrder.id]
+      });
+    } finally {
+      await cleanupEntitlementTestUsers(userIds);
     }
   });
 });

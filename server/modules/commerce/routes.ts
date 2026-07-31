@@ -3,7 +3,7 @@ import { z } from "zod";
 import { ApiError } from "../../errors.js";
 import { getConfig } from "../../config.js";
 import { query } from "../../db.js";
-import { requireAuth } from "../../security.js";
+import { requireAdmin, requireAuth } from "../../security.js";
 import { getActiveCatalog } from "./catalog.js";
 import {
   closeExpiredOrders,
@@ -44,6 +44,7 @@ const commerceStatuses: Partial<
   PAYMENT_TOKEN_INVALID: { status: 404, message: "测试支付凭证无效" },
   PAYMENT_TOKEN_USED: { status: 409, message: "测试支付凭证已使用" },
   INVOICE_NOT_ALLOWED: { status: 409, message: "当前订单不可申请发票" },
+  INVOICE_CONFLICT: { status: 409, message: "该订单已有不同的开票资料" },
   INVALID_ENTITLEMENT_POLICY: { status: 500, message: "商品履约配置无效" }
 };
 
@@ -85,6 +86,32 @@ const invoiceBodySchema = z
 const requestIp = (request: Request) =>
   request.ip || request.socket.remoteAddress || "127.0.0.1";
 
+const originForChannel = (
+  configuredOrigins: string,
+  channel: "main" | "ai"
+) => {
+  const origins = configuredOrigins
+    .split(",")
+    .map((item) => item.trim().replace(/\/+$/, ""))
+    .filter(Boolean);
+  const classifyOrigin = (origin: string) => {
+    try {
+      const parsed = new URL(origin);
+      if (!["http:", "https:"].includes(parsed.protocol)) return undefined;
+      return parsed.hostname.split(".")[0] === "ai" ? "ai" : "main";
+    } catch {
+      return undefined;
+    }
+  };
+  const selected = origins.find(
+    (origin) => classifyOrigin(origin) === channel
+  );
+  if (!selected) {
+    throw new CommerceError("PAYMENT_PROVIDER_FAILED");
+  }
+  return selected;
+};
+
 export const createCommerceRouters = (
   provider?: PaymentProvider
 ) => {
@@ -96,6 +123,7 @@ export const createCommerceRouters = (
       : undefined);
   const router = Router();
   const testRouter = Router();
+  const adminRouter = Router();
 
   router.get("/catalog", async (request, response, next) => {
     try {
@@ -132,13 +160,18 @@ export const createCommerceRouters = (
           throw new CommerceError("PAYMENT_PROVIDER_FAILED");
         }
         const orderId = uuidSchema.parse(request.params.id);
+        const order = await getOwnedOrder(request.authUser!.id, orderId);
+        const returnOrigin = originForChannel(
+          config.APP_ORIGIN,
+          order.channel
+        );
         response.json(
           await startPayment({
             userId: request.authUser!.id,
             orderId,
             provider: paymentProvider,
             clientIp: requestIp(request),
-            returnUrl: `${config.APP_ORIGIN.split(",")[0]}/orders/${orderId}`,
+            returnUrl: `${returnOrigin}/orders/${orderId}`,
             notifyUrl: "/api/test-payments/notify"
           })
         );
@@ -200,38 +233,109 @@ export const createCommerceRouters = (
     }
   );
 
+  adminRouter.get(
+    "/status",
+    requireAuth,
+    requireAdmin,
+    async (_request, response, next) => {
+      try {
+        const result = await query<{
+          open_orders: string;
+          pending_attempts: string;
+        }>(
+          `SELECT
+             (
+               SELECT count(*)::text
+               FROM orders
+               WHERE status IN (
+                 'CREATED',
+                 'PAYING',
+                 'PAYMENT_FAILED',
+                 'PAID',
+                 'FULFILLING'
+               )
+             ) AS open_orders,
+             (
+               SELECT count(*)::text
+               FROM payment_attempts
+               WHERE status IN ('CREATED', 'REDIRECT_READY', 'PENDING')
+             ) AS pending_attempts`
+        );
+        response.json({
+          paymentMode: config.PAYMENT_MODE,
+          counts: {
+            openOrders: result.rows[0]?.open_orders ?? "0",
+            pendingAttempts: result.rows[0]?.pending_attempts ?? "0"
+          }
+        });
+      } catch (error) {
+        next(commerceApiError(error));
+      }
+    }
+  );
+
+  adminRouter.post(
+    "/close-expired",
+    requireAuth,
+    requireAdmin,
+    async (request, response, next) => {
+      try {
+        const body = z
+          .object({
+            limit: z.number().int().min(1).max(500).default(200)
+          })
+          .strict()
+          .parse(request.body);
+        const closedOrderIds = await closeExpiredOrders(body.limit);
+        response.json({
+          closedCount: closedOrderIds.length,
+          closedOrderIds
+        });
+      } catch (error) {
+        next(commerceApiError(error));
+      }
+    }
+  );
+
   if (config.NODE_ENV === "test" && paymentProvider instanceof FakePaymentProvider) {
     testRouter.post(
       "/:orderNo/complete",
       async (request, response, next) => {
+        let token: string | undefined;
+        let completionStarted = false;
         try {
           z.object({}).strict().parse(request.body);
           const orderNo = z.string().trim().min(1).max(80).parse(
             request.params.orderNo
           );
-          const token = z.string().min(20).max(300).parse(
+          token = z.string().min(20).max(300).parse(
             request.query.token
           );
-          const verified = paymentProvider.complete(orderNo, token);
+          const verified = paymentProvider.beginCompletion(orderNo, token);
+          completionStarted = true;
           const attemptId = z.string().uuid().parse(
             verified.raw.attemptId
           );
           const order = await queryOrderId(orderNo);
-          response.json(
-            await markOrderPaid({
-              orderId: order,
-              paymentAttemptId: attemptId,
-              verified
-            })
-          );
+          const completed = await markOrderPaid({
+            orderId: order,
+            paymentAttemptId: attemptId,
+            verified
+          });
+          paymentProvider.commitCompletion(token);
+          completionStarted = false;
+          response.json(completed);
         } catch (error) {
+          if (completionStarted && token) {
+            paymentProvider.rollbackCompletion(token);
+          }
           next(commerceApiError(error));
         }
       }
     );
   }
 
-  return { router, testRouter };
+  return { router, testRouter, adminRouter };
 };
 
 const queryOrderId = async (orderNo: string) => {

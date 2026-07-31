@@ -148,21 +148,22 @@ const makeOrderNo = () =>
     .slice(0, 14)
     .toUpperCase()}`;
 
-const assertOwnedPolicyDraft = async (
+const assertOwnedBusinessDraft = async (
   client: pg.PoolClient,
   userId: string,
-  sku: ProductSku,
+  channel: OrderProductChannel,
   businessDraftId?: string
 ) => {
-  if (sku !== "POLICY_CALC") return;
   if (!businessDraftId) {
     throw new CommerceError("BUSINESS_DRAFT_NOT_FOUND");
   }
   const draft = await client.query<{
     user_id: string | null;
     product_channel: string;
+    status: string;
+    current_step: string;
   }>(
-    `SELECT user_id, product_channel
+    `SELECT user_id, product_channel, status, current_step
      FROM assessments
      WHERE id = $1
      FOR SHARE`,
@@ -170,7 +171,9 @@ const assertOwnedPolicyDraft = async (
   );
   if (
     draft.rows[0]?.user_id !== userId ||
-    draft.rows[0]?.product_channel !== "main"
+    draft.rows[0]?.product_channel !== channel ||
+    draft.rows[0]?.status !== "in_progress" ||
+    draft.rows[0]?.current_step !== "awaiting_entitlement"
   ) {
     throw new CommerceError("BUSINESS_DRAFT_NOT_FOUND");
   }
@@ -215,10 +218,10 @@ export const createOrder = async (
       return mapOrder(current);
     }
 
-    await assertOwnedPolicyDraft(
+    await assertOwnedBusinessDraft(
       client,
       userId,
-      sku,
+      channel,
       businessDraftId
     );
     const product = await client.query<{
@@ -399,6 +402,82 @@ const loadFulfillmentOrder = async (
   return order;
 };
 
+const fulfillOrderInTransaction = async (
+  client: pg.PoolClient,
+  order: OrderFulfillmentRow
+): Promise<CommerceOrder> => {
+  const successfulTransaction = await client.query<{ id: string }>(
+    `SELECT id
+     FROM payment_transactions
+     WHERE order_id = $1
+       AND status = 'SUCCESS'
+     ORDER BY paid_at, id
+     LIMIT 1
+     FOR SHARE`,
+    [order.id]
+  );
+  if (!successfulTransaction.rows[0]) {
+    throw new CommerceError("ORDER_STATE_CONFLICT");
+  }
+  if (order.status === "COMPLETED") {
+    return mapOrder(order);
+  }
+  if (!["PAID", "FULFILLING"].includes(order.status)) {
+    throw new CommerceError("ORDER_STATE_CONFLICT");
+  }
+
+  const grantCount = parseGrantCount(order.entitlement_policy);
+  if (order.status === "PAID") {
+    await client.query(
+      `UPDATE orders
+       SET status = 'FULFILLING',
+           updated_at = now()
+       WHERE id = $1`,
+      [order.id]
+    );
+  }
+  await client.query(
+    `INSERT INTO entitlements(
+       user_id,
+       product_id,
+       source_type,
+       source_id,
+       total_uses,
+       remaining_uses,
+       status
+     )
+     VALUES ($1, $2, 'order', $3, $4, $4, 'active')
+     ON CONFLICT (user_id, product_id, source_type, source_id)
+       WHERE source_id IS NOT NULL
+     DO NOTHING`,
+    [order.user_id, order.product_id, order.id, grantCount]
+  );
+  await client.query(
+    `UPDATE orders
+     SET status = 'COMPLETED',
+         completed_at = COALESCE(completed_at, now()),
+         updated_at = now()
+     WHERE id = $1`,
+    [order.id]
+  );
+  const completed = await client.query<OrderRow>(
+    `${orderSelect}
+     WHERE o.id = $1`,
+    [order.id]
+  );
+  return mapOrder(completed.rows[0]);
+};
+
+export const fulfillOrder = async (
+  orderIdInput: string
+): Promise<CommerceOrder> => {
+  const orderId = requireUuid(orderIdInput);
+  return withTransaction(async (client) => {
+    const order = await loadFulfillmentOrder(client, orderId);
+    return fulfillOrderInTransaction(client, order);
+  });
+};
+
 export const markOrderPaid = async ({
   orderId: orderIdInput,
   paymentAttemptId: paymentAttemptIdInput,
@@ -421,6 +500,9 @@ export const markOrderPaid = async ({
 
   return withTransaction(async (client) => {
     const order = await loadFulfillmentOrder(client, orderId);
+    if (paidAt.getTime() > order.expires_at.getTime()) {
+      throw new CommerceError("PAYMENT_VERIFICATION_FAILED");
+    }
     const attempt = await client.query<{
       id: string;
       channel: PaymentChannel;
@@ -482,7 +564,9 @@ export const markOrderPaid = async ({
       throw new CommerceError("ORDER_STATE_CONFLICT");
     }
     if (
-      !["CREATED", "PAYING", "PAYMENT_FAILED"].includes(order.status)
+      !["CREATED", "PAYING", "PAYMENT_FAILED", "CLOSED"].includes(
+        order.status
+      )
     ) {
       throw new CommerceError("ORDER_STATE_CONFLICT");
     }
@@ -559,55 +643,16 @@ export const markOrderPaid = async ({
       `UPDATE orders
        SET status = 'PAID',
            paid_at = $2,
+           closed_at = NULL,
            updated_at = now()
        WHERE id = $1`,
       [order.id, paidAt.toISOString()]
     );
 
-    const grantCount = parseGrantCount(order.entitlement_policy);
-    await client.query(
-      `UPDATE orders
-       SET status = 'FULFILLING',
-           updated_at = now()
-       WHERE id = $1`,
-      [order.id]
-    );
-    await client.query(
-      `INSERT INTO entitlements(
-         user_id,
-         product_id,
-         source_type,
-         source_id,
-         total_uses,
-         remaining_uses,
-         status
-       )
-       VALUES ($1, $2, 'order', $3, $4, $4, 'active')
-       ON CONFLICT (user_id, product_id, source_type, source_id)
-         WHERE source_id IS NOT NULL
-       DO NOTHING`,
-      [order.user_id, order.product_id, order.id, grantCount]
-    );
-    const completed = await client.query<OrderRow>(
-      `${orderSelect}
-       WHERE o.id = $1
-       FOR UPDATE OF o`,
-      [order.id]
-    );
-    const finalState = await client.query<{ updated_at: Date }>(
-      `UPDATE orders
-       SET status = 'COMPLETED',
-           completed_at = now(),
-           updated_at = now()
-       WHERE id = $1
-       RETURNING updated_at`,
-      [order.id]
-    );
-    return {
-      ...mapOrder(completed.rows[0]),
-      status: "COMPLETED",
-      updatedAt: finalState.rows[0].updated_at
-    };
+    return fulfillOrderInTransaction(client, {
+      ...order,
+      status: "PAID"
+    });
   });
 };
 
@@ -655,15 +700,20 @@ export const listOwnedOrders = async (
   };
 };
 
-export const closeExpiredOrders = async () => {
+export const closeExpiredOrders = async (limit = 200) => {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+    throw new CommerceError("INVALID_COMMERCE_INPUT");
+  }
   return withTransaction(async (client) => {
     const expired = await client.query<{ id: string }>(
       `SELECT id
        FROM orders
        WHERE expires_at <= now()
-         AND status IN ('CREATED', 'PAYING')
+         AND status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED')
        ORDER BY expires_at, id
-       FOR UPDATE SKIP LOCKED`
+       LIMIT $1
+       FOR UPDATE SKIP LOCKED`,
+      [limit]
     );
     const orderIds = expired.rows.map((row) => row.id);
     if (!orderIds.length) return [];
@@ -672,7 +722,7 @@ export const closeExpiredOrders = async () => {
        SET status = 'CLOSED',
            updated_at = now()
        WHERE order_id = ANY($1::uuid[])
-         AND status IN ('CREATED', 'REDIRECT_READY', 'PENDING')`,
+         AND status IN ('CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED')`,
       [orderIds]
     );
     const result = await client.query<{ id: string }>(
@@ -681,7 +731,7 @@ export const closeExpiredOrders = async () => {
            closed_at = now(),
            updated_at = now()
        WHERE id = ANY($1::uuid[])
-         AND status IN ('CREATED', 'PAYING')
+         AND status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED')
        RETURNING id`,
       [orderIds]
     );
@@ -703,6 +753,74 @@ type PreparedPayment = {
   attemptId: string;
   generation: string;
   order: CommerceOrder;
+};
+
+type FailedPaymentRecovery = {
+  orderId: string;
+  orderNo: string;
+  attemptId: string;
+  expiresAt: Date;
+};
+
+const withPaymentProviderTimeout = async <T>(
+  operation: Promise<T>,
+  timeoutMs: number
+) => {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("Payment provider timeout")),
+          timeoutMs
+        );
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+};
+
+const getFailedPaymentRecovery = async (
+  userId: string,
+  orderId: string,
+  channel: PaymentChannel
+): Promise<FailedPaymentRecovery | undefined> => {
+  const result = await query<{
+    id: string;
+    order_no: string;
+    attempt_id: string;
+    expires_at: Date;
+  }>(
+    `SELECT
+       o.id,
+       o.order_no,
+       attempt.id AS attempt_id,
+       o.expires_at
+     FROM orders o
+     JOIN LATERAL (
+       SELECT id
+       FROM payment_attempts
+       WHERE order_id = o.id
+         AND channel = $3
+       ORDER BY created_at DESC, id DESC
+       LIMIT 1
+     ) attempt ON true
+     WHERE o.id = $1
+       AND o.user_id = $2
+       AND o.status = 'PAYMENT_FAILED'`,
+    [orderId, userId, channel]
+  );
+  const row = result.rows[0];
+  return row
+    ? {
+        orderId: row.id,
+        orderNo: row.order_no,
+        attemptId: row.attempt_id,
+        expiresAt: row.expires_at
+      }
+    : undefined;
 };
 
 const preparePayment = async (
@@ -868,10 +986,50 @@ export const startPayment = async (
     clientIp: string;
     returnUrl: string;
     notifyUrl: string;
+    providerTimeoutMs?: number;
   }
 ): Promise<PaymentStartResult> => {
   const userId = requireUuid(input.userId);
   const orderId = requireUuid(input.orderId);
+  const providerTimeoutMs = input.providerTimeoutMs ?? 15_000;
+  if (
+    !Number.isInteger(providerTimeoutMs) ||
+    providerTimeoutMs < 1 ||
+    providerTimeoutMs > 60_000
+  ) {
+    throw new CommerceError("INVALID_COMMERCE_INPUT");
+  }
+  const failedRecovery = await getFailedPaymentRecovery(
+    userId,
+    orderId,
+    input.provider.channel
+  );
+  if (failedRecovery) {
+    let verified: VerifiedPayment | null;
+    try {
+      verified = await withPaymentProviderTimeout(
+        input.provider.queryPayment(failedRecovery.orderNo),
+        providerTimeoutMs
+      );
+    } catch {
+      throw new CommerceError("PAYMENT_PROVIDER_FAILED");
+    }
+    if (verified) {
+      const completed = await markOrderPaid({
+        orderId: failedRecovery.orderId,
+        paymentAttemptId: failedRecovery.attemptId,
+        verified
+      });
+      return {
+        orderId: completed.id,
+        orderNo: completed.orderNo,
+        status: completed.status,
+        paymentAttemptId: failedRecovery.attemptId,
+        launchUrl: input.returnUrl,
+        expiresAt: completed.expiresAt
+      };
+    }
+  }
   const prepared = await preparePayment(
     userId,
     orderId,
@@ -880,15 +1038,18 @@ export const startPayment = async (
   if (prepared.existing) return prepared.existing;
 
   try {
-    const created = await input.provider.createPayment({
-      attemptId: prepared.attemptId,
-      orderNo: prepared.order.orderNo,
-      description: prepared.order.productName,
-      amountFen: prepared.order.amountFen,
-      clientIp: input.clientIp,
-      returnUrl: input.returnUrl,
-      notifyUrl: input.notifyUrl
-    });
+    const created = await withPaymentProviderTimeout(
+      input.provider.createPayment({
+        attemptId: prepared.attemptId,
+        orderNo: prepared.order.orderNo,
+        description: prepared.order.productName,
+        amountFen: prepared.order.amountFen,
+        clientIp: input.clientIp,
+        returnUrl: input.returnUrl,
+        notifyUrl: input.notifyUrl
+      }),
+      providerTimeoutMs
+    );
     if (!created.launchUrl.trim()) {
       throw new Error("Provider returned an empty launch URL");
     }
@@ -1020,6 +1181,38 @@ export const createInvoiceRequest = async (input: {
     ) {
       throw new CommerceError("INVOICE_NOT_ALLOWED");
     }
+    const requestedTaxNumber = input.taxNumber ?? null;
+    const existing = await client.query<{
+      id: string;
+      title: string;
+      tax_number: string | null;
+      email: string;
+      status: string;
+      created_at: Date;
+    }>(
+      `SELECT id, title, tax_number, email, status, created_at
+       FROM invoice_requests
+       WHERE user_id = $1
+         AND order_id = $2
+       FOR UPDATE`,
+      [userId, orderId]
+    );
+    if (existing.rows[0]) {
+      const invoice = existing.rows[0];
+      if (
+        invoice.title !== input.title ||
+        invoice.tax_number !== requestedTaxNumber ||
+        invoice.email !== input.email
+      ) {
+        throw new CommerceError("INVOICE_CONFLICT");
+      }
+      return {
+        id: invoice.id,
+        orderId,
+        status: invoice.status,
+        createdAt: invoice.created_at
+      };
+    }
     const inserted = await client.query<{
       id: string;
       status: string;
@@ -1034,14 +1227,12 @@ export const createInvoiceRequest = async (input: {
          status
        )
        VALUES ($1, $2, $3, $4, $5, 'SUBMITTED')
-       ON CONFLICT (user_id, order_id)
-       DO UPDATE SET user_id = EXCLUDED.user_id
        RETURNING id, status, created_at`,
       [
         userId,
         orderId,
         input.title,
-        input.taxNumber ?? null,
+        requestedTaxNumber,
         input.email
       ]
     );

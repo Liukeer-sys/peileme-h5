@@ -17,6 +17,7 @@ export class FakePaymentProvider implements PaymentProvider {
   private readonly secret = crypto.randomBytes(32);
   private readonly pending = new Map<string, PendingFakePayment>();
   private readonly completed = new Map<string, VerifiedPayment>();
+  private readonly processing = new Map<string, VerifiedPayment>();
   private readonly used = new Set<string>();
 
   constructor(environment: string) {
@@ -52,8 +53,8 @@ export class FakePaymentProvider implements PaymentProvider {
     };
   }
 
-  complete(orderNo: string, token: string): VerifiedPayment {
-    if (this.used.has(token)) {
+  beginCompletion(orderNo: string, token: string): VerifiedPayment {
+    if (this.used.has(token) || this.processing.has(token)) {
       throw new CommerceError("PAYMENT_TOKEN_USED");
     }
     const pending = this.pending.get(token);
@@ -75,8 +76,6 @@ export class FakePaymentProvider implements PaymentProvider {
       throw new CommerceError("PAYMENT_TOKEN_INVALID");
     }
 
-    this.pending.delete(token);
-    this.used.add(token);
     const verified: VerifiedPayment = {
       orderNo: pending.input.orderNo,
       channel: "fake",
@@ -89,7 +88,28 @@ export class FakePaymentProvider implements PaymentProvider {
         attemptId: pending.input.attemptId
       }
     };
-    this.completed.set(orderNo, verified);
+    this.processing.set(token, verified);
+    return verified;
+  }
+
+  commitCompletion(token: string) {
+    const verified = this.processing.get(token);
+    if (!verified) {
+      throw new CommerceError("PAYMENT_TOKEN_INVALID");
+    }
+    this.processing.delete(token);
+    this.pending.delete(token);
+    this.used.add(token);
+    this.completed.set(verified.orderNo, verified);
+  }
+
+  rollbackCompletion(token: string) {
+    this.processing.delete(token);
+  }
+
+  complete(orderNo: string, token: string): VerifiedPayment {
+    const verified = this.beginCompletion(orderNo, token);
+    this.commitCompletion(token);
     return verified;
   }
 
