@@ -326,6 +326,23 @@ const withPre011Database = async <T>(
   }
 };
 
+const withApplied011WithoutRefundReverseIndex = async <T>(
+  callback: (client: pg.Client, databaseUrl: string) => Promise<T>
+) =>
+  withPre011Database(async (client, databaseUrl) => {
+    await client.query(
+      await readFile(
+        path.resolve("database/migrations/011_real_payments.sql"),
+        "utf8"
+      )
+    );
+    await client.query(
+      "INSERT INTO schema_migrations(version) VALUES ('011_real_payments.sql')"
+    );
+    await client.query("DROP INDEX refunds_payment_transaction_idx");
+    return callback(client, databaseUrl);
+  });
+
 const createLegacyUser = async (client: pg.Client, marker: string) => {
   const result = await client.query<{ id: string }>(
     `INSERT INTO users(email)
@@ -433,12 +450,57 @@ describe("Task 4 real payment migration contract (RED)", () => {
     const result = await query<{ version: string }>(
       `SELECT version
          FROM schema_migrations
-        WHERE version = '011_real_payments.sql'`
+        WHERE version IN (
+          '011_real_payments.sql',
+          '012_refunds_payment_transaction_index.sql'
+        )
+        ORDER BY version`
     );
 
     expect(result.rows).toEqual([
-      { version: "011_real_payments.sql" }
+      { version: "011_real_payments.sql" },
+      { version: "012_refunds_payment_transaction_index.sql" }
     ]);
+  });
+
+  it("upgrades an already-applied 011 schema that is missing the refund reverse index", async () => {
+    await withApplied011WithoutRefundReverseIndex(
+      async (client, databaseUrl) => {
+        const before = await client.query<{ index_name: string | null }>(
+          `SELECT to_regclass(
+             'public.refunds_payment_transaction_idx'
+           )::text AS index_name`
+        );
+        expect(before.rows).toEqual([{ index_name: null }]);
+
+        const migrated = await runMigrationProcess(databaseUrl);
+        expect(
+          migrated.status,
+          `${migrated.stdout}\n${migrated.stderr}`
+        ).toBe(0);
+
+        const after = await client.query<{
+          index_name: string | null;
+          migration_applied: boolean;
+        }>(
+          `SELECT to_regclass(
+                    'public.refunds_payment_transaction_idx'
+                  )::text AS index_name,
+                  EXISTS (
+                    SELECT 1
+                      FROM schema_migrations
+                     WHERE version =
+                       '012_refunds_payment_transaction_index.sql'
+                  ) AS migration_applied`
+        );
+        expect(after.rows).toEqual([
+          {
+            index_name: "refunds_payment_transaction_idx",
+            migration_applied: true
+          }
+        ]);
+      }
+    );
   });
 
   it("creates immutable provider identities with one canonical query owner", async () => {
@@ -2813,10 +2875,15 @@ describe("Task 4 real payment migration behavior (RED)", () => {
         const applied = await client.query<{ version: string }>(
           `SELECT version
              FROM schema_migrations
-            WHERE version = '011_real_payments.sql'`
+            WHERE version IN (
+              '011_real_payments.sql',
+              '012_refunds_payment_transaction_index.sql'
+            )
+            ORDER BY version`
         );
         expect(applied.rows).toEqual([
-          { version: "011_real_payments.sql" }
+          { version: "011_real_payments.sql" },
+          { version: "012_refunds_payment_transaction_index.sql" }
         ]);
 
         const firstSnapshot = await client.query<{
@@ -3747,7 +3814,11 @@ describe("Task 4 real payment migration behavior (RED)", () => {
       const applied = await client.query<{ version: string }>(
         `SELECT version
            FROM schema_migrations
-          WHERE version = '011_real_payments.sql'`
+          WHERE version IN (
+            '011_real_payments.sql',
+            '012_refunds_payment_transaction_index.sql'
+          )
+          ORDER BY version`
       );
       expect(applied.rows).toEqual([]);
       const schema = await client.query<{
