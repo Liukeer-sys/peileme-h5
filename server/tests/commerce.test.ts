@@ -3222,6 +3222,247 @@ describe("atomic commerce orders and payments", () => {
     }
   });
 
+  it("scans past deferred provider failures to close later safe expired orders", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const firstQueryError = await createFailedPaymentOrder(
+        userId,
+        "fair-close-query-error-first"
+      );
+      const secondQueryError = await createFailedPaymentOrder(
+        userId,
+        "fair-close-query-error-second"
+      );
+      const invalidVerified = await createFailedPaymentOrder(
+        userId,
+        "fair-close-invalid-verified"
+      );
+      const created = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `fair-close-created-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      const unpaid = await createFailedPaymentOrder(
+        userId,
+        "fair-close-unpaid"
+      );
+      const allIds = [
+        firstQueryError.order.id,
+        secondQueryError.order.id,
+        invalidVerified.order.id,
+        created.id,
+        unpaid.order.id
+      ];
+      await query(
+        `UPDATE orders
+         SET created_at = now() - interval '10 minutes',
+             expires_at = now() - interval '5 minutes'
+         WHERE id = ANY($1::uuid[])`,
+        [allIds]
+      );
+      await query(
+        `UPDATE payment_attempts
+         SET updated_at = CASE
+           WHEN id = $2 THEN now() - interval '8 minutes'
+           WHEN id = $3 THEN now() - interval '7 minutes'
+           WHEN id = $4 THEN now() - interval '6 minutes'
+           ELSE now() - interval '5 minutes'
+         END
+         WHERE id = ANY($1::uuid[])`,
+        [
+          [
+            firstQueryError.attemptId,
+            secondQueryError.attemptId,
+            invalidVerified.attemptId,
+            unpaid.attemptId
+          ],
+          firstQueryError.attemptId,
+          secondQueryError.attemptId,
+          invalidVerified.attemptId
+        ]
+      );
+      const queryCallsByRun: string[][] = [[], []];
+      let currentRun = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          throw new Error("cleanup must not create");
+        },
+        async queryPayment(orderNo: string, signal: AbortSignal) {
+          expect(signal.aborted).toBe(false);
+          queryCallsByRun[currentRun].push(orderNo);
+          if (
+            orderNo === firstQueryError.order.orderNo ||
+            orderNo === secondQueryError.order.orderNo
+          ) {
+            throw new Error("persistent provider query failure");
+          }
+          if (orderNo === invalidVerified.order.orderNo) {
+            return {
+              orderNo,
+              channel: "fake" as const,
+              channelTransactionId: `invalid-${randomUUID()}`,
+              amountFen: (
+                BigInt(invalidVerified.order.amountFen) + 1n
+              ).toString(),
+              currency: "CNY" as const,
+              paidAt: new Date(Date.now() - 15 * 60_000).toISOString(),
+              raw: { source: "invalid-reconciliation" }
+            };
+          }
+          return null;
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+
+      const firstReconciliation = await reconcileAndCloseExpiredOrders({
+        provider,
+        limit: 2,
+        providerQueryBudget: 2,
+        providerTimeoutMs: 100
+      });
+      currentRun = 1;
+      const secondReconciliation = await reconcileAndCloseExpiredOrders({
+        provider,
+        limit: 2,
+        providerQueryBudget: 2,
+        providerTimeoutMs: 100
+      });
+
+      expect(firstReconciliation.closedOrderIds).toEqual([created.id]);
+      expect(firstReconciliation.summary).toEqual({
+        scannedCount: 3,
+        closedCount: 1,
+        providerConfirmedPaidCount: 0,
+        deferredCount: 2,
+        hasMore: true,
+        deferredByReason: {
+          providerQueryError: 2,
+          paymentVerificationFailed: 0,
+          unsafeOrChangedState: 0
+        }
+      });
+      expect(secondReconciliation.closedOrderIds).toEqual([
+        unpaid.order.id
+      ]);
+      expect(secondReconciliation.summary).toEqual({
+        scannedCount: 2,
+        closedCount: 1,
+        providerConfirmedPaidCount: 0,
+        deferredCount: 1,
+        hasMore: true,
+        deferredByReason: {
+          providerQueryError: 0,
+          paymentVerificationFailed: 1,
+          unsafeOrChangedState: 0
+        }
+      });
+      expect(queryCallsByRun).toEqual([
+        [
+          firstQueryError.order.orderNo,
+          secondQueryError.order.orderNo
+        ],
+        [
+          invalidVerified.order.orderNo,
+          unpaid.order.orderNo
+        ]
+      ]);
+      expect(queryCallsByRun.every((calls) => calls.length <= 2)).toBe(
+        true
+      );
+      const states = await query<{
+        id: string;
+        status: string;
+        error_code: string | null;
+        transactions: string;
+        entitlements: string;
+      }>(
+        `SELECT
+           o.id,
+           o.status,
+           attempt.error_code,
+           (SELECT count(*)::text
+              FROM payment_transactions
+             WHERE order_id = o.id) AS transactions,
+           (SELECT count(*)::text
+              FROM entitlements
+             WHERE source_id = o.id) AS entitlements
+         FROM orders o
+         LEFT JOIN LATERAL (
+           SELECT error_code
+           FROM payment_attempts
+           WHERE order_id = o.id
+           ORDER BY created_at DESC, id DESC
+           LIMIT 1
+         ) attempt ON true
+         WHERE o.id = ANY($1::uuid[])`,
+        [allIds]
+      );
+      expect(new Map(states.rows.map((row) => [row.id, row]))).toEqual(
+        new Map([
+          [
+            firstQueryError.order.id,
+            {
+              id: firstQueryError.order.id,
+              status: "PAYMENT_FAILED",
+              error_code: "RECONCILIATION_QUERY_FAILED",
+              transactions: "0",
+              entitlements: "0"
+            }
+          ],
+          [
+            secondQueryError.order.id,
+            {
+              id: secondQueryError.order.id,
+              status: "PAYMENT_FAILED",
+              error_code: "RECONCILIATION_QUERY_FAILED",
+              transactions: "0",
+              entitlements: "0"
+            }
+          ],
+          [
+            invalidVerified.order.id,
+            {
+              id: invalidVerified.order.id,
+              status: "PAYMENT_FAILED",
+              error_code: "RECONCILIATION_VERIFICATION_FAILED",
+              transactions: "0",
+              entitlements: "0"
+            }
+          ],
+          [
+            created.id,
+            {
+              id: created.id,
+              status: "CLOSED",
+              error_code: null,
+              transactions: "0",
+              entitlements: "0"
+            }
+          ],
+          [
+            unpaid.order.id,
+            {
+              id: unpaid.order.id,
+              status: "CLOSED",
+              error_code: null,
+              transactions: "0",
+              entitlements: "0"
+            }
+          ]
+        ])
+      );
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
   it("closes expired attempts while preserving a completed paid order", async () => {
     await seedPolicyFoundation();
     let userId: string | undefined;
@@ -3308,7 +3549,12 @@ describe("atomic commerce orders and payments", () => {
         });
       const firstBatch = await closeBatch();
       const secondBatch = await closeBatch();
-      expect([...firstBatch, ...secondBatch].sort()).toEqual(
+      expect(
+        [
+          ...firstBatch.closedOrderIds,
+          ...secondBatch.closedOrderIds
+        ].sort()
+      ).toEqual(
         [pending.order.id, failed.order.id].sort()
       );
       const states = await query<{
@@ -3766,7 +4012,19 @@ describe("atomic commerce orders and payments", () => {
         .expect(200);
       expect(closed.body).toEqual({
         closedCount: 1,
-        closedOrderIds: [expiredOrder.id]
+        closedOrderIds: [expiredOrder.id],
+        reconciliation: {
+          scannedCount: 1,
+          closedCount: 1,
+          providerConfirmedPaidCount: 0,
+          deferredCount: 0,
+          hasMore: false,
+          deferredByReason: {
+            providerQueryError: 0,
+            paymentVerificationFailed: 0,
+            unsafeOrChangedState: 0
+          }
+        }
       });
       const audit = await query<{
         action: string;
@@ -3774,6 +4032,18 @@ describe("atomic commerce orders and payments", () => {
           limit: number;
           closedCount: number;
           closedOrderIds: string[];
+          reconciliation: {
+            scannedCount: number;
+            closedCount: number;
+            providerConfirmedPaidCount: number;
+            deferredCount: number;
+            hasMore: boolean;
+            deferredByReason: {
+              providerQueryError: number;
+              paymentVerificationFailed: number;
+              unsafeOrChangedState: number;
+            };
+          };
         };
       }>(
         `SELECT action, detail
@@ -3788,7 +4058,19 @@ describe("atomic commerce orders and payments", () => {
           detail: {
             limit: 1,
             closedCount: 1,
-            closedOrderIds: [expiredOrder.id]
+            closedOrderIds: [expiredOrder.id],
+            reconciliation: {
+              scannedCount: 1,
+              closedCount: 1,
+              providerConfirmedPaidCount: 0,
+              deferredCount: 0,
+              hasMore: false,
+              deferredByReason: {
+                providerQueryError: 0,
+                paymentVerificationFailed: 0,
+                unsafeOrChangedState: 0
+              }
+            }
           }
         }
       ]);

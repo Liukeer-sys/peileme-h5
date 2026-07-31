@@ -292,10 +292,10 @@ export const createCommerceRouters = (
           })
           .strict()
           .parse(request.body);
-        const closedOrderIds = await reconcileAndCloseExpiredOrders({
+        const reconciliation = await reconcileAndCloseExpiredOrders({
           provider: paymentProvider,
           limit: body.limit,
-          onClosed: async (client, ids) => {
+          onClosed: async (client, ids, summary) => {
             await writeAdminAudit(
               request,
               "commerce.orders.close_expired",
@@ -304,15 +304,17 @@ export const createCommerceRouters = (
               {
                 limit: body.limit,
                 closedCount: ids.length,
-                closedOrderIds: ids
+                closedOrderIds: ids,
+                reconciliation: summary
               },
               client
             );
           }
         });
         response.json({
-          closedCount: closedOrderIds.length,
-          closedOrderIds
+          closedCount: reconciliation.closedOrderIds.length,
+          closedOrderIds: reconciliation.closedOrderIds,
+          reconciliation: reconciliation.summary
         });
       } catch (error) {
         next(commerceApiError(error));

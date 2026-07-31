@@ -754,6 +754,8 @@ export const closeExpiredOrders = async (limit = 200) => {
 type ExpiredCloseCandidate = {
   id: string;
   status: OrderStatus;
+  attemptId: string | null;
+  attemptChannel: PaymentChannel | null;
 };
 
 const closeExpiredCandidatesInTransaction = async (
@@ -762,9 +764,9 @@ const closeExpiredCandidatesInTransaction = async (
 ) => {
   if (!candidates.length) return [];
   const result = await client.query<{ id: string }>(
-    `WITH expected(id, status) AS (
+    `WITH expected(id, status, attempt_id, attempt_channel) AS (
        SELECT *
-       FROM unnest($1::uuid[], $2::text[])
+       FROM unnest($1::uuid[], $2::text[], $3::uuid[], $4::text[])
      ),
      locked AS (
        SELECT o.id
@@ -772,7 +774,22 @@ const closeExpiredCandidatesInTransaction = async (
        JOIN expected e
          ON e.id = o.id
         AND e.status = o.status
+       LEFT JOIN LATERAL (
+         SELECT id, channel
+         FROM payment_attempts
+         WHERE order_id = o.id
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1
+       ) attempt ON true
        WHERE o.expires_at <= now()
+         AND (
+           (e.attempt_id IS NULL AND attempt.id IS NULL)
+           OR (
+             e.attempt_id IS NOT NULL
+             AND attempt.id = e.attempt_id
+             AND attempt.channel = e.attempt_channel
+           )
+         )
        FOR UPDATE OF o SKIP LOCKED
      ),
      closed_attempts AS (
@@ -790,10 +807,15 @@ const closeExpiredCandidatesInTransaction = async (
      RETURNING id`,
     [
       candidates.map((candidate) => candidate.id),
-      candidates.map((candidate) => candidate.status)
+      candidates.map((candidate) => candidate.status),
+      candidates.map((candidate) => candidate.attemptId),
+      candidates.map((candidate) => candidate.attemptChannel)
     ]
   );
-  return result.rows.map((row) => row.id);
+  const closedOrderIds = new Set(result.rows.map((row) => row.id));
+  return candidates
+    .filter((candidate) => closedOrderIds.has(candidate.id))
+    .map((candidate) => candidate.id);
 };
 
 export type PaymentStartResult = {
@@ -852,132 +874,271 @@ const withPaymentProviderTimeout = async <T>(
   }
 };
 
+export type ExpiredOrderReconciliationSummary = {
+  scannedCount: number;
+  closedCount: number;
+  providerConfirmedPaidCount: number;
+  deferredCount: number;
+  hasMore: boolean;
+  deferredByReason: {
+    providerQueryError: number;
+    paymentVerificationFailed: number;
+    unsafeOrChangedState: number;
+  };
+};
+
 export const reconcileAndCloseExpiredOrders = async (input: {
   provider?: PaymentProvider;
   limit?: number;
   providerTimeoutMs?: number;
+  providerQueryBudget?: number;
   onClosed?: (
     client: pg.PoolClient,
-    closedOrderIds: string[]
+    closedOrderIds: string[],
+    summary: ExpiredOrderReconciliationSummary
   ) => Promise<void>;
 }) => {
   const limit = input.limit ?? 200;
   const providerTimeoutMs = input.providerTimeoutMs ?? 15_000;
+  const providerQueryBudget = input.providerQueryBudget ?? 10;
   if (
     !Number.isInteger(limit) ||
     limit < 1 ||
     limit > 500 ||
     !Number.isInteger(providerTimeoutMs) ||
     providerTimeoutMs < 1 ||
-    providerTimeoutMs > 60_000
+    providerTimeoutMs > 60_000 ||
+    !Number.isInteger(providerQueryBudget) ||
+    providerQueryBudget < 1 ||
+    providerQueryBudget > 10
   ) {
     throw new CommerceError("INVALID_COMMERCE_INPUT");
   }
-  const candidates = await query<{
+  const provider = input.provider;
+  const providerChannel = provider?.channel ?? null;
+  const noAttemptCandidates = await query<{
+    id: string;
+    status: OrderStatus;
+  }>(
+    `SELECT o.id, o.status
+     FROM orders o
+     WHERE o.expires_at <= now()
+       AND o.status = 'CREATED'
+       AND NOT EXISTS (
+         SELECT 1
+         FROM payment_attempts
+         WHERE payment_attempts.order_id = o.id
+       )
+     ORDER BY o.expires_at, o.id
+     LIMIT $1`,
+    [limit]
+  );
+  type ReconciliationCandidate = {
     id: string;
     order_no: string;
     status: OrderStatus;
     attempt_id: string | null;
     attempt_channel: PaymentChannel | null;
-  }>(
-    `SELECT
-       o.id,
-       o.order_no,
-       o.status,
-       attempt.id AS attempt_id,
-       attempt.channel AS attempt_channel
-     FROM orders o
-     LEFT JOIN LATERAL (
-       SELECT id, channel
-       FROM payment_attempts
-       WHERE order_id = o.id
-       ORDER BY created_at DESC, id DESC
-       LIMIT 1
-     ) attempt ON true
-     WHERE o.expires_at <= now()
-       AND o.status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED')
-       AND (
-         ($2::text IS NULL AND attempt.id IS NULL)
-         OR (
-           $2::text IS NOT NULL
-           AND (attempt.id IS NULL OR attempt.channel = $2)
-         )
-       )
-     ORDER BY o.expires_at, o.id
-     LIMIT $1`,
-    [limit, input.provider?.channel ?? null]
-  );
-  const reconciled = new Array<ExpiredCloseCandidate | undefined>(
-    candidates.rows.length
-  );
-  let nextCandidateIndex = 0;
-  const reconcileCandidate = async (candidateIndex: number) => {
-    const candidate = candidates.rows[candidateIndex];
-    if (!candidate.attempt_id) {
-      if (candidate.status === "CREATED") {
-        reconciled[candidateIndex] = {
-          id: candidate.id,
-          status: candidate.status
-        };
-      }
-      return;
-    }
-    if (
-      !input.provider ||
-      candidate.attempt_channel !== input.provider.channel
-    ) {
-      return;
-    }
-    let verified: VerifiedPayment | null;
-    try {
-      verified = await withPaymentProviderTimeout(
-        (signal) =>
-          input.provider!.queryPayment(candidate.order_no, signal),
-        providerTimeoutMs
-      );
-    } catch {
-      return;
-    }
-    if (verified) {
-      try {
-        await markOrderPaid({
-          orderId: candidate.id,
-          paymentAttemptId: candidate.attempt_id,
-          verified
-        });
-      } catch {
-        // A callback or another reconciliation may have won the race.
-      }
-      return;
-    }
-    reconciled[candidateIndex] = {
-      id: candidate.id,
-      status: candidate.status
-    };
   };
-  const workers = Array.from(
-    { length: Math.min(10, candidates.rows.length) },
-    async () => {
-      while (nextCandidateIndex < candidates.rows.length) {
-        const candidateIndex = nextCandidateIndex;
-        nextCandidateIndex += 1;
-        await reconcileCandidate(candidateIndex);
+  const safeToClose: ExpiredCloseCandidate[] =
+    noAttemptCandidates.rows.map((candidate) => ({
+      id: candidate.id,
+      status: candidate.status,
+      attemptId: null,
+      attemptChannel: null
+    }));
+  let scannedCount = noAttemptCandidates.rows.length;
+  let providerConfirmedPaidCount = 0;
+  const deferredByReason = {
+    providerQueryError: 0,
+    paymentVerificationFailed: 0,
+    unsafeOrChangedState: 0
+  };
+
+  if (provider && safeToClose.length < limit) {
+    const candidates = await query<ReconciliationCandidate>(
+      `SELECT
+         o.id,
+         o.order_no,
+         o.status,
+         attempt.id AS attempt_id,
+         attempt.channel AS attempt_channel
+       FROM orders o
+       JOIN LATERAL (
+         SELECT id, channel, updated_at
+         FROM payment_attempts
+         WHERE order_id = o.id
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1
+       ) attempt ON true
+       WHERE o.expires_at <= now()
+         AND o.status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED')
+         AND attempt.channel = $2
+       ORDER BY attempt.updated_at, o.expires_at, o.id
+       LIMIT $1`,
+      [providerQueryBudget, providerChannel]
+    );
+    scannedCount += candidates.rows.length;
+    type ReconciliationOutcome =
+      | { safeToClose: ExpiredCloseCandidate }
+      | {
+          deferred:
+            | "providerQueryError"
+            | "paymentVerificationFailed"
+            | "unsafeOrChangedState";
+        }
+      | { providerConfirmedPaid: true };
+    const outcomes = new Array<ReconciliationOutcome | undefined>(
+      candidates.rows.length
+    );
+    let nextCandidateIndex = 0;
+    const reconcileCandidate = async (candidateIndex: number) => {
+      const candidate = candidates.rows[candidateIndex];
+      if (
+        !candidate.attempt_id ||
+        candidate.attempt_channel !== provider.channel
+      ) {
+        outcomes[candidateIndex] = {
+          deferred: "unsafeOrChangedState"
+        };
+        return;
+      }
+      let verified: VerifiedPayment | null;
+      try {
+        verified = await withPaymentProviderTimeout(
+          (signal) => provider.queryPayment(candidate.order_no, signal),
+          providerTimeoutMs
+        );
+      } catch {
+        await query(
+          `UPDATE payment_attempts
+           SET error_code = 'RECONCILIATION_QUERY_FAILED',
+               error_message = '支付渠道查单失败，等待下次重试',
+               updated_at = now()
+           WHERE id = $1
+             AND status IN ('CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED')`,
+          [candidate.attempt_id]
+        );
+        outcomes[candidateIndex] = {
+          deferred: "providerQueryError"
+        };
+        return;
+      }
+      if (verified) {
+        try {
+          await markOrderPaid({
+            orderId: candidate.id,
+            paymentAttemptId: candidate.attempt_id,
+            verified
+          });
+          outcomes[candidateIndex] = {
+            providerConfirmedPaid: true
+          };
+        } catch (error) {
+          const verificationFailed =
+            error instanceof CommerceError &&
+            error.code === "PAYMENT_VERIFICATION_FAILED";
+          await query(
+            `UPDATE payment_attempts
+             SET error_code = $2,
+                 error_message = $3,
+                 updated_at = now()
+             WHERE id = $1
+               AND status IN ('CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED')`,
+            [
+              candidate.attempt_id,
+              verificationFailed
+                ? "RECONCILIATION_VERIFICATION_FAILED"
+                : "RECONCILIATION_SETTLEMENT_DEFERRED",
+              verificationFailed
+                ? "支付核验不一致，等待人工检查"
+                : "支付状态已变化，等待下次核验"
+            ]
+          );
+          outcomes[candidateIndex] = {
+            deferred: verificationFailed
+              ? "paymentVerificationFailed"
+              : "unsafeOrChangedState"
+          };
+        }
+        return;
+      }
+      outcomes[candidateIndex] = {
+        safeToClose: {
+          id: candidate.id,
+          status: candidate.status,
+          attemptId: candidate.attempt_id,
+          attemptChannel: candidate.attempt_channel
+        }
+      };
+    };
+    const workers = Array.from(
+      { length: Math.min(10, candidates.rows.length) },
+      async () => {
+        while (nextCandidateIndex < candidates.rows.length) {
+          const candidateIndex = nextCandidateIndex;
+          nextCandidateIndex += 1;
+          await reconcileCandidate(candidateIndex);
+        }
+      }
+    );
+    await Promise.all(workers);
+    for (const outcome of outcomes) {
+      if (!outcome) continue;
+      if ("providerConfirmedPaid" in outcome) {
+        providerConfirmedPaidCount += 1;
+      } else if ("deferred" in outcome) {
+        deferredByReason[outcome.deferred] += 1;
+      } else if (safeToClose.length < limit) {
+        safeToClose.push(outcome.safeToClose);
       }
     }
-  );
-  await Promise.all(workers);
-  const safeToClose = reconciled.filter(
-    (candidate): candidate is ExpiredCloseCandidate =>
-      candidate !== undefined
-  );
+  }
 
   return withTransaction(async (client) => {
     const closedOrderIds =
       await closeExpiredCandidatesInTransaction(client, safeToClose);
+    deferredByReason.unsafeOrChangedState +=
+      safeToClose.length - closedOrderIds.length;
+    const moreCandidates = await client.query<{ has_more: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1
+         FROM orders o
+         LEFT JOIN LATERAL (
+           SELECT id, channel
+           FROM payment_attempts
+           WHERE order_id = o.id
+           ORDER BY created_at DESC, id DESC
+           LIMIT 1
+         ) attempt ON true
+         WHERE o.expires_at <= now()
+           AND o.status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED')
+           AND (
+             (o.status = 'CREATED' AND attempt.id IS NULL)
+             OR (
+               $1::text IS NOT NULL
+               AND attempt.channel = $1
+             )
+           )
+       ) AS has_more`,
+      [providerChannel]
+    );
+    const deferredCount =
+      deferredByReason.providerQueryError +
+      deferredByReason.paymentVerificationFailed +
+      deferredByReason.unsafeOrChangedState;
+    const summary: ExpiredOrderReconciliationSummary = {
+      scannedCount,
+      closedCount: closedOrderIds.length,
+      providerConfirmedPaidCount,
+      deferredCount,
+      hasMore: moreCandidates.rows[0]?.has_more ?? false,
+      deferredByReason
+    };
     if (input.onClosed) {
-      await input.onClosed(client, closedOrderIds);
+      await input.onClosed(client, closedOrderIds, summary);
     }
-    return closedOrderIds;
+    return { closedOrderIds, summary };
   });
 };
 
