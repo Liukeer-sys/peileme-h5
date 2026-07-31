@@ -215,7 +215,7 @@ CREATE TABLE payment_attempts (
   error_message TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (order_id, id)
+  UNIQUE (order_id, id, channel)
 );
 
 CREATE TABLE payment_transactions (
@@ -231,8 +231,8 @@ CREATE TABLE payment_transactions (
   paid_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (channel, channel_transaction_id),
-  FOREIGN KEY (order_id, payment_attempt_id)
-    REFERENCES payment_attempts(order_id, id)
+  FOREIGN KEY (order_id, payment_attempt_id, channel)
+    REFERENCES payment_attempts(order_id, id, channel)
 );
 
 CREATE TABLE entitlements (

@@ -178,7 +178,8 @@ CREATE TABLE payment_attempts (
   error_message TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CONSTRAINT payment_attempts_order_id_unique UNIQUE (order_id, id)
+  CONSTRAINT payment_attempts_order_id_channel_unique
+    UNIQUE (order_id, id, channel)
 );
 
 CREATE UNIQUE INDEX payment_attempts_channel_prepay_unique_idx
@@ -201,8 +202,8 @@ CREATE TABLE payment_transactions (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (channel, channel_transaction_id),
   CONSTRAINT payment_transactions_attempt_order_fk
-    FOREIGN KEY (order_id, payment_attempt_id)
-    REFERENCES payment_attempts(order_id, id)
+    FOREIGN KEY (order_id, payment_attempt_id, channel)
+    REFERENCES payment_attempts(order_id, id, channel)
 );
 
 CREATE TABLE entitlements (

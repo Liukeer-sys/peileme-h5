@@ -405,61 +405,70 @@ describe("commerce catalog foundation", () => {
   });
 
   it("rejects payment, entitlement and invoice rows with mismatched ownership", async () => {
-    await seedPolicyFoundation();
     const marker = randomUUID().replaceAll("-", "");
-    const users = await query<{ id: string }>(
-      `INSERT INTO users(email)
-       VALUES ($1), ($2)
-       RETURNING id`,
-      [`quality-a-${marker}@peileme.test`, `quality-b-${marker}@peileme.test`]
-    );
-    const [userA, userB] = users.rows.map((row) => row.id);
-    const orders = await query<{ id: string }>(
-      `INSERT INTO orders(
-         order_no,
-         user_id,
-         product_channel,
-         status,
-         total_fen,
-         idempotency_key,
-         expires_at
-       )
-       VALUES
-         ($1, $3, 'main', 'CREATED', 990, $4, now() + interval '30 minutes'),
-         ($2, $5, 'main', 'CREATED', 990, $6, now() + interval '30 minutes')
-       RETURNING id`,
-      [
-        `QUALITY-A-${marker}`,
-        `QUALITY-B-${marker}`,
-        userA,
-        `quality-a-${marker}`,
-        userB,
-        `quality-b-${marker}`
-      ]
-    );
-    const [orderA, orderB] = orders.rows.map((row) => row.id);
-    const attempt = await query<{ id: string }>(
-      `INSERT INTO payment_attempts(order_id, channel, status)
-       VALUES ($1, 'fake', 'CREATED')
-       RETURNING id`,
-      [orderA]
-    );
-    const entitlement = await query<{ id: string }>(
-      `INSERT INTO entitlements(
-         user_id,
-         product_id,
-         source_type,
-         total_uses,
-         remaining_uses,
-         status
-       )
-       SELECT $1, id, 'admin', 1, 1, 'active'
-         FROM products
-        WHERE sku = 'POLICY_CALC'
-       RETURNING id`,
-      [userA]
-    );
+    let userIds: string[] = [];
+    let orderIds: string[] = [];
+    let attemptId: string | undefined;
+    let entitlementId: string | undefined;
     try {
+      await seedPolicyFoundation();
+      const users = await query<{ id: string }>(
+        `INSERT INTO users(email)
+         VALUES ($1), ($2)
+         RETURNING id`,
+        [`quality-a-${marker}@peileme.test`, `quality-b-${marker}@peileme.test`]
+      );
+      userIds = users.rows.map((row) => row.id);
+      const [userA, userB] = userIds;
+      const orders = await query<{ id: string }>(
+        `INSERT INTO orders(
+           order_no,
+           user_id,
+           product_channel,
+           status,
+           total_fen,
+           idempotency_key,
+           expires_at
+         )
+         VALUES
+           ($1, $3, 'main', 'CREATED', 990, $4, now() + interval '30 minutes'),
+           ($2, $5, 'main', 'CREATED', 990, $6, now() + interval '30 minutes')
+         RETURNING id`,
+        [
+          `QUALITY-A-${marker}`,
+          `QUALITY-B-${marker}`,
+          userA,
+          `quality-a-${marker}`,
+          userB,
+          `quality-b-${marker}`
+        ]
+      );
+      orderIds = orders.rows.map((row) => row.id);
+      const [orderA, orderB] = orderIds;
+      const attempt = await query<{ id: string }>(
+        `INSERT INTO payment_attempts(order_id, channel, status)
+         VALUES ($1, 'fake', 'CREATED')
+         RETURNING id`,
+        [orderA]
+      );
+      attemptId = attempt.rows[0].id;
+      const entitlement = await query<{ id: string }>(
+        `INSERT INTO entitlements(
+           user_id,
+           product_id,
+           source_type,
+           total_uses,
+           remaining_uses,
+           status
+         )
+         SELECT $1, id, 'admin', 1, 1, 'active'
+           FROM products
+          WHERE sku = 'POLICY_CALC'
+         RETURNING id`,
+        [userA]
+      );
+      entitlementId = entitlement.rows[0].id;
+
       await expect(
         query(
           `INSERT INTO payment_transactions(
@@ -473,7 +482,7 @@ describe("commerce catalog foundation", () => {
              verified_payload
            )
            VALUES ($1, $2, 'fake', $3, 990, 'CNY', 'SUCCESS', '{}')`,
-          [orderB, attempt.rows[0].id, `quality-${marker}`]
+          [orderB, attemptId, `quality-${marker}`]
         )
       ).rejects.toMatchObject({
         code: "23503",
@@ -490,7 +499,7 @@ describe("commerce catalog foundation", () => {
              status
            )
            VALUES ($1, $2, 'quality', $3, 'reserved')`,
-          [entitlement.rows[0].id, userB, randomUUID()]
+          [entitlementId, userB, randomUUID()]
         )
       ).rejects.toMatchObject({
         code: "23503",
@@ -518,25 +527,107 @@ describe("commerce catalog foundation", () => {
         "DELETE FROM payment_transactions WHERE channel_transaction_id = $1",
         [`quality-${marker}`]
       );
-      await query(
-        "DELETE FROM entitlement_usages WHERE entitlement_id = $1",
-        [entitlement.rows[0].id]
+      if (entitlementId) {
+        await query(
+          "DELETE FROM entitlement_usages WHERE entitlement_id = $1",
+          [entitlementId]
+        );
+      }
+      if (orderIds.length > 0) {
+        await query(
+          "DELETE FROM invoice_requests WHERE order_id = ANY($1::uuid[])",
+          [orderIds]
+        );
+      }
+      if (entitlementId) {
+        await query("DELETE FROM entitlements WHERE id = $1", [entitlementId]);
+      }
+      if (attemptId) {
+        await query("DELETE FROM payment_attempts WHERE id = $1", [attemptId]);
+      }
+      if (orderIds.length > 0) {
+        await query("DELETE FROM orders WHERE id = ANY($1::uuid[])", [
+          orderIds
+        ]);
+      }
+      if (userIds.length > 0) {
+        await query("DELETE FROM users WHERE id = ANY($1::uuid[])", [userIds]);
+      }
+    }
+  });
+
+  it("rejects a payment transaction whose channel differs from its attempt", async () => {
+    const marker = randomUUID().replaceAll("-", "");
+    let userId: string | undefined;
+    let orderId: string | undefined;
+    let attemptId: string | undefined;
+    try {
+      const user = await query<{ id: string }>(
+        `INSERT INTO users(email)
+         VALUES ($1)
+         RETURNING id`,
+        [`quality-channel-${marker}@peileme.test`]
       );
-      await query("DELETE FROM invoice_requests WHERE order_id = ANY($1::uuid[])", [
-        [orderA, orderB]
-      ]);
-      await query("DELETE FROM entitlements WHERE id = $1", [
-        entitlement.rows[0].id
-      ]);
-      await query("DELETE FROM payment_attempts WHERE id = $1", [
-        attempt.rows[0].id
-      ]);
-      await query("DELETE FROM orders WHERE id = ANY($1::uuid[])", [
-        [orderA, orderB]
-      ]);
-      await query("DELETE FROM users WHERE id = ANY($1::uuid[])", [
-        [userA, userB]
-      ]);
+      userId = user.rows[0].id;
+      const order = await query<{ id: string }>(
+        `INSERT INTO orders(
+           order_no,
+           user_id,
+           product_channel,
+           status,
+           total_fen,
+           idempotency_key,
+           expires_at
+         )
+         VALUES (
+           $1, $2, 'main', 'CREATED', 990, $3,
+           now() + interval '30 minutes'
+         )
+         RETURNING id`,
+        [`QUALITY-CHANNEL-${marker}`, userId, `quality-channel-${marker}`]
+      );
+      orderId = order.rows[0].id;
+      const attempt = await query<{ id: string }>(
+        `INSERT INTO payment_attempts(order_id, channel, status)
+         VALUES ($1, 'alipay_wap', 'CREATED')
+         RETURNING id`,
+        [orderId]
+      );
+      attemptId = attempt.rows[0].id;
+
+      await expect(
+        query(
+          `INSERT INTO payment_transactions(
+             order_id,
+             payment_attempt_id,
+             channel,
+             channel_transaction_id,
+             amount_fen,
+             currency,
+             status,
+             verified_payload
+           )
+           VALUES ($1, $2, 'wechat_h5', $3, 990, 'CNY', 'SUCCESS', '{}')`,
+          [orderId, attemptId, `quality-channel-${marker}`]
+        )
+      ).rejects.toMatchObject({
+        code: "23503",
+        constraint: "payment_transactions_attempt_order_fk"
+      });
+    } finally {
+      await query(
+        "DELETE FROM payment_transactions WHERE channel_transaction_id = $1",
+        [`quality-channel-${marker}`]
+      );
+      if (attemptId) {
+        await query("DELETE FROM payment_attempts WHERE id = $1", [attemptId]);
+      }
+      if (orderId) {
+        await query("DELETE FROM orders WHERE id = $1", [orderId]);
+      }
+      if (userId) {
+        await query("DELETE FROM users WHERE id = $1", [userId]);
+      }
     }
   });
 
