@@ -29,7 +29,7 @@ export default function MainAccountPanel({
   policyRecalculating = false,
   onPolicyRecalculate
 }: MainAccountPanelProps) {
-  const { user, grants, logout, redeemInvite, updateProfile } = useAuth();
+  const { user, capabilities, grants, logout, redeemInvite, updateProfile } = useAuth();
   const [invite, setInvite] = useState("");
   const [message, setMessage] = useState("");
   const [displayName, setDisplayName] = useState("");
@@ -227,7 +227,7 @@ export default function MainAccountPanel({
           />
         </div>
 
-        {["admin", "analyst"].includes(user.role) && (
+        {capabilities.includes("admin.access") && (
           <a className="admin-entry-link" href="/admin" onClick={() => track("admin_opened")}>
             进入管理后台 →
           </a>

@@ -72,6 +72,19 @@ const navItems: Array<{ id: BaseTab; label: string; icon: string }> = [
 
 const noExtensions: AdminDashboardExtension[] = [];
 
+const tabCapability: Partial<Record<BaseTab, string>> = {
+  overview: "analytics.read",
+  policyRules: "policy.read",
+  regionalData: "policy.read",
+  announcements: "content.read",
+  users: "users.read",
+  assessments: "assessments.read",
+  invites: "invites.read",
+  events: "analytics.read",
+  audit: "audit.read",
+  system: "system.read"
+};
+
 export default function AdminDashboard({
   extensions = noExtensions
 }: AdminDashboardProps) {
@@ -87,7 +100,7 @@ export default function AdminDashboard({
   const requestGenerationRef = useRef(0);
   const requestControllerRef = useRef<AbortController | null>(null);
 
-  const isAdmin = Boolean(user && ["admin", "analyst"].includes(user.role));
+  const isAdmin = Boolean(user && capabilities.includes("admin.access"));
   const allNavItems = useMemo(
     () => {
       const positioned = navItems.flatMap((item) => [
@@ -101,10 +114,18 @@ export default function AdminDashboard({
         ...extensions
           .filter((extension) => !extension.after)
           .map(({ id, label, icon }) => ({ id, label, icon }))
-      ];
+      ].filter((item) => {
+        const required = tabCapability[item.id as BaseTab];
+        return !required || capabilities.includes(required);
+      });
     },
-    [extensions]
+    [capabilities, extensions]
   );
+
+  useEffect(() => {
+    if (!allNavItems.length || allNavItems.some((item) => item.id === tab)) return;
+    setTab(allNavItems[0].id);
+  }, [allNavItems, tab]);
   const activeExtension = useMemo(
     () => extensions.find((extension) => extension.id === tab),
     [extensions, tab]
@@ -224,6 +245,10 @@ export default function AdminDashboard({
   const adminUser = user!;
   const canWritePolicy = capabilities.includes("policy.write");
   const canPublishPolicy = capabilities.includes("policy.publish");
+  const canWriteContent = capabilities.includes("content.write");
+  const canPublishContent = capabilities.includes("content.publish");
+  const canWriteUsers = capabilities.includes("users.write");
+  const canWriteInvites = capabilities.includes("invites.write");
   const rows = ((data.items || data.recentAssessments || []) as UnknownRow[]);
   const overview = (data.summary || {}) as UnknownRow;
   const createInvite = async () => {
@@ -268,9 +293,13 @@ export default function AdminDashboard({
     }
   };
 
-  const updateUser = async (id: unknown, patch: Record<string, unknown>) => {
+  const updateUser = async (row: UnknownRow, patch: Record<string, unknown>) => {
     const capturedEndpoint = endpoint;
-    await api(`/api/admin/users/${id}`, { method: "PATCH", auth: true, body: patch });
+    await api(`/api/admin/users/${row.id}`, {
+      method: "PATCH",
+      auth: true,
+      body: { ...patch, expectedUpdatedAt: row.updated_at }
+    });
     await load(capturedEndpoint);
   };
 
@@ -309,7 +338,7 @@ export default function AdminDashboard({
         </nav>
         <div className="admin-profile">
           <strong>{adminUser.displayName || adminUser.email || adminUser.phone}</strong>
-          <span>{adminUser.role === "admin" ? "超级管理员" : "数据分析员"}</span>
+          <span>{adminUser.role}</span>
           <button type="button" onClick={() => void logout().then(() => window.location.assign("/"))}>退出</button>
         </div>
       </aside>
@@ -355,8 +384,8 @@ export default function AdminDashboard({
 
         {tab === "announcements" && (
           <AnnouncementsPanel
-            canWrite={canWritePolicy}
-            canPublish={canPublishPolicy}
+            canWrite={canWriteContent}
+            canPublish={canPublishContent}
             refreshKey={policyRefreshKey}
           />
         )}
@@ -426,18 +455,18 @@ export default function AdminDashboard({
                 {
                   key: "actions",
                   label: "操作",
-                  render: (row) => (
+                  render: (row) => canWriteUsers ? (
                     <div className="admin-row-actions">
-                      <button type="button" onClick={() => void updateUser(row.id, { status: row.status === "active" ? "disabled" : "active" })}>
+                      <button type="button" onClick={() => void updateUser(row, { status: row.status === "active" ? "disabled" : "active" })}>
                         {row.status === "active" ? "停用" : "启用"}
                       </button>
                       {adminUser.role === "admin" && row.role !== "admin" && (
-                        <button type="button" onClick={() => void updateUser(row.id, { role: row.role === "analyst" ? "user" : "analyst" })}>
+                        <button type="button" onClick={() => void updateUser(row, { role: row.role === "analyst" ? "user" : "analyst" })}>
                           {row.role === "analyst" ? "降为用户" : "设为分析员"}
                         </button>
                       )}
                     </div>
-                  )
+                  ) : "只读"
                 }
               ]}
             />
@@ -463,7 +492,7 @@ export default function AdminDashboard({
 
         {tab === "invites" && (
           <>
-            {adminUser.role === "admin" && (
+            {canWriteInvites && (
               <section className="admin-card admin-invite-form">
                 <h2>生成邀请码</h2>
                 <input value={inviteDescription} placeholder="用途备注，例如：首批内测用户" onChange={(event) => setInviteDescription(event.target.value)} />
@@ -482,7 +511,7 @@ export default function AdminDashboard({
                   { key: "enabled", label: "状态", render: (row) => row.enabled ? "有效" : "停用" },
                   { key: "expires_at", label: "过期时间", render: (row) => row.expires_at ? dateTime(row.expires_at) : "长期" },
                   { key: "created_at", label: "创建时间", render: (row) => dateTime(row.created_at) },
-                  { key: "actions", label: "操作", render: (row) => adminUser.role === "admin" ? <button type="button" onClick={() => void toggleInvite(row)}>{row.enabled ? "停用" : "启用"}</button> : "只读" }
+                  { key: "actions", label: "操作", render: (row) => canWriteInvites ? <button type="button" onClick={() => void toggleInvite(row)}>{row.enabled ? "停用" : "启用"}</button> : "只读" }
                 ]}
               />
             </section>

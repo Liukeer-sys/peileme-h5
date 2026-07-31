@@ -19,7 +19,17 @@ import {
 
 export type User = {
   id: string;
-  role: "user" | "admin" | "analyst";
+  role:
+    | "user"
+    | "admin"
+    | "policy_editor"
+    | "policy_reviewer"
+    | "operations"
+    | "finance"
+    | "support"
+    | "ai_operator"
+    | "auditor"
+    | "analyst";
   email: string | null;
   phone: string | null;
   displayName: string | null;

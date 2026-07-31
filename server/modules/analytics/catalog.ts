@@ -65,9 +65,24 @@ export const parseClientEvent = (input: {
       }
     ]);
   }
+  const properties = schema.parse(input.properties ?? {});
+  const receivedKeys =
+    input.properties && typeof input.properties === "object" && !Array.isArray(input.properties)
+      ? Object.keys(input.properties)
+      : [];
+  const acceptedKeys = Object.keys(properties);
+  if (receivedKeys.some((key) => !acceptedKeys.includes(key))) {
+    throw new z.ZodError([
+      {
+        code: "custom",
+        path: ["properties"],
+        message: "事件属性未注册"
+      }
+    ]);
+  }
   return {
     name: input.name as ClientEventName,
-    properties: schema.parse(input.properties ?? {})
+    properties
   };
 };
 

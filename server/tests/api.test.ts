@@ -604,12 +604,19 @@ describe("policy persistence foundation", () => {
        FROM role_capabilities
        ORDER BY role, capability`
     );
-    expect(capabilities.rows).toEqual([
+    expect(capabilities.rows).toEqual(expect.arrayContaining([
+      { role: "admin", capability: "admin.access" },
       { role: "admin", capability: "policy.publish" },
-      { role: "admin", capability: "policy.read" },
-      { role: "admin", capability: "policy.write" },
-      { role: "analyst", capability: "policy.read" }
-    ]);
+      { role: "operations", capability: "operations.read" },
+      { role: "policy_editor", capability: "policy.write" },
+      { role: "policy_reviewer", capability: "policy.publish" },
+      { role: "analyst", capability: "policy.read" },
+      { role: "support", capability: "users.read" },
+      { role: "auditor", capability: "audit.read" },
+      { role: "finance", capability: "commerce.read" },
+      { role: "ai_operator", capability: "uploads.read" }
+    ]));
+    expect(capabilities.rows).toHaveLength(57);
   });
 
   it("keeps all baseline timestamps stable when seed data is unchanged", async () => {
@@ -2004,7 +2011,11 @@ describe("assessments, events and uploads", () => {
       .send({
         events: [
           { name: "document_uploaded", path: "/account" },
-          { name: "ai_document_uploaded", path: "/account" },
+          {
+            name: "ai_document_uploaded",
+            path: "/account",
+            properties: { sku: "AI_DOCUMENT_REVIEW", fileCount: 1 }
+          },
           { name: "ai_document_downloaded", path: "/account" }
         ]
       })

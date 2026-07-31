@@ -55,13 +55,12 @@ import {
   type OtpPurpose
 } from "./services.js";
 import {
+  type AuthUser,
   getRequestIdentity,
   optionalAuth,
   publicUser,
-  requireAdmin,
   requireAuth,
-  requireCapability,
-  requireSuperAdmin
+  requireCapability
 } from "./security.js";
 import {
   attachProductChannel,
@@ -307,15 +306,25 @@ export const createApp = (
 
   app.get("/api/ready", async (_request, response) => {
     const started = Date.now();
-    const database = await query<{ version: string }>(
-      "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1"
-    );
-    response.json({
-      status: "ready",
-      dependencies: { database: "ready" },
-      migration: database.rows[0]?.version ?? null,
-      checkedInMs: Date.now() - started
-    });
+    try {
+      const database = await query<{ version: string }>(
+        "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1"
+      );
+      response.json({
+        status: "ready",
+        database: true,
+        dependencies: { database: "ready" },
+        migration: database.rows[0]?.version ?? null,
+        checkedInMs: Date.now() - started
+      });
+    } catch {
+      response.status(503).json({
+        status: "not_ready",
+        database: false,
+        dependencies: { database: "unavailable" },
+        checkedInMs: Date.now() - started
+      });
+    }
   });
 
   app.get("/api/public/config", (request, response) => {
@@ -995,7 +1004,7 @@ export const createApp = (
     const [items, total] = await Promise.all([
       query(
         `SELECT u.id, u.email, u.phone, u.display_name, u.role, u.status,
-                u.last_login_at, u.created_at,
+                u.last_login_at, u.created_at, u.updated_at,
                 count(DISTINCT a.id)::int AS assessment_count,
                 count(DISTINCT r.id)::int AS invite_redemption_count
            FROM users u
@@ -1070,7 +1079,7 @@ export const createApp = (
         email: string | null;
         phone: string | null;
         display_name: string | null;
-        role: typeof request.authUser.role;
+        role: AuthUser["role"];
         status: "active" | "disabled";
         updated_at: Date;
       }>(
@@ -1275,7 +1284,8 @@ export const createApp = (
     const { pageSize, offset, page } = parsePagination(request);
     const includeMaterialAudit = request.productChannel === "ai";
     const result = await query(
-      `SELECT l.id, l.action, l.target_type, l.target_id, l.detail, l.ip, l.created_at,
+      `SELECT l.id, l.action, l.target_type, l.target_id, l.detail, l.ip,
+              l.actor_role, l.request_id, l.created_at,
               u.email AS admin_email, u.display_name AS admin_name
          FROM admin_audit_logs l
          LEFT JOIN users u ON u.id = l.admin_user_id
@@ -1344,7 +1354,7 @@ export const createApp = (
               FROM app_errors
              WHERE created_at >= now() - interval '24 hours') AS last_24_hours,
            coalesce(
-             (SELECT jsonb_agg(to_jsonb(recent_errors) ORDER BY created_at DESC)
+             (SELECT jsonb_agg(to_jsonb(recent_errors) ORDER BY recent_errors."createdAt" DESC)
                 FROM (
                   SELECT id, request_id AS "requestId", method, path, code,
                          created_at AS "createdAt"
@@ -1402,6 +1412,29 @@ export const createApp = (
     });
   });
 
+  app.get(
+    "/api/admin/operations",
+    requireCapability("operations.read"),
+    async (_request, response) => {
+      const [errors, jobs] = await Promise.all([
+        query(
+          `SELECT id, request_id, method, path, code, status_code,
+                  product_channel, created_at
+             FROM app_errors
+            ORDER BY created_at DESC
+            LIMIT 50`
+        ),
+        query(
+          `SELECT id, job_name, status, started_at, finished_at, detail
+             FROM operational_job_runs
+            ORDER BY started_at DESC
+            LIMIT 50`
+        )
+      ]);
+      response.json({ errors: errors.rows, jobs: jobs.rows });
+    }
+  );
+
   app.get("/api/admin/uploads/:id/download", requireCapability("uploads.download"), async (request, response) => {
     const id = uuidSchema.parse(request.params.id);
     const result = await query<{ stored_name: string; original_name: string }>(
@@ -1413,6 +1446,12 @@ export const createApp = (
     await audit(request, "upload.download", "upload", id);
     response.download(path.join(uploadDir, file.stored_name), file.original_name);
   });
+
+  if (config.NODE_ENV === "test") {
+    app.get("/api/test/force-error", () => {
+      throw new Error("forced test error");
+    });
+  }
 
   app.use((_request, response) => {
     response.status(404).json({ error: "NOT_FOUND", message: "接口不存在" });
@@ -1466,15 +1505,17 @@ export const createApp = (
       try {
         await query(
           `INSERT INTO app_errors(
-             request_id, method, path, code, message, product_channel
+             request_id, method, path, code, message, status_code, user_id,
+             product_channel
            )
-           VALUES ($1, $2, $3, $4, $5, $6)`,
+           VALUES ($1, $2, $3, $4, $5, 500, $6, $7)`,
           [
             String(request.header("x-request-id") || request.id || "").slice(0, 160) || null,
             request.method.slice(0, 20),
             request.path.slice(0, 500),
             (internalError.name || "INTERNAL_ERROR").slice(0, 100),
             internalError.message.slice(0, 1_000),
+            request.authUser?.id || null,
             request.productChannel || null
           ]
         );

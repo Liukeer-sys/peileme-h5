@@ -548,8 +548,8 @@ const requireAnnouncementCapability = (
   requireCapability(
     request.body?.status &&
     request.body.status !== "draft"
-      ? "policy.publish"
-      : "policy.write"
+      ? "content.publish"
+      : "content.write"
   )(request, response, next);
 
 export const createAdminPolicyRouter = (
@@ -750,7 +750,7 @@ export const createAdminPolicyRouter = (
     response.json({ year: query.year, items: await repository.coverage(query.year) });
   });
 
-  router.get("/announcements", read, async (_request, response) => {
+  router.get("/announcements", requireCapability("content.read"), async (_request, response) => {
     response.json({ items: await repository.listAnnouncements() });
   });
 
@@ -779,7 +779,7 @@ export const createAdminPolicyRouter = (
 
   router.delete(
     "/announcements/:id",
-    write,
+    requireCapability("content.write"),
     async (request, response) => {
       const id = z.string().uuid().parse(request.params.id);
       await repository.deleteAnnouncement({ id, request });

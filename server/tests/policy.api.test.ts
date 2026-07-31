@@ -3271,16 +3271,39 @@ describe("policy capability administration", () => {
       .set(authHeader(adminToken))
       .expect(200);
     expect(admin.body.capabilities).toEqual([
+      "admin.access",
+      "analytics.read",
+      "assessments.read",
+      "audit.read",
+      "commerce.read",
+      "content.publish",
+      "content.read",
+      "content.write",
+      "invites.read",
+      "invites.write",
+      "operations.read",
       "policy.publish",
       "policy.read",
-      "policy.write"
+      "policy.write",
+      "system.read",
+      "uploads.download",
+      "uploads.read",
+      "users.read",
+      "users.write"
     ]);
 
     const analyst = await request(createApp())
       .get("/api/auth/me")
       .set(authHeader(analystToken))
       .expect(200);
-    expect(analyst.body.capabilities).toEqual(["policy.read"]);
+    expect(analyst.body.capabilities).toEqual([
+      "admin.access",
+      "analytics.read",
+      "assessments.read",
+      "content.read",
+      "policy.read",
+      "users.read"
+    ]);
 
     const user = await request(createApp())
       .get("/api/auth/me")
@@ -3709,7 +3732,7 @@ describe("policy capability administration", () => {
 
     await query(
       `INSERT INTO role_capabilities(role, capability)
-       VALUES ('analyst', 'policy.write')
+       VALUES ('analyst', 'content.write')
        ON CONFLICT DO NOTHING`
     );
     await request(createApp())
@@ -3813,7 +3836,7 @@ describe("policy capability administration", () => {
     const path = "/api/admin/policy/announcements";
     await query(
       `INSERT INTO role_capabilities(role, capability)
-       VALUES ('analyst', 'policy.write')
+       VALUES ('analyst', 'content.write')
        ON CONFLICT DO NOTHING`
     );
     const draft = await request(createApp())

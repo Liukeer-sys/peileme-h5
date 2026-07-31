@@ -39,7 +39,7 @@ export default function AiAccountPanel({
   open,
   onClose
 }: AiAccountPanelProps) {
-  const { user, grants, logout, redeemInvite, updateProfile } = useAuth();
+  const { user, capabilities, grants, logout, redeemInvite, updateProfile } = useAuth();
   const [invite, setInvite] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [uploads, setUploads] = useState<UploadItem[]>([]);
@@ -454,7 +454,7 @@ export default function AiAccountPanel({
           </div>
         </div>
 
-        {["admin", "analyst"].includes(user.role) && (
+        {capabilities.includes("admin.access") && (
           <a className="admin-entry-link" href="/admin" onClick={() => track("admin_opened")}>
             进入 AI 管理后台 →
           </a>

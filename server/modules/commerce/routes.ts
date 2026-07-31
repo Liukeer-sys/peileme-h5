@@ -5,8 +5,8 @@ import { ApiError } from "../../errors.js";
 import { getConfig } from "../../config.js";
 import { query } from "../../db.js";
 import {
-  requireAdmin,
   requireAuth,
+  requireCapability,
   requireSuperAdmin
 } from "../../security.js";
 import { getActiveCatalog } from "./catalog.js";
@@ -330,7 +330,7 @@ export const createCommerceRouters = (
   adminRouter.get(
     "/status",
     requireAuth,
-    requireAdmin,
+    requireCapability("commerce.read"),
     async (_request, response, next) => {
       try {
         const result = await query<{
