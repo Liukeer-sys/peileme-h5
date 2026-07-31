@@ -1,3 +1,4 @@
+import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { sanitizePaymentEvidence } from "../modules/payments/evidence.js";
 
@@ -331,5 +332,84 @@ describe("payment evidence full-content digest", () => {
     expect(getterCalls).toBe(0);
     expect(repeated).toBe(first);
     expect(different).not.toBe(first);
+  });
+
+  it("falls through Date prototype brand spoofing to own data keys", () => {
+    const makeEvidence = (meta: string) => {
+      const value = Object.create(Date.prototype) as Record<string, unknown>;
+      value.meta = meta;
+      return { oversized: "x".repeat(5_000), value };
+    };
+
+    expectDistinctStableHashes(makeEvidence("A"), makeEvidence("B"));
+  });
+
+  it("falls through ArrayBuffer prototype brand spoofing to own data keys", () => {
+    const makeEvidence = (meta: string) => {
+      const value = Object.create(
+        ArrayBuffer.prototype
+      ) as Record<string, unknown>;
+      value.meta = meta;
+      return { oversized: "x".repeat(5_000), value };
+    };
+
+    expectDistinctStableHashes(makeEvidence("A"), makeEvidence("B"));
+  });
+
+  it("uses cross-realm Date internal slots", () => {
+    expectDistinctStableHashes(
+      {
+        oversized: "x".repeat(5_000),
+        value: runInNewContext("new Date(0)")
+      },
+      {
+        oversized: "x".repeat(5_000),
+        value: runInNewContext("new Date(1)")
+      }
+    );
+  });
+
+  it("uses cross-realm ArrayBuffer internal slots", () => {
+    expectDistinctStableHashes(
+      {
+        oversized: "x".repeat(5_000),
+        value: runInNewContext("Uint8Array.from([1, 2, 3]).buffer")
+      },
+      {
+        oversized: "x".repeat(5_000),
+        value: runInNewContext("Uint8Array.from([1, 2, 4]).buffer")
+      }
+    );
+  });
+
+  it("uses cross-realm SharedArrayBuffer internal slots when supported", () => {
+    if (typeof SharedArrayBuffer !== "function") return;
+    expectDistinctStableHashes(
+      {
+        oversized: "x".repeat(5_000),
+        value: runInNewContext(
+          "const b = new SharedArrayBuffer(3); new Uint8Array(b).set([1, 2, 3]); b"
+        )
+      },
+      {
+        oversized: "x".repeat(5_000),
+        value: runInNewContext(
+          "const b = new SharedArrayBuffer(3); new Uint8Array(b).set([1, 2, 4]); b"
+        )
+      }
+    );
+  });
+
+  it("recognizes cross-realm typed arrays through ArrayBuffer.isView", () => {
+    expectDistinctStableHashes(
+      {
+        oversized: "x".repeat(5_000),
+        value: runInNewContext("new Uint8Array([1, 2, 3])")
+      },
+      {
+        oversized: "x".repeat(5_000),
+        value: runInNewContext("new Uint8Array([1, 2, 4])")
+      }
+    );
   });
 });

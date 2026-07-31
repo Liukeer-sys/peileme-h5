@@ -76,7 +76,7 @@ interface PaymentProvider {
 
 `VerifiedPayment` 保存 `providerOrderNo`，不再把本地 `orders.order_no` 当作支付机构订单号。微信查单返回 `REFUND` 时使用独立 `state=REFUND`，同时仍携带原成功支付的 transaction id、金额、币种和支付时间；恢复任务据此补齐本地成功交易及退款状态，禁止把它降格成未付款。只有原始非 2xx 响应通过微信签名验证，且 404 body 明确表示订单不存在时才映射为 `NOT_FOUND`；unsigned/tampered 404 必须映射 `UNKNOWN` 或抛出未知结果错误并保持锁。创建请求发出后遇到超时、断链或无法验证的响应映射为 `CREATE_UNKNOWN`；其余无法判定状态映射为 `UNKNOWN`。Provider 不读数据库；订单与尝试的对应关系由 commerce service 完成。
 
-`created.response -> response_snapshot` 与 `verified.raw -> verified_payload` 共用同一持久化 sanitizer：递归删除 authorization/signature/token/secret/private key/api key/payer/openid/buyer id/phone/email 类 key，安全处理循环引用与 BigInt，并限制深度、数组长度、对象键数、字符串字节数、节点数和最终 JSON 字节数。任一形状或总量超限只保存 `_truncated=true`、完整有限输入的确定性 SHA-256 与原因；摘要使用显式栈覆盖完整字符串、全部数组项、排序后的全部 own data keys 和 typed-array 实际字节。Date、typed view、ArrayBuffer、SharedArrayBuffer 与数组先写入内在内容，再写入排序后的额外 own data keys；内在内容通过模块加载时捕获的原型 intrinsic 读取，不调用可被实例属性遮蔽的方法或 getter；数组和 typed array 的标准数值索引只处理一次。循环引用使用稳定对象编号，accessor、不可读属性或无法安全分类的对象使用稳定标记。金额、币种、provider transaction id 等结算字段继续写入独立结构化列。
+`created.response -> response_snapshot` 与 `verified.raw -> verified_payload` 共用同一持久化 sanitizer：递归删除 authorization/signature/token/secret/private key/api key/payer/openid/buyer id/phone/email 类 key，安全处理循环引用与 BigInt，并限制深度、数组长度、对象键数、字符串字节数、节点数和最终 JSON 字节数。任一形状或总量超限只保存 `_truncated=true`、完整有限输入的确定性 SHA-256 与原因；摘要使用显式栈覆盖完整字符串、全部数组项、排序后的全部 own data keys 和 typed-array 实际字节。Date、typed view、ArrayBuffer、SharedArrayBuffer 与数组先写入内在内容，再写入排序后的额外 own data keys；内在内容和品牌通过模块加载时捕获的原型 intrinsic 读取，可识别跨 realm 真对象，也不会调用可被实例属性遮蔽的方法或 getter。品牌探测失败会继续后续探测并最终按普通 own keys 处理；数组和 typed array 的标准数值索引只处理一次。循环引用使用稳定对象编号，accessor、不可读属性或无法遍历的对象使用稳定标记。金额、币种、provider transaction id 等结算字段继续写入独立结构化列。
 
 ### 3.2 Transport 和 SDK port
 

@@ -1,8 +1,6 @@
 import { createHash } from "node:crypto";
 
 const intrinsicApply = Reflect.apply;
-const DateIntrinsic = Date;
-const ArrayBufferIntrinsic = ArrayBuffer;
 const arrayBufferIsViewIntrinsic = ArrayBuffer.isView;
 const arrayIsArrayIntrinsic = Array.isArray;
 const SharedArrayBufferIntrinsic =
@@ -16,6 +14,22 @@ const captureGetter = (target: object, key: PropertyKey) => {
 
 const callIntrinsic = <Result>(intrinsic: Function, receiver: object) =>
   intrinsicApply(intrinsic, receiver, []) as Result;
+
+type IntrinsicProbe<Result> =
+  | { matched: true; value: Result }
+  | { matched: false };
+
+const probeIntrinsic = <Result>(
+  intrinsic: Function | undefined,
+  receiver: object
+): IntrinsicProbe<Result> => {
+  if (!intrinsic) return { matched: false };
+  try {
+    return { matched: true, value: callIntrinsic<Result>(intrinsic, receiver) };
+  } catch {
+    return { matched: false };
+  }
+};
 
 const dateGetTimeIntrinsic = Date.prototype.getTime;
 const dateToISOStringIntrinsic = Date.prototype.toISOString;
@@ -252,39 +266,27 @@ const hashEvidence = (input: unknown) => {
     nextObjectId += 1;
     seen.set(value, objectId);
 
-    let isDate: boolean;
-    let isBinaryView: boolean;
-    let isArrayBuffer: boolean;
-    let isSharedArrayBuffer: boolean;
-    let isArray: boolean;
-    try {
-      isDate = value instanceof DateIntrinsic;
-      isBinaryView = arrayBufferIsViewIntrinsic(value);
-      isArrayBuffer = value instanceof ArrayBufferIntrinsic;
-      isSharedArrayBuffer = Boolean(
-        SharedArrayBufferIntrinsic && value instanceof SharedArrayBufferIntrinsic
-      );
-      isArray = arrayIsArrayIntrinsic(value);
-    } catch {
-      writeToken("unreadable-object", String(objectId));
-      continue;
-    }
-
-    if (isDate) {
+    const dateTime = probeIntrinsic<number>(dateGetTimeIntrinsic, value);
+    if (dateTime.matched) {
       try {
-        const time = callIntrinsic<number>(dateGetTimeIntrinsic, value);
         writeToken(
           "date",
-          Number.isNaN(time)
+          Number.isNaN(dateTime.value)
             ? "[Invalid Date]"
             : callIntrinsic<string>(dateToISOStringIntrinsic, value)
         );
-      } catch {
-        writeToken("unreadable-object", String(objectId));
+        tasks.push(ownPropertiesTask(value, objectId));
         continue;
+      } catch {
+        // Continue to the remaining brands and ordinary own-key handling.
       }
-      tasks.push(ownPropertiesTask(value, objectId));
-      continue;
+    }
+
+    let isBinaryView = false;
+    try {
+      isBinaryView = arrayBufferIsViewIntrinsic(value);
+    } catch {
+      // Continue to the remaining brands and ordinary own-key handling.
     }
     if (isBinaryView) {
       try {
@@ -327,11 +329,13 @@ const hashEvidence = (input: unknown) => {
           );
           viewName = callIntrinsic<string>(typedArrayTagIntrinsic, value);
         }
-        writeToken("binary-view-type", viewName);
-        writeToken(
-          "binary-view-bytes",
-          new Uint8Array(viewBuffer, byteOffset, byteLength)
+        const viewBytes = new Uint8Array(
+          viewBuffer,
+          byteOffset,
+          byteLength
         );
+        writeToken("binary-view-type", viewName);
+        writeToken("binary-view-bytes", viewBytes);
         tasks.push(
           ownPropertiesTask(
             value,
@@ -340,44 +344,55 @@ const hashEvidence = (input: unknown) => {
             indexedLength
           )
         );
-      } catch {
-        writeToken("unreadable-object", String(objectId));
-      }
-      continue;
-    }
-    if (isArrayBuffer) {
-      try {
-        const byteLength = callIntrinsic<number>(
-          arrayBufferByteLengthIntrinsic,
-          value
-        );
-        writeToken(
-          "array-buffer",
-          new Uint8Array(value as ArrayBuffer, 0, byteLength)
-        );
-      } catch {
-        writeToken("unreadable-object", String(objectId));
         continue;
-      }
-      tasks.push(ownPropertiesTask(value, objectId));
-      continue;
-    }
-    if (isSharedArrayBuffer) {
-      try {
-        const byteLength = callIntrinsic<number>(
-          sharedArrayBufferByteLengthIntrinsic!,
-          value
-        );
-        writeToken(
-          "shared-array-buffer",
-          new Uint8Array(value as SharedArrayBuffer, 0, byteLength)
-        );
       } catch {
-        writeToken("unreadable-object", String(objectId));
-        continue;
+        // Continue to the remaining brands and ordinary own-key handling.
       }
-      tasks.push(ownPropertiesTask(value, objectId));
-      continue;
+    }
+
+    const arrayBufferByteLength = probeIntrinsic<number>(
+      arrayBufferByteLengthIntrinsic,
+      value
+    );
+    if (arrayBufferByteLength.matched) {
+      try {
+        const bufferBytes = new Uint8Array(
+          value as ArrayBuffer,
+          0,
+          arrayBufferByteLength.value
+        );
+        writeToken("array-buffer", bufferBytes);
+        tasks.push(ownPropertiesTask(value, objectId));
+        continue;
+      } catch {
+        // Continue to the remaining brands and ordinary own-key handling.
+      }
+    }
+
+    const sharedArrayBufferByteLength = probeIntrinsic<number>(
+      sharedArrayBufferByteLengthIntrinsic,
+      value
+    );
+    if (sharedArrayBufferByteLength.matched) {
+      try {
+        const bufferBytes = new Uint8Array(
+          value as SharedArrayBuffer,
+          0,
+          sharedArrayBufferByteLength.value
+        );
+        writeToken("shared-array-buffer", bufferBytes);
+        tasks.push(ownPropertiesTask(value, objectId));
+        continue;
+      } catch {
+        // Continue to ordinary own-key handling.
+      }
+    }
+
+    let isArray = false;
+    try {
+      isArray = arrayIsArrayIntrinsic(value);
+    } catch {
+      // Continue to ordinary own-key handling.
     }
     if (isArray) {
       const arrayValue = value as unknown[];
@@ -467,30 +482,21 @@ export const sanitizePaymentEvidence = (input: unknown): unknown => {
 
     if (seen.has(value)) return "[Circular]";
     seen.add(value);
-    let isDate: boolean;
-    let isBinaryView: boolean;
-    let isArrayBuffer: boolean;
-    let isSharedArrayBuffer: boolean;
-    let isArray: boolean;
-    try {
-      isDate = value instanceof DateIntrinsic;
-      isBinaryView = arrayBufferIsViewIntrinsic(value);
-      isArrayBuffer = value instanceof ArrayBufferIntrinsic;
-      isSharedArrayBuffer = Boolean(
-        SharedArrayBufferIntrinsic && value instanceof SharedArrayBufferIntrinsic
-      );
-      isArray = arrayIsArrayIntrinsic(value);
-    } catch {
-      limitExceeded = true;
-      return "[Unreadable Object]";
-    }
-    if (isDate) {
+    const dateTime = probeIntrinsic<number>(dateGetTimeIntrinsic, value);
+    if (dateTime.matched) {
       try {
         return callIntrinsic<string>(dateToISOStringIntrinsic, value);
       } catch {
         limitExceeded = true;
         return "[Unreadable Date]";
       }
+    }
+
+    let isBinaryView = false;
+    try {
+      isBinaryView = arrayBufferIsViewIntrinsic(value);
+    } catch {
+      // Continue to the remaining brands and ordinary own-key handling.
     }
     if (isBinaryView) {
       try {
@@ -508,23 +514,31 @@ export const sanitizePaymentEvidence = (input: unknown): unknown => {
         }
         return `[Binary ${byteLength} bytes]`;
       } catch {
-        limitExceeded = true;
-        return "[Unreadable Binary]";
+        // Continue to the remaining brands and ordinary own-key handling.
       }
     }
-    if (isArrayBuffer || isSharedArrayBuffer) {
-      try {
-        const byteLength = isArrayBuffer
-          ? callIntrinsic<number>(arrayBufferByteLengthIntrinsic, value)
-          : callIntrinsic<number>(
-              sharedArrayBufferByteLengthIntrinsic!,
-              value
-            );
-        return `[Binary ${byteLength} bytes]`;
-      } catch {
-        limitExceeded = true;
-        return "[Unreadable Binary]";
-      }
+
+    const arrayBufferByteLength = probeIntrinsic<number>(
+      arrayBufferByteLengthIntrinsic,
+      value
+    );
+    if (arrayBufferByteLength.matched) {
+      return `[Binary ${arrayBufferByteLength.value} bytes]`;
+    }
+
+    const sharedArrayBufferByteLength = probeIntrinsic<number>(
+      sharedArrayBufferByteLengthIntrinsic,
+      value
+    );
+    if (sharedArrayBufferByteLength.matched) {
+      return `[Binary ${sharedArrayBufferByteLength.value} bytes]`;
+    }
+
+    let isArray = false;
+    try {
+      isArray = arrayIsArrayIntrinsic(value);
+    } catch {
+      // Continue to ordinary own-key handling.
     }
     if (isArray) {
       const arrayValue = value as unknown[];
