@@ -44,8 +44,45 @@ export type FormulaStep = {
   value: string;
 };
 
+export type EngineTerminationRule = Readonly<{
+  compensationMultiplier: number;
+  noticePayMonths: number;
+}>;
+
+export type EngineReviewTerminationRule = EngineTerminationRule &
+  Readonly<{
+    reviewRange: Readonly<{
+      candidates: readonly EngineTerminationRule[];
+    }>;
+  }>;
+
+export type EnginePolicyRules = Readonly<{
+  schemaVersion: 1;
+  serviceYearFraction: Readonly<{
+    lessThanSixMonths: number;
+    atLeastSixMonths: number;
+  }>;
+  highSalaryCap: Readonly<{
+    localAverageMultiplier: number;
+    serviceYearCap: number;
+  }>;
+  termination: Readonly<{
+    mutualAgreementEmployer: EngineTerminationRule;
+    mutualAgreementEmployee: EngineReviewTerminationRule;
+    article40Notice30Days: EngineTerminationRule;
+    article40PaymentInLieu: EngineTerminationRule;
+    article38EmployeeTermination: EngineTerminationRule;
+    statutoryCompensation: EngineTerminationRule;
+    article39NoCompensation: EngineTerminationRule;
+    voluntaryResignation: EngineTerminationRule;
+    unlawfulTermination: EngineTerminationRule;
+    unclear: EngineReviewTerminationRule;
+  }>;
+}>;
+
 export type PolicyEngineErrorCode =
   | "INVALID_POLICY_INPUT"
+  | "INVALID_POLICY_RULES"
   | "INVALID_REGION"
   | "INVALID_EMPLOYMENT_DATE"
   | "END_DATE_MUST_FOLLOW_START_DATE"
@@ -60,6 +97,7 @@ export type PolicyEngineErrorCode =
 export type PolicyEngineErrorDetails = Readonly<{
   field?:
     | "input"
+    | "rules"
     | "regionCode"
     | "regionName"
     | "startDate"

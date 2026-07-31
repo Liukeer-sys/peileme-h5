@@ -1977,6 +1977,18 @@ describe("policy capability administration", () => {
     expect(responses.map((response) => response.status)).toEqual([201, 201]);
     const versions = responses.map((response) => response.body.version);
     expect(new Set(versions).size).toBe(2);
+    for (const response of responses) {
+      expect(response.body).toMatchObject({
+        regressionStatus: "passed",
+        regressionSummary: {
+          failed: 0
+        }
+      });
+      expect(response.body.regressionSummary.total).toBeGreaterThanOrEqual(6);
+      expect(Number.isNaN(Date.parse(response.body.regressionRunAt))).toBe(
+        false
+      );
+    }
 
     const audits = await query<{ count: string }>(
       `SELECT count(*)::text AS count
@@ -1985,6 +1997,43 @@ describe("policy capability administration", () => {
           AND detail->>'source' = 'parallel draft test'`
     );
     expect(audits.rows[0].count).toBe("2");
+  });
+
+  it("refuses to publish a draft whose persisted regression did not pass", async () => {
+    const path = "/api/admin/policy/rule-sets/cn-severance/versions";
+    const listed = await request(createApp())
+      .get(path)
+      .set(authHeader(adminToken))
+      .expect(200);
+    const draft = await request(createApp())
+      .post(path)
+      .set(authHeader(adminToken))
+      .send({
+        definition: listed.body.items[0].definition,
+        sourceSnapshot: [{ source: "regression gate test" }],
+        effectiveFrom: "2055-01-01"
+      })
+      .expect(201);
+    await query(
+      `UPDATE policy_rule_versions
+          SET regression_status = 'failed',
+              regression_summary = '{"total": 8, "passed": 7, "failed": 1}'::jsonb
+        WHERE id = $1`,
+      [draft.body.id]
+    );
+
+    const rejected = await request(createApp())
+      .post(`${path}/${draft.body.id}/publish`)
+      .set(authHeader(adminToken))
+      .expect(409);
+    expect(rejected.body).toMatchObject({
+      error: "POLICY_REGRESSION_REQUIRED"
+    });
+    const state = await query<{ status: string }>(
+      "SELECT status FROM policy_rule_versions WHERE id = $1",
+      [draft.body.id]
+    );
+    expect(state.rows[0].status).toBe("draft");
   });
 
   it("keeps a failed policy write and its audit in the same transaction", async () => {
@@ -2151,6 +2200,85 @@ describe("policy capability administration", () => {
       ruleVersion: 1,
       output: historical.body.result
     });
+  });
+
+  it("uses the published definition for calculation and restores behavior through rollback", async () => {
+    const versionsPath =
+      "/api/admin/policy/rule-sets/cn-severance/versions";
+    const listed = await request(createApp())
+      .get(versionsPath)
+      .set(authHeader(adminToken))
+      .expect(200);
+    const definition = structuredClone(listed.body.items[0].definition);
+    definition.decisionModel.article40EmployerTermination.notice30Days
+      .compensation = "TWO_N";
+    const input = calculationBody({ endDate: "2026-07-01" });
+
+    const before = await request(createApp())
+      .post("/api/policy/calculate")
+      .set(authHeader(userToken))
+      .send(input)
+      .expect(201);
+    const draft = await request(createApp())
+      .post(versionsPath)
+      .set(authHeader(adminToken))
+      .send({
+        definition,
+        sourceSnapshot: [{ source: "definition execution test" }],
+        effectiveFrom: "2026-01-01"
+      })
+      .expect(201);
+    await request(createApp())
+      .post(`${versionsPath}/${draft.body.id}/publish`)
+      .set(authHeader(adminToken))
+      .expect(200);
+
+    const after = await request(createApp())
+      .post("/api/policy/calculate")
+      .set(authHeader(userToken))
+      .send(input)
+      .expect(201);
+    expect(after.body.ruleVersion).toBe(draft.body.version);
+    expect(after.body.result.baseCompensationFen).toBe(
+      before.body.result.baseCompensationFen
+    );
+    expect(after.body.result.payableFen).toBe(
+      before.body.result.payableFen * 2
+    );
+    expect(
+      after.body.result.formulaSteps.find(
+        (step: { key: string }) => step.key === "scenario"
+      ).value
+    ).toContain("2N");
+
+    const futureInput = calculationBody({ endDate: "2027-07-01" });
+    const changedFuture = await request(createApp())
+      .post("/api/policy/calculate")
+      .set(authHeader(userToken))
+      .send(futureInput)
+      .expect(201);
+    const rollback = await request(createApp())
+      .post("/api/admin/policy/rule-sets/cn-severance/rollback")
+      .set(authHeader(adminToken))
+      .send({ targetVersion: 1, effectiveFrom: "2027-01-01" })
+      .expect(201);
+    const restored = await request(createApp())
+      .post("/api/policy/calculate")
+      .set(authHeader(userToken))
+      .send(futureInput)
+      .expect(201);
+    expect(restored.body.ruleVersion).toBe(rollback.body.version);
+    expect(restored.body.result.payableFen).toBe(
+      changedFuture.body.result.payableFen / 2
+    );
+    expect(restored.body.result.formulaSteps).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          key: "scenario",
+          value: expect.not.stringContaining("2N")
+        })
+      ])
+    );
   });
 
   it("rejects overlapping publication without partial state or audit", async () => {
@@ -2613,6 +2741,94 @@ describe("policy capability administration", () => {
     expect(response.body.message).toContain("CSV header must be exactly");
   });
 
+  it("handles quoted CSV fields while rejecting duplicates, formulas, and oversize payloads", async () => {
+    const path = "/api/admin/policy/regional-parameters/import";
+    const header =
+      "region_code,region_name,year,parameter_type,amount_fen,source_name,source_url,source_published_at,status";
+    const quoted = [
+      header,
+      '420100,武汉市,2026,minimum_monthly_wage,276000,"武汉市人社局,',
+      '劳动关系处",https://rsj.wuhan.gov.cn/task8/quoted.html,2026-02-01,verified'
+    ].join("\n");
+    const accepted = await request(createApp())
+      .post(path)
+      .set(authHeader(adminToken))
+      .send({ csv: quoted })
+      .expect(201);
+    expect(accepted.body.items[0].sourceName).toBe(
+      "武汉市人社局,\n劳动关系处"
+    );
+
+    const duplicate = [
+      header,
+      "310000,上海市,2026,minimum_monthly_wage,300000,上海市人社局,https://rsj.sh.gov.cn/task8/a.html,2026-01-01,verified",
+      "310000,上海市,2026,minimum_monthly_wage,310000,上海市人社局,https://rsj.sh.gov.cn/task8/b.html,2026-01-02,verified"
+    ].join("\n");
+    await request(createApp())
+      .post(path)
+      .set(authHeader(adminToken))
+      .send({ csv: duplicate })
+      .expect(400);
+
+    const formula = [
+      header,
+      '310000,上海市,2026,minimum_monthly_wage,300000,"=HYPERLINK(""https://evil.example"")",https://rsj.sh.gov.cn/task8/formula.html,2026-01-01,verified'
+    ].join("\n");
+    await request(createApp())
+      .post(path)
+      .set(authHeader(adminToken))
+      .send({ csv: formula })
+      .expect(400);
+
+    const oversize = await request(createApp())
+      .post(path)
+      .set(authHeader(adminToken))
+      .send({ csv: "x".repeat(500_001) })
+      .expect(400);
+    expect(oversize.body.error).toBe(
+      "INVALID_REGIONAL_PARAMETER_CSV"
+    );
+  });
+
+  it("forwards CSV database failures to the central 500 handler without leaking SQL details", async () => {
+    await query(`
+      CREATE FUNCTION fail_regional_csv_for_test()
+      RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        RAISE EXCEPTION 'regional csv SQL sentinel secret';
+      END;
+      $$;
+      CREATE TRIGGER fail_regional_csv_trigger
+      BEFORE INSERT ON regional_parameters
+      FOR EACH ROW EXECUTE FUNCTION fail_regional_csv_for_test()
+    `);
+    try {
+      const header =
+        "region_code,region_name,year,parameter_type,amount_fen,source_name,source_url,source_published_at,status";
+      const response = await request(createApp())
+        .post("/api/admin/policy/regional-parameters/import")
+        .set(authHeader(adminToken))
+        .send({
+          csv: [
+            header,
+            "310000,上海市,2026,minimum_monthly_wage,300000,上海市人社局,https://rsj.sh.gov.cn/task8/db.html,2026-01-01,verified"
+          ].join("\n")
+        })
+        .expect(500);
+      expect(response.body).toEqual({
+        error: "INTERNAL_ERROR",
+        message: "服务暂时开小差了"
+      });
+      expect(JSON.stringify(response.body)).not.toContain("sentinel");
+    } finally {
+      await query(`
+        DROP TRIGGER IF EXISTS fail_regional_csv_trigger
+          ON regional_parameters;
+        DROP FUNCTION IF EXISTS fail_regional_csv_for_test()
+      `);
+    }
+  });
+
   it("provides announcement CRUD with read-only analyst and audited admin mutations", async () => {
     const path = "/api/admin/policy/announcements";
     await request(createApp()).get(path).expect(401);
@@ -2676,7 +2892,7 @@ describe("policy capability administration", () => {
       .patch(`${path}/${created.body.id}`)
       .set(authHeader(analystToken))
       .send({ title: "分析员不得改写已发布公告" })
-      .expect(403);
+      .expect(409);
 
     const immutableDelete = await request(createApp())
       .delete(`${path}/${created.body.id}`)
@@ -2741,6 +2957,170 @@ describe("policy capability administration", () => {
         WHERE title = '错误排期'`
     );
     expect(persisted.rows[0].count).toBe("0");
+  });
+
+  it("enforces the draft-published-archived announcement state machine", async () => {
+    const path = "/api/admin/policy/announcements";
+    await query(
+      `INSERT INTO role_capabilities(role, capability)
+       VALUES ('analyst', 'policy.write')
+       ON CONFLICT DO NOTHING`
+    );
+    const draft = await request(createApp())
+      .post(path)
+      .set(authHeader(analystToken))
+      .send({
+        title: "分析员草稿",
+        body: "初始正文",
+        placement: "main",
+        status: "draft",
+        startsAt: "2026-08-01T08:00:00+08:00",
+        endsAt: "2026-08-01T09:00:00+08:00"
+      })
+      .expect(201);
+    const edited = await request(createApp())
+      .patch(`${path}/${draft.body.id}`)
+      .set(authHeader(analystToken))
+      .send({
+        title: "分析员编辑后的草稿",
+        body: "编辑后的完整正文",
+        startsAt: "2026-08-02T08:00:00+08:00",
+        endsAt: "2026-08-02T09:00:00+08:00"
+      })
+      .expect(200);
+    expect(edited.body).toMatchObject({
+      title: "分析员编辑后的草稿",
+      body: "编辑后的完整正文",
+      status: "draft"
+    });
+    await request(createApp())
+      .patch(`${path}/${draft.body.id}`)
+      .set(authHeader(analystToken))
+      .send({ status: "published" })
+      .expect(403);
+
+    await request(createApp())
+      .patch(`${path}/${draft.body.id}`)
+      .set(authHeader(adminToken))
+      .send({ status: "published" })
+      .expect(200);
+    await request(createApp())
+      .patch(`${path}/${draft.body.id}`)
+      .set(authHeader(adminToken))
+      .send({ body: "已发布正文不可覆盖" })
+      .expect(409);
+    await request(createApp())
+      .patch(`${path}/${draft.body.id}`)
+      .set(authHeader(adminToken))
+      .send({ status: "draft" })
+      .expect(409);
+    await request(createApp())
+      .patch(`${path}/${draft.body.id}`)
+      .set(authHeader(adminToken))
+      .send({ status: "archived" })
+      .expect(200);
+    await request(createApp())
+      .patch(`${path}/${draft.body.id}`)
+      .set(authHeader(adminToken))
+      .send({ status: "draft" })
+      .expect(409);
+    await request(createApp())
+      .patch(`${path}/${draft.body.id}`)
+      .set(authHeader(adminToken))
+      .send({ status: "published" })
+      .expect(409);
+    await request(createApp())
+      .post(path)
+      .set(authHeader(adminToken))
+      .send({
+        title: "禁止直接发布",
+        body: "必须先保存草稿",
+        placement: "main",
+        status: "published"
+      })
+      .expect(400);
+
+    const audits = await query<{
+      action: string;
+      detail: {
+        before?: Record<string, unknown>;
+        after?: Record<string, unknown>;
+      };
+    }>(
+      `SELECT action, detail
+         FROM admin_audit_logs
+        WHERE target_type = 'announcement'
+          AND target_id = $1
+        ORDER BY created_at`,
+      [draft.body.id]
+    );
+    expect(audits.rows).toHaveLength(4);
+    expect(audits.rows[1].detail).toMatchObject({
+      before: {
+        title: "分析员草稿",
+        body: "初始正文",
+        placement: "main",
+        status: "draft",
+        startsAt: expect.any(String),
+        endsAt: expect.any(String)
+      },
+      after: {
+        title: "分析员编辑后的草稿",
+        body: "编辑后的完整正文",
+        placement: "main",
+        status: "draft",
+        startsAt: expect.any(String),
+        endsAt: expect.any(String)
+      }
+    });
+  });
+
+  it("compares announcement schedules by absolute time and rejects invalid dates atomically", async () => {
+    const path = "/api/admin/policy/announcements";
+    const legalAcrossOffsets = await request(createApp())
+      .post(path)
+      .set(authHeader(adminToken))
+      .send({
+        title: "跨时区合法排期",
+        body: "结束时间在绝对时间上更晚",
+        placement: "all",
+        status: "draft",
+        startsAt: "2026-08-01T08:00:00+08:00",
+        endsAt: "2026-08-01T00:30:00Z"
+      })
+      .expect(201);
+    expect(Date.parse(legalAcrossOffsets.body.endsAt)).toBeGreaterThan(
+      Date.parse(legalAcrossOffsets.body.startsAt)
+    );
+
+    for (const schedule of [
+      {
+        startsAt: "2026-08-01T00:30:00Z",
+        endsAt: "2026-08-01T08:00:00+08:00"
+      },
+      {
+        startsAt: "not-a-date",
+        endsAt: "2026-08-01T09:00:00+08:00"
+      }
+    ]) {
+      await request(createApp())
+        .post(path)
+        .set(authHeader(adminToken))
+        .send({
+          title: "无效排期不得写入",
+          body: "错误排期",
+          placement: "main",
+          status: "draft",
+          ...schedule
+        })
+        .expect(400);
+    }
+    const count = await query<{ count: string }>(
+      `SELECT count(*)::text AS count
+         FROM announcements
+        WHERE title = '无效排期不得写入'`
+    );
+    expect(count.rows[0].count).toBe("0");
   });
 
   it("keeps a retired baseline retired when repeated seed recomputes the active pointer", async () => {

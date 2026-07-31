@@ -295,10 +295,18 @@ const regionalParameterCsvHeader = [
   "status"
 ] as const;
 
+const safeSpreadsheetText = z
+  .string()
+  .trim()
+  .min(1)
+  .refine((value) => !/^[=+\-@]/.test(value), {
+    message: "文本字段不得以 =、+、- 或 @ 开头"
+  });
+
 const regionalParameterCsvRowSchema = z
   .object({
     region_code: z.string().regex(/^\d{6}$/),
-    region_name: z.string().trim().min(1).max(200),
+    region_name: safeSpreadsheetText.max(200),
     year: z.string().regex(/^\d{4}$/).transform(Number),
     parameter_type: z.enum([
       "minimum_monthly_wage",
@@ -309,7 +317,7 @@ const regionalParameterCsvRowSchema = z
       .regex(/^\d+$/)
       .transform(Number)
       .pipe(positiveMoneySchema),
-    source_name: z.string().trim().min(1).max(500),
+    source_name: safeSpreadsheetText.max(500),
     source_url: z.string(),
     source_published_at: z.string(),
     status: z.enum(["draft", "verified", "stale"])
@@ -326,6 +334,8 @@ const regionalParameterCsvRowSchema = z
     status: row.status
   }));
 
+class RegionalParameterCsvError extends Error {}
+
 const announcementFields = {
   title: z.string().trim().min(1).max(200),
   body: z.string().trim().min(1).max(20_000),
@@ -339,7 +349,11 @@ const validAnnouncementSchedule = (
   value: { startsAt?: string | null; endsAt?: string | null },
   context: z.RefinementCtx
 ) => {
-  if (value.startsAt && value.endsAt && value.endsAt < value.startsAt) {
+  if (
+    value.startsAt &&
+    value.endsAt &&
+    Date.parse(value.endsAt) < Date.parse(value.startsAt)
+  ) {
     context.addIssue({
       code: "custom",
       path: ["endsAt"],
@@ -349,7 +363,10 @@ const validAnnouncementSchedule = (
 };
 
 const createAnnouncementSchema = z
-  .object(announcementFields)
+  .object({
+    ...announcementFields,
+    status: z.literal("draft")
+  })
   .strict()
   .superRefine(validAnnouncementSchedule);
 
@@ -511,6 +528,11 @@ export const createAdminPolicyRouter = (
     "/regional-parameters/import",
     publish,
     async (request, response, next) => {
+      let items: Array<
+        z.infer<typeof regionalParameterSchema> & {
+          regionName: string;
+        }
+      >;
       try {
         const body = z
           .object({
@@ -528,41 +550,51 @@ export const createAdminPolicyRouter = (
           throw new Error("Regional-parameter CSV must contain at least one row");
         }
         const seen = new Set<string>();
-        const items = records.map((record, index) => {
-          const parsedRow = regionalParameterCsvRowSchema.parse(record);
-          const parsed = regionalParameterSchema.parse(parsedRow);
-          const key = `${parsed.regionCode}:${parsed.year}:${parsed.parameterType}`;
-          if (seen.has(key)) {
-            throw new Error(
-              `Row ${index + 2}: duplicate regional parameter ${key}`
-            );
+        items = records.map((record, index) => {
+          try {
+            const parsedRow = regionalParameterCsvRowSchema.parse(record);
+            const parsed = regionalParameterSchema.parse(parsedRow);
+            const key = `${parsed.regionCode}:${parsed.year}:${parsed.parameterType}`;
+            if (seen.has(key)) {
+              throw new RegionalParameterCsvError(
+                `第 ${index + 2} 行：区域参数 ${key} 重复`
+              );
+            }
+            seen.add(key);
+            return {
+              ...parsed,
+              regionName: parsedRow.regionName
+            };
+          } catch (error) {
+            if (error instanceof z.ZodError) {
+              throw new RegionalParameterCsvError(
+                `第 ${index + 2} 行：${error.issues[0]?.message || "字段无效"}`
+              );
+            }
+            throw error;
           }
-          seen.add(key);
-          return {
-            ...parsed,
-            regionName: parsedRow.regionName
-          };
         });
-        const result = await repository.importRegionalParameters({
+      } catch (error) {
+        next(
+          new ApiError(
+            400,
+            "INVALID_REGIONAL_PARAMETER_CSV",
+            error instanceof z.ZodError
+              ? error.issues[0]?.message || "CSV 请求无效"
+              : error instanceof RegionalParameterCsvError ||
+                  error instanceof Error
+                ? error.message
+                : "CSV 请求无效"
+          )
+        );
+        return;
+      }
+      response.status(201).json(
+        await repository.importRegionalParameters({
           inputs: items,
           request
-        });
-        response.status(201).json(result);
-      } catch (error) {
-        if (error instanceof z.ZodError || error instanceof Error) {
-          next(
-            new ApiError(
-              400,
-              "INVALID_REGIONAL_PARAMETER_CSV",
-              error instanceof z.ZodError
-                ? `第 ${Number(error.issues[0]?.path[0] ?? 0) + 2} 行：${error.issues[0]?.message || "字段无效"}`
-                : error.message
-            )
-          );
-          return;
-        }
-        next(error);
-      }
+        })
+      );
     }
   );
 
@@ -592,7 +624,7 @@ export const createAdminPolicyRouter = (
 
   router.patch(
     "/announcements/:id",
-    publish,
+    requireAnnouncementCapability,
     async (request, response) => {
       const id = z.string().uuid().parse(request.params.id);
       const input = updateAnnouncementSchema.parse(request.body);

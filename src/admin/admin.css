@@ -858,6 +858,19 @@
   gap: 12px;
 }
 
+.admin-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  padding-top: 18px;
+}
+
+.admin-pagination span {
+  color: var(--admin-muted);
+  font-size: 13px;
+}
+
 .admin-parameter-editor {
   grid-template-columns: repeat(5, minmax(0, 1fr)) auto;
   align-items: end;

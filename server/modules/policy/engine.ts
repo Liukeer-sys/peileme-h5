@@ -1,6 +1,10 @@
 import { Decimal } from "decimal.js";
+import { z } from "zod";
 import { PolicyEngineError } from "./types.js";
 import type {
+  EnginePolicyRules,
+  EngineReviewTerminationRule,
+  EngineTerminationRule,
   FormulaStep,
   PolicyEngineErrorCode,
   PolicyEngineErrorDetails,
@@ -38,6 +42,145 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     !Array.isArray(value)
   );
 }
+
+const terminationRuleSchema = z
+  .object({
+    compensationMultiplier: z.number().min(0).max(4),
+    noticePayMonths: z.number().min(0).max(3)
+  })
+  .strict();
+
+const reviewTerminationRuleSchema = z
+  .object({
+    compensationMultiplier: z.number().min(0).max(4),
+    noticePayMonths: z.number().min(0).max(3),
+    reviewRange: z
+      .object({
+        candidates: z.array(terminationRuleSchema).min(1).max(10)
+      })
+      .strict()
+  })
+  .strict();
+
+const enginePolicyRulesSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    serviceYearFraction: z
+      .object({
+        lessThanSixMonths: z.number().min(0).max(1),
+        atLeastSixMonths: z.number().min(0).max(1)
+      })
+      .strict(),
+    highSalaryCap: z
+      .object({
+        localAverageMultiplier: z.number().min(1).max(10),
+        serviceYearCap: z.number().int().min(1).max(50)
+      })
+      .strict(),
+    termination: z
+      .object({
+        mutualAgreementEmployer: terminationRuleSchema,
+        mutualAgreementEmployee: reviewTerminationRuleSchema,
+        article40Notice30Days: terminationRuleSchema,
+        article40PaymentInLieu: terminationRuleSchema,
+        article38EmployeeTermination: terminationRuleSchema,
+        statutoryCompensation: terminationRuleSchema,
+        article39NoCompensation: terminationRuleSchema,
+        voluntaryResignation: terminationRuleSchema,
+        unlawfulTermination: terminationRuleSchema,
+        unclear: reviewTerminationRuleSchema
+      })
+      .strict()
+  })
+  .strict()
+  .superRefine((rules, context) => {
+    if (
+      rules.serviceYearFraction.atLeastSixMonths <
+      rules.serviceYearFraction.lessThanSixMonths
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["serviceYearFraction", "atLeastSixMonths"],
+        message:
+          "atLeastSixMonths must be greater than or equal to lessThanSixMonths"
+      });
+    }
+  });
+
+export const DEFAULT_ENGINE_POLICY_RULES: EnginePolicyRules = {
+  schemaVersion: 1,
+  serviceYearFraction: {
+    lessThanSixMonths: 0.5,
+    atLeastSixMonths: 1
+  },
+  highSalaryCap: {
+    localAverageMultiplier: 3,
+    serviceYearCap: 12
+  },
+  termination: {
+    mutualAgreementEmployer: {
+      compensationMultiplier: 1,
+      noticePayMonths: 0
+    },
+    mutualAgreementEmployee: {
+      compensationMultiplier: 0,
+      noticePayMonths: 0,
+      reviewRange: {
+        candidates: [
+          { compensationMultiplier: 0, noticePayMonths: 0 },
+          { compensationMultiplier: 1, noticePayMonths: 0 }
+        ]
+      }
+    },
+    article40Notice30Days: {
+      compensationMultiplier: 1,
+      noticePayMonths: 0
+    },
+    article40PaymentInLieu: {
+      compensationMultiplier: 1,
+      noticePayMonths: 1
+    },
+    article38EmployeeTermination: {
+      compensationMultiplier: 1,
+      noticePayMonths: 0
+    },
+    statutoryCompensation: {
+      compensationMultiplier: 1,
+      noticePayMonths: 0
+    },
+    article39NoCompensation: {
+      compensationMultiplier: 0,
+      noticePayMonths: 0
+    },
+    voluntaryResignation: {
+      compensationMultiplier: 0,
+      noticePayMonths: 0
+    },
+    unlawfulTermination: {
+      compensationMultiplier: 2,
+      noticePayMonths: 0
+    },
+    unclear: {
+      compensationMultiplier: 0,
+      noticePayMonths: 0,
+      reviewRange: {
+        candidates: [
+          { compensationMultiplier: 0, noticePayMonths: 0 },
+          { compensationMultiplier: 2, noticePayMonths: 0 },
+          { compensationMultiplier: 1, noticePayMonths: 1 }
+        ]
+      }
+    }
+  }
+};
+
+const parseEnginePolicyRules = (value: unknown): EnginePolicyRules => {
+  const parsed = enginePolicyRulesSchema.safeParse(value);
+  if (!parsed.success) {
+    fail("INVALID_POLICY_RULES", { field: "rules" });
+  }
+  return parsed.data;
+};
 
 const isLeapYear = (year: number) =>
   year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
@@ -206,15 +349,16 @@ const averageFen = (values: number[]) => {
 
 const compensationYears = (
   serviceMonths: number,
-  serviceRemainderDays: number
+  serviceRemainderDays: number,
+  rules: EnginePolicyRules["serviceYearFraction"]
 ) => {
   const fullYears = Math.floor(serviceMonths / 12);
   const remainderMonths = serviceMonths % 12;
   if (remainderMonths >= 6) {
-    return fullYears + 1;
+    return fullYears + rules.atLeastSixMonths;
   }
   if (remainderMonths > 0 || serviceRemainderDays > 0) {
-    return fullYears + 0.5;
+    return fullYears + rules.lessThanSixMonths;
   }
   return fullYears;
 };
@@ -384,52 +528,173 @@ const parsePolicyInput = (value: unknown): PolicyInput => {
   };
 };
 
+const evaluateTerminationRule = (
+  rule: EngineTerminationRule,
+  baseCompensationFen: number,
+  noticePayBasisFen: number
+) => {
+  const compensationFen = multiplyMoney(
+    baseCompensationFen,
+    rule.compensationMultiplier
+  );
+  const noticePayFen = multiplyMoney(
+    noticePayBasisFen,
+    rule.noticePayMonths
+  );
+  return {
+    noticePayFen,
+    payableFen: addMoney(compensationFen, noticePayFen)
+  };
+};
+
+const evaluateReviewRange = (
+  rule: EngineReviewTerminationRule,
+  baseCompensationFen: number,
+  noticePayBasisFen: number
+) => {
+  const candidates = rule.reviewRange.candidates.map(
+    (candidate) =>
+      evaluateTerminationRule(
+        candidate,
+        baseCompensationFen,
+        noticePayBasisFen
+      ).payableFen
+  );
+  return {
+    low: Math.min(...candidates),
+    high: Math.max(...candidates)
+  };
+};
+
 const describeScenario = (
   scenario: TerminationScenario,
-  continuedPerformanceRequired: boolean
+  continuedPerformanceRequired: boolean,
+  appliedRule: EngineTerminationRule
 ) => {
-  switch (scenario.kind) {
-    case "MUTUAL_AGREEMENT":
-      return scenario.proposedBy === "employer"
-        ? "用人单位提出协商解除，按N计算经济补偿"
-        : "劳动者提出协商解除，法定经济补偿需结合协议及事实复核，以待复核区间展示";
-    case "ARTICLE_40":
-      return scenario.noticeMethod === "notice_30_days"
-        ? "用人单位依据第四十条解除并已提前三十日书面通知"
-        : "用人单位依据第四十条解除并选择支付代通知金";
-    case "ARTICLE_38_EMPLOYEE_TERMINATION":
-      return "劳动者依据第三十八条解除，按N计算经济补偿";
-    case "STATUTORY_COMPENSATION":
-      return "劳动合同依法解除或终止，按N计算法定经济补偿";
-    case "ARTICLE_39_NO_COMPENSATION":
-      return "用人单位依据第三十九条过失性解除，法定经济补偿为0分";
-    case "VOLUNTARY_RESIGNATION":
-      return "劳动者自愿辞职，法定经济补偿按0分计算";
-    case "UNLAWFUL_TERMINATION":
-      return continuedPerformanceRequired
-        ? "违法解除，继续履行劳动合同优先"
-        : "违法解除，按二倍经济补偿计算赔偿金";
-    case "UNCLEAR":
-      return "解除情形尚不明确，现金结果按支持情形的保守范围展示并需复核";
+  const defaultRule: EngineTerminationRule = (() => {
+    switch (scenario.kind) {
+      case "MUTUAL_AGREEMENT":
+        return {
+          compensationMultiplier:
+            scenario.proposedBy === "employer" ? 1 : 0,
+          noticePayMonths: 0
+        };
+      case "ARTICLE_40":
+        return {
+          compensationMultiplier: 1,
+          noticePayMonths:
+            scenario.noticeMethod === "payment_in_lieu" ? 1 : 0
+        };
+      case "ARTICLE_38_EMPLOYEE_TERMINATION":
+      case "STATUTORY_COMPENSATION":
+        return { compensationMultiplier: 1, noticePayMonths: 0 };
+      case "UNLAWFUL_TERMINATION":
+        return { compensationMultiplier: 2, noticePayMonths: 0 };
+      case "ARTICLE_39_NO_COMPENSATION":
+      case "VOLUNTARY_RESIGNATION":
+      case "UNCLEAR":
+        return { compensationMultiplier: 0, noticePayMonths: 0 };
+    }
+  })();
+  const usesDefaultRule =
+    appliedRule.compensationMultiplier ===
+      defaultRule.compensationMultiplier &&
+    appliedRule.noticePayMonths === defaultRule.noticePayMonths;
+
+  const defaultDescription = (() => {
+    switch (scenario.kind) {
+      case "MUTUAL_AGREEMENT":
+        return scenario.proposedBy === "employer"
+          ? "用人单位提出协商解除，按N计算经济补偿"
+          : "劳动者提出协商解除，法定经济补偿需结合协议及事实复核，以待复核区间展示";
+      case "ARTICLE_40":
+        return scenario.noticeMethod === "notice_30_days"
+          ? "用人单位依据第四十条解除并已提前三十日书面通知"
+          : "用人单位依据第四十条解除并选择支付代通知金";
+      case "ARTICLE_38_EMPLOYEE_TERMINATION":
+        return "劳动者依据第三十八条解除，按N计算经济补偿";
+      case "STATUTORY_COMPENSATION":
+        return "劳动合同依法解除或终止，按N计算法定经济补偿";
+      case "ARTICLE_39_NO_COMPENSATION":
+        return "用人单位依据第三十九条过失性解除，法定经济补偿为0分";
+      case "VOLUNTARY_RESIGNATION":
+        return "劳动者自愿辞职，法定经济补偿按0分计算";
+      case "UNLAWFUL_TERMINATION":
+        return continuedPerformanceRequired
+          ? "违法解除，继续履行劳动合同优先"
+          : "违法解除，按二倍经济补偿计算赔偿金";
+      case "UNCLEAR":
+        return "解除情形尚不明确，现金结果按支持情形的保守范围展示并需复核";
+    }
+  })();
+  if (usesDefaultRule || continuedPerformanceRequired) {
+    return defaultDescription;
   }
+
+  const ruleBasis = (() => {
+    switch (scenario.kind) {
+      case "MUTUAL_AGREEMENT":
+        return scenario.proposedBy === "employer"
+          ? "用人单位提出协商解除"
+          : "劳动者提出协商解除";
+      case "ARTICLE_40":
+        return "用人单位依据第四十条解除";
+      case "ARTICLE_38_EMPLOYEE_TERMINATION":
+        return "劳动者依据第三十八条解除";
+      case "STATUTORY_COMPENSATION":
+        return "劳动合同依法解除或终止";
+      case "ARTICLE_39_NO_COMPENSATION":
+        return "用人单位依据第三十九条过失性解除";
+      case "VOLUNTARY_RESIGNATION":
+        return "劳动者自愿辞职";
+      case "UNLAWFUL_TERMINATION":
+        return "违法解除";
+      case "UNCLEAR":
+        return "解除情形尚不明确";
+    }
+  })();
+  return (
+    `${ruleBasis}；当前有效规则配置为` +
+    `${appliedRule.compensationMultiplier}N经济补偿和` +
+    `${appliedRule.noticePayMonths}个月代通知金`
+  );
 };
 
 const noticePayExplanation = (
   scenario: TerminationScenario,
   noticePayBasisFen: number,
-  noticePayFen: number
+  noticePayFen: number,
+  noticePayMonths: number
 ) => {
+  if (noticePayMonths > 0) {
+    if (
+      scenario.kind === "ARTICLE_40" &&
+      scenario.noticeMethod === "payment_in_lieu" &&
+      noticePayMonths === 1
+    ) {
+      return `按解除前一个完整工资月${noticePayBasisFen}分计算，代通知金为${noticePayFen}分`;
+    }
+    return (
+      `按有效规则配置的${noticePayMonths}个月×` +
+      `解除前一个完整工资月${noticePayBasisFen}分计算，` +
+      `代通知金为${noticePayFen}分`
+    );
+  }
   if (scenario.kind !== "ARTICLE_40") {
     return `当前情形不适用代通知金，金额为${noticePayFen}分`;
   }
   if (scenario.noticeMethod === "notice_30_days") {
     return "已提前三十日书面通知，代通知金为0分";
   }
-  return `按解除前一个完整工资月${noticePayBasisFen}分计算，代通知金为${noticePayFen}分`;
+  return "当前有效规则未配置代通知金，金额为0分";
 };
 
-export const calculatePolicy = (value: unknown): PolicyOutput => {
+export const calculatePolicy = (
+  value: unknown,
+  rulesValue: unknown = DEFAULT_ENGINE_POLICY_RULES
+): PolicyOutput => {
   const input = parsePolicyInput(value);
+  const rules = parseEnginePolicyRules(rulesValue);
   const scenario = input.terminationScenario;
   const { serviceMonths, serviceRemainderDays } = serviceDuration(
     input.startDate,
@@ -446,7 +711,7 @@ export const calculatePolicy = (value: unknown): PolicyOutput => {
       : rawAverageWageFen;
   const highSalaryCapFen = multiplyMoney(
     input.employeeAverageMonthlyWageFen,
-    3
+    rules.highSalaryCap.localAverageMultiplier
   );
   const salaryCapped = rawAverageWageFen > highSalaryCapFen;
   const salaryBasisFen = salaryCapped
@@ -454,10 +719,14 @@ export const calculatePolicy = (value: unknown): PolicyOutput => {
     : minimumAdjusted;
   const uncappedCompensationMonths = compensationYears(
     serviceMonths,
-    serviceRemainderDays
+    serviceRemainderDays,
+    rules.serviceYearFraction
   );
   const compensationMonths = salaryCapped
-    ? Math.min(12, uncappedCompensationMonths)
+    ? Math.min(
+        rules.highSalaryCap.serviceYearCap,
+        uncappedCompensationMonths
+      )
     : uncappedCompensationMonths;
   const baseCompensationFen = multiplyMoney(
     salaryBasisFen,
@@ -469,52 +738,74 @@ export const calculatePolicy = (value: unknown): PolicyOutput => {
   let reviewRequired = false;
   let continuedPerformanceRequired = false;
   let rangeFen = { low: 0, high: 0 };
+  let appliedRule: EngineTerminationRule = {
+    compensationMultiplier: 0,
+    noticePayMonths: 0
+  };
+
+  const applyRule = (rule: EngineTerminationRule) => {
+    appliedRule = rule;
+    const result = evaluateTerminationRule(
+      rule,
+      baseCompensationFen,
+      noticePayBasisFen
+    );
+    noticePayFen = result.noticePayFen;
+    payableFen = result.payableFen;
+    rangeFen = { low: payableFen, high: payableFen };
+  };
+  const applyReviewRule = (rule: EngineReviewTerminationRule) => {
+    applyRule(rule);
+    reviewRequired = true;
+    rangeFen = evaluateReviewRange(
+      rule,
+      baseCompensationFen,
+      noticePayBasisFen
+    );
+  };
 
   switch (scenario.kind) {
     case "MUTUAL_AGREEMENT":
       if (scenario.proposedBy === "employer") {
-        payableFen = baseCompensationFen;
-        rangeFen = { low: payableFen, high: payableFen };
+        applyRule(rules.termination.mutualAgreementEmployer);
       } else {
-        reviewRequired = true;
-        rangeFen = { low: 0, high: baseCompensationFen };
+        applyReviewRule(
+          rules.termination.mutualAgreementEmployee
+        );
       }
       break;
     case "ARTICLE_40":
-      noticePayFen =
+      applyRule(
         scenario.noticeMethod === "payment_in_lieu"
-          ? noticePayBasisFen
-          : 0;
-      payableFen = addMoney(baseCompensationFen, noticePayFen);
-      rangeFen = { low: payableFen, high: payableFen };
+          ? rules.termination.article40PaymentInLieu
+          : rules.termination.article40Notice30Days
+      );
       break;
     case "ARTICLE_38_EMPLOYEE_TERMINATION":
+      applyRule(
+        rules.termination.article38EmployeeTermination
+      );
+      break;
     case "STATUTORY_COMPENSATION":
-      payableFen = baseCompensationFen;
-      rangeFen = { low: payableFen, high: payableFen };
+      applyRule(rules.termination.statutoryCompensation);
       break;
     case "ARTICLE_39_NO_COMPENSATION":
+      applyRule(rules.termination.article39NoCompensation);
+      break;
     case "VOLUNTARY_RESIGNATION":
+      applyRule(rules.termination.voluntaryResignation);
       break;
     case "UNLAWFUL_TERMINATION":
       continuedPerformanceRequired =
         scenario.continuedPerformanceRequested &&
         scenario.continuedPerformancePossible;
-      payableFen = continuedPerformanceRequired
-        ? 0
-        : multiplyMoney(baseCompensationFen, 2);
-      rangeFen = { low: payableFen, high: payableFen };
+      if (!continuedPerformanceRequired) {
+        applyRule(rules.termination.unlawfulTermination);
+      }
       break;
-    case "UNCLEAR": {
-      reviewRequired = true;
-      const twoNFen = multiplyMoney(baseCompensationFen, 2);
-      const nPlusNoticeFen = addMoney(
-        baseCompensationFen,
-        noticePayBasisFen
-      );
-      rangeFen = { low: 0, high: Math.max(twoNFen, nPlusNoticeFen) };
+    case "UNCLEAR":
+      applyReviewRule(rules.termination.unclear);
       break;
-    }
   }
 
   const remainingAfterPaid = (amountFen: number) =>
@@ -556,9 +847,14 @@ export const calculatePolicy = (value: unknown): PolicyOutput => {
     },
     {
       key: "cap",
-      label: "当地职工月平均工资三倍上限",
+      label:
+        "当地职工月平均工资" +
+        (rules.highSalaryCap.localAverageMultiplier === 3
+          ? "三"
+          : rules.highSalaryCap.localAverageMultiplier) +
+        "倍上限",
       value: salaryCapped
-        ? `触发${highSalaryCapFen}分上限，工资基数为${salaryBasisFen}分且计发年限最多12年`
+        ? `触发${highSalaryCapFen}分上限，工资基数为${salaryBasisFen}分且计发年限最多${rules.highSalaryCap.serviceYearCap}年`
         : `未触发${highSalaryCapFen}分上限，工资基数为${salaryBasisFen}分`
     },
     {
@@ -569,7 +865,11 @@ export const calculatePolicy = (value: unknown): PolicyOutput => {
     {
       key: "scenario",
       label: "解除情形",
-      value: describeScenario(scenario, continuedPerformanceRequired)
+      value: describeScenario(
+        scenario,
+        continuedPerformanceRequired,
+        appliedRule
+      )
     },
     {
       key: "notice",
@@ -577,7 +877,8 @@ export const calculatePolicy = (value: unknown): PolicyOutput => {
       value: noticePayExplanation(
         scenario,
         noticePayBasisFen,
-        noticePayFen
+        noticePayFen,
+        appliedRule.noticePayMonths
       )
     }
   ];

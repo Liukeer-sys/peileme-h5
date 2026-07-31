@@ -4,7 +4,9 @@ import { z } from "zod";
 import { writeAdminAudit } from "../../audit.js";
 import { query, withTransaction } from "../../db.js";
 import { ApiError } from "../../errors.js";
+import { runPolicyRegression } from "./regression.js";
 import type {
+  EnginePolicyRules,
   PolicyInput,
   PolicyOutput
 } from "./types.js";
@@ -20,6 +22,23 @@ export type PolicyRegion = {
   };
 };
 
+const compensationSchema = z.enum(["ZERO", "N", "TWO_N"]);
+const compensationMultiplier = (
+  compensation: z.infer<typeof compensationSchema>
+) => ({ ZERO: 0, N: 1, TWO_N: 2 })[compensation];
+const compensationRuleSchema = z
+  .object({
+    compensation: compensationSchema,
+    noticePayMonths: z.number().min(0).max(3).default(0)
+  })
+  .strict();
+const reviewCandidateSchema = z
+  .object({
+    compensation: compensationSchema,
+    noticePayMonths: z.number().min(0).max(3).default(0)
+  })
+  .strict();
+
 export const policyDefinitionSchema = z
   .object({
     schemaVersion: z.literal(2),
@@ -27,47 +46,40 @@ export const policyDefinitionSchema = z
       .object({
         mutualAgreement: z
           .object({
-            employerProposed: z
-              .object({ compensation: z.literal("N") })
-              .strict(),
+            employerProposed: compensationRuleSchema,
             employeeProposed: z
               .object({
-                compensation: z.literal("ZERO"),
-                agreementReviewRequired: z.literal(true)
+                compensation: compensationSchema,
+                noticePayMonths: z.number().min(0).max(3).default(0),
+                agreementReviewRequired: z.literal(true),
+                reviewCandidates: z
+                  .array(reviewCandidateSchema)
+                  .min(1)
+                  .max(10)
+                  .optional()
               })
               .strict()
           })
           .strict(),
         article40EmployerTermination: z
           .object({
-            notice30Days: z
-              .object({
-                compensation: z.literal("N"),
-                noticePayMonths: z.literal(0)
-              })
-              .strict(),
-            paymentInLieu: z
-              .object({
-                compensation: z.literal("N"),
-                noticePayMonths: z.literal(1)
-              })
-              .strict()
+            notice30Days: compensationRuleSchema,
+            paymentInLieu: compensationRuleSchema
           })
           .strict(),
         employeeTermination: z
           .object({
-            article38: z
-              .object({ compensation: z.literal("N") })
-              .strict(),
-            voluntaryResignation: z
-              .object({ compensation: z.literal("ZERO") })
-              .strict()
+            article38: compensationRuleSchema,
+            voluntaryResignation: compensationRuleSchema
           })
           .strict(),
+        statutoryCompensation: compensationRuleSchema.optional(),
+        article39NoCompensation: compensationRuleSchema.optional(),
         unlawfulTermination: z
           .object({
             primaryRemedy: z.literal("CONTINUE_PERFORMANCE"),
-            fallbackCompensation: z.literal("TWO_N"),
+            fallbackCompensation: compensationSchema,
+            noticePayMonths: z.number().min(0).max(3).default(0),
             fallbackWhen: z.tuple([
               z.literal("EMPLOYEE_DOES_NOT_REQUEST_CONTINUATION"),
               z.literal("CONTINUED_PERFORMANCE_IMPOSSIBLE")
@@ -75,26 +87,131 @@ export const policyDefinitionSchema = z
           })
           .strict(),
         unclear: z
-          .object({ result: z.literal("REVIEW") })
+          .object({
+            result: z.literal("REVIEW"),
+            reviewCandidates: z
+              .array(reviewCandidateSchema)
+              .min(1)
+              .max(10)
+              .optional()
+          })
           .strict()
       })
       .strict(),
     serviceYearFraction: z
       .object({
-        lessThanSixMonths: z.literal(0.5),
-        atLeastSixMonths: z.literal(1)
+        lessThanSixMonths: z.number().min(0).max(1),
+        atLeastSixMonths: z.number().min(0).max(1)
       })
-      .strict(),
+      .strict()
+      .refine(
+        (value) =>
+          value.atLeastSixMonths >= value.lessThanSixMonths,
+        {
+          message: "满六个月的工龄折算不得低于不足六个月",
+          path: ["atLeastSixMonths"]
+        }
+      ),
     highSalaryCap: z
       .object({
-        localAverageMultiplier: z.literal(3),
-        serviceYearCap: z.literal(12)
+        localAverageMultiplier: z.number().min(1).max(10),
+        serviceYearCap: z.number().int().min(1).max(50)
       })
       .strict()
   })
   .strict();
 
 export type PolicyDefinition = z.infer<typeof policyDefinitionSchema>;
+
+const engineRule = (value: {
+  compensation: z.infer<typeof compensationSchema>;
+  noticePayMonths: number;
+}) => ({
+  compensationMultiplier: compensationMultiplier(value.compensation),
+  noticePayMonths: value.noticePayMonths
+});
+
+export const policyDefinitionToEngineRules = (
+  definition: PolicyDefinition
+): EnginePolicyRules => {
+  const decision = definition.decisionModel;
+  const mutualEmployee = decision.mutualAgreement.employeeProposed;
+  const defaultMutualReview = [
+    {
+      compensation: mutualEmployee.compensation,
+      noticePayMonths: mutualEmployee.noticePayMonths
+    },
+    decision.mutualAgreement.employerProposed
+  ];
+  const defaultUnclearReview = [
+    { compensation: "ZERO" as const, noticePayMonths: 0 },
+    {
+      compensation: decision.unlawfulTermination.fallbackCompensation,
+      noticePayMonths: decision.unlawfulTermination.noticePayMonths
+    },
+    decision.article40EmployerTermination.paymentInLieu
+  ];
+  return {
+    schemaVersion: 1,
+    serviceYearFraction: definition.serviceYearFraction,
+    highSalaryCap: definition.highSalaryCap,
+    termination: {
+      mutualAgreementEmployer: engineRule(
+        decision.mutualAgreement.employerProposed
+      ),
+      mutualAgreementEmployee: {
+        ...engineRule({
+          compensation: mutualEmployee.compensation,
+          noticePayMonths: mutualEmployee.noticePayMonths
+        }),
+        reviewRange: {
+          candidates: (
+            mutualEmployee.reviewCandidates ?? defaultMutualReview
+          ).map(engineRule)
+        }
+      },
+      article40Notice30Days: engineRule(
+        decision.article40EmployerTermination.notice30Days
+      ),
+      article40PaymentInLieu: engineRule(
+        decision.article40EmployerTermination.paymentInLieu
+      ),
+      article38EmployeeTermination: engineRule(
+        decision.employeeTermination.article38
+      ),
+      statutoryCompensation: engineRule(
+        decision.statutoryCompensation ?? {
+          compensation: "N",
+          noticePayMonths: 0
+        }
+      ),
+      article39NoCompensation: engineRule(
+        decision.article39NoCompensation ?? {
+          compensation: "ZERO",
+          noticePayMonths: 0
+        }
+      ),
+      voluntaryResignation: engineRule(
+        decision.employeeTermination.voluntaryResignation
+      ),
+      unlawfulTermination: {
+        compensationMultiplier: compensationMultiplier(
+          decision.unlawfulTermination.fallbackCompensation
+        ),
+        noticePayMonths: decision.unlawfulTermination.noticePayMonths
+      },
+      unclear: {
+        compensationMultiplier: 0,
+        noticePayMonths: 0,
+        reviewRange: {
+          candidates: (
+            decision.unclear.reviewCandidates ?? defaultUnclearReview
+          ).map(engineRule)
+        }
+      }
+    }
+  };
+};
 
 export type ManualPolicyParameters = {
   minimumMonthlyWageFen?: number;
@@ -174,7 +291,10 @@ export type CalculationResult = {
   result: PolicyOutput;
 };
 
-type PolicyCalculator = (input: unknown) => PolicyOutput;
+type PolicyCalculator = (
+  input: unknown,
+  rules?: EnginePolicyRules
+) => PolicyOutput;
 
 const stableJson = (value: unknown): string => {
   if (Array.isArray(value)) {
@@ -227,6 +347,9 @@ const formatVersion = (row: {
   published_by?: string | null;
   published_at?: string | null;
   created_at?: string;
+  regression_status?: string;
+  regression_summary?: unknown;
+  regression_run_at?: string | null;
 }) => ({
   id: row.id,
   version: row.version,
@@ -237,6 +360,9 @@ const formatVersion = (row: {
   effectiveTo: row.effective_to,
   publishedBy: row.published_by ?? null,
   publishedAt: row.published_at ?? null,
+  regressionStatus: row.regression_status ?? "pending",
+  regressionSummary: row.regression_summary ?? {},
+  regressionRunAt: row.regression_run_at ?? null,
   ...(row.created_at ? { createdAt: row.created_at } : {})
 });
 
@@ -250,6 +376,22 @@ const sourceLabel = (snapshot: unknown) => {
   }
   return "api";
 };
+
+const announcementAuditSnapshot = (announcement: {
+  title: string;
+  body: string;
+  placement: string;
+  status: string;
+  starts_at: string | null;
+  ends_at: string | null;
+}) => ({
+  title: announcement.title,
+  body: announcement.body,
+  placement: announcement.placement,
+  status: announcement.status,
+  startsAt: announcement.starts_at,
+  endsAt: announcement.ends_at
+});
 
 export class PolicyRepository {
   async listRegions(
@@ -411,7 +553,10 @@ export class PolicyRepository {
           "该日期暂无可用政策规则"
         );
       }
-      if (!policyDefinitionSchema.safeParse(version.definition).success) {
+      const parsedDefinition = policyDefinitionSchema.safeParse(
+        version.definition
+      );
+      if (!parsedDefinition.success) {
         throw new ApiError(
           422,
           "POLICY_DEFINITION_INVALID",
@@ -565,7 +710,10 @@ export class PolicyRepository {
         employeeAverageMonthlyWageFen: averageProvenance.amountFen,
         alreadyPaidFen: facts.alreadyPaidFen ?? 0
       };
-      const output = calculate(canonicalInput);
+      const output = calculate(
+        canonicalInput,
+        policyDefinitionToEngineRules(parsedDefinition.data)
+      );
       const parameterIds = provenanceValues.flatMap((item) =>
         item.source === "database" ? [item.parameterId] : []
       );
@@ -918,11 +1066,16 @@ export class PolicyRepository {
       published_by: string | null;
       published_at: string | null;
       created_at: string;
+      regression_status: string;
+      regression_summary: unknown;
+      regression_run_at: string | null;
     }>(
       `SELECT prv.id, prv.version, prv.status, prv.definition,
               prv.source_snapshot, prv.effective_from::text,
               prv.effective_to::text, prv.published_by,
-              prv.published_at::text, prv.created_at::text
+              prv.published_at::text, prv.created_at::text,
+              prv.regression_status, prv.regression_summary,
+              prv.regression_run_at::text
          FROM policy_rule_sets prs
          JOIN policy_rule_versions prv ON prv.rule_set_id = prs.id
         WHERE prs.code = $1
@@ -947,6 +1100,11 @@ export class PolicyRepository {
     effectiveTo?: string | null;
     request: Request;
   }) {
+    const regression = runPolicyRegression(
+      policyDefinitionToEngineRules(definition)
+    );
+    const regressionStatus =
+      regression.failed === 0 ? "passed" : "failed";
     return withTransaction(async (client) => {
       const ruleSet = await client.query<{ id: string }>(
         `SELECT id
@@ -977,21 +1135,32 @@ export class PolicyRepository {
         effective_from: string;
         effective_to: string | null;
         created_at: string;
+        regression_status: string;
+        regression_summary: unknown;
+        regression_run_at: string;
       }>(
         `INSERT INTO policy_rule_versions(
            rule_set_id, version, status, definition, source_snapshot,
-           effective_from, effective_to
+           effective_from, effective_to, regression_status,
+           regression_summary, regression_run_at
          )
-         VALUES ($1, $2, 'draft', $3::jsonb, $4::jsonb, $5::date, $6::date)
+         VALUES (
+           $1, $2, 'draft', $3::jsonb, $4::jsonb, $5::date, $6::date,
+           $7, $8::jsonb, now()
+         )
          RETURNING id, version, status, definition, source_snapshot,
-                   effective_from::text, effective_to::text, created_at::text`,
+                   effective_from::text, effective_to::text, created_at::text,
+                   regression_status, regression_summary,
+                   regression_run_at::text`,
         [
           ruleSet.rows[0].id,
           nextVersion.rows[0].version,
           JSON.stringify(definition),
           JSON.stringify(sourceSnapshot),
           effectiveFrom,
-          effectiveTo ?? null
+          effectiveTo ?? null,
+          regressionStatus,
+          JSON.stringify(regression)
         ]
       );
       const row = inserted.rows[0];
@@ -1009,7 +1178,9 @@ export class PolicyRepository {
             effectiveTo: row.effective_to
           },
           version: row.version,
-          source: sourceLabel(sourceSnapshot)
+          source: sourceLabel(sourceSnapshot),
+          regressionStatus,
+          regression
         },
         client
       );
@@ -1142,9 +1313,14 @@ export class PolicyRepository {
         source_snapshot: unknown;
         effective_from: string;
         effective_to: string | null;
+        regression_status: string;
+        regression_summary: unknown;
+        regression_run_at: string | null;
       }>(
         `SELECT id, version, status, definition, source_snapshot,
-                effective_from::text, effective_to::text
+                effective_from::text, effective_to::text,
+                regression_status, regression_summary,
+                regression_run_at::text
            FROM policy_rule_versions
           WHERE id = $1
             AND rule_set_id = $2
@@ -1164,6 +1340,14 @@ export class PolicyRepository {
           409,
           "POLICY_VERSION_IMMUTABLE",
           "仅草稿版本可以发布"
+        );
+      }
+      if (draft.regression_status !== "passed") {
+        throw new ApiError(
+          409,
+          "POLICY_REGRESSION_REQUIRED",
+          "规则回归校验通过后才可发布",
+          { regressionSummary: draft.regression_summary }
         );
       }
       if (!policyDefinitionSchema.safeParse(draft.definition).success) {
@@ -1190,6 +1374,9 @@ export class PolicyRepository {
         effective_to: string | null;
         published_by: string | null;
         published_at: string | null;
+        regression_status: string;
+        regression_summary: unknown;
+        regression_run_at: string | null;
       }>(
         `UPDATE policy_rule_versions
             SET status = 'published',
@@ -1199,7 +1386,8 @@ export class PolicyRepository {
           WHERE id = $1
           RETURNING id, version, status, definition, source_snapshot,
                     effective_from::text, effective_to::text, published_by,
-                    published_at::text`,
+                    published_at::text, regression_status,
+                    regression_summary, regression_run_at::text`,
         [draft.id, request.authUser!.id]
       );
       await this.updateActivePointer(client, ruleSet.rows[0].id);
@@ -1267,6 +1455,27 @@ export class PolicyRepository {
           "回滚目标版本不存在"
         );
       }
+      const parsedTarget = policyDefinitionSchema.safeParse(
+        target.rows[0].definition
+      );
+      if (!parsedTarget.success) {
+        throw new ApiError(
+          409,
+          "POLICY_REGRESSION_REQUIRED",
+          "回滚目标规则无法通过当前回归校验"
+        );
+      }
+      const regression = runPolicyRegression(
+        policyDefinitionToEngineRules(parsedTarget.data)
+      );
+      if (regression.failed > 0) {
+        throw new ApiError(
+          409,
+          "POLICY_REGRESSION_REQUIRED",
+          "回滚目标规则无法通过当前回归校验",
+          { regressionSummary: regression }
+        );
+      }
       const maximum = await client.query<{
         version: number;
         effective_from: string | null;
@@ -1306,25 +1515,31 @@ export class PolicyRepository {
         effective_to: string | null;
         published_by: string | null;
         published_at: string | null;
+        regression_status: string;
+        regression_summary: unknown;
+        regression_run_at: string;
       }>(
         `INSERT INTO policy_rule_versions(
            rule_set_id, version, status, definition, source_snapshot,
-           effective_from, effective_to, published_by, published_at
+           effective_from, effective_to, published_by, published_at,
+           regression_status, regression_summary, regression_run_at
          )
          VALUES (
            $1, $2, 'published', $3::jsonb, $4::jsonb,
-           $5::date, NULL, $6, now()
+           $5::date, NULL, $6, now(), 'passed', $7::jsonb, now()
          )
          RETURNING id, version, status, definition, source_snapshot,
                    effective_from::text, effective_to::text, published_by,
-                   published_at::text`,
+                   published_at::text, regression_status,
+                   regression_summary, regression_run_at::text`,
         [
           ruleSet.rows[0].id,
           maximum.rows[0].version + 1,
           JSON.stringify(target.rows[0].definition),
           JSON.stringify(target.rows[0].source_snapshot),
           effectiveFrom,
-          request.authUser!.id
+          request.authUser!.id,
+          JSON.stringify(regression)
         ]
       );
       await this.updateActivePointer(client, ruleSet.rows[0].id);
@@ -1341,7 +1556,9 @@ export class PolicyRepository {
           },
           targetVersion,
           newVersion: inserted.rows[0].version,
-          source: sourceLabel(target.rows[0].source_snapshot)
+          source: sourceLabel(target.rows[0].source_snapshot),
+          regressionStatus: "passed",
+          regression
         },
         client
       );
@@ -1515,8 +1732,7 @@ export class PolicyRepository {
         AND ($4::text IS NULL OR rp.parameter_type = $4)
         AND ($5::text IS NULL OR rp.status = $5)
     `;
-    const [items, total] = await Promise.all([
-      query<{
+    type RegionalParameterListRow = {
         id: string;
         region_code: string;
         region_name: string;
@@ -1532,8 +1748,13 @@ export class PolicyRepository {
         reviewed_by: string | null;
         reviewed_at: string | null;
         updated_at: string;
-      }>(
-        `SELECT rp.id, rp.region_code, rp.region_name,
+    };
+    const result = await query<{
+      items: RegionalParameterListRow[];
+      total: string;
+    }>(
+      `WITH filtered AS (
+         SELECT rp.id, rp.region_code, rp.region_name,
                 CASE
                   WHEN child.level = 'province' THEN child.code
                   ELSE parent.code
@@ -1551,20 +1772,27 @@ export class PolicyRepository {
            LEFT JOIN administrative_regions parent
              ON parent.code = child.parent_code
           ${where}
-          ORDER BY rp.year DESC, rp.region_code, rp.parameter_type
-          LIMIT $6 OFFSET $7`,
-        [...values, pageSize, (page - 1) * pageSize]
-      ),
-      query<{ count: string }>(
-        `SELECT count(*)::text AS count
-           FROM regional_parameters rp
-           JOIN administrative_regions child ON child.code = rp.region_code
-          ${where}`,
-        values
-      )
-    ]);
+       ),
+       page_rows AS (
+         SELECT *
+           FROM filtered
+          ORDER BY year DESC, region_code, parameter_type
+          LIMIT $6 OFFSET $7
+       )
+       SELECT coalesce(
+                jsonb_agg(
+                  to_jsonb(page_rows)
+                  ORDER BY year DESC, region_code, parameter_type
+                ),
+                '[]'::jsonb
+              ) AS items,
+              (SELECT count(*)::text FROM filtered) AS total
+         FROM page_rows`,
+      [...values, pageSize, (page - 1) * pageSize]
+    );
+    const pageResult = result.rows[0];
     return {
-      items: items.rows.map((row) => ({
+      items: pageResult.items.map((row) => ({
         id: row.id,
         regionCode: row.region_code,
         regionName: row.region_name,
@@ -1584,7 +1812,7 @@ export class PolicyRepository {
       pagination: {
         page,
         pageSize,
-        total: Number(total.rows[0]?.count || 0)
+        total: Number(pageResult.total || 0)
       }
     };
   }
@@ -1625,16 +1853,24 @@ export class PolicyRepository {
       for (const input of inputs) {
         const region = byCode.get(input.regionCode);
         if (!region) {
-          throw new Error(`Unknown administrative region ${input.regionCode}`);
+          throw new ApiError(
+            400,
+            "INVALID_REGIONAL_PARAMETER_CSV",
+            `行政区划 ${input.regionCode} 不存在`
+          );
         }
         if (region.status !== "active") {
-          throw new Error(
-            `Administrative region ${input.regionCode} is not active`
+          throw new ApiError(
+            400,
+            "INVALID_REGIONAL_PARAMETER_CSV",
+            `行政区划 ${input.regionCode} 当前不可用`
           );
         }
         if (region.name !== input.regionName) {
-          throw new Error(
-            `Region ${input.regionCode} is named ${region.name}, received ${input.regionName}`
+          throw new ApiError(
+            400,
+            "INVALID_REGIONAL_PARAMETER_CSV",
+            `行政区划 ${input.regionCode} 名称应为 ${region.name}`
           );
         }
       }
@@ -1806,7 +2042,10 @@ export class PolicyRepository {
         "announcement.create",
         "announcement",
         row.id,
-        { title: row.title, status: row.status, placement: row.placement },
+        {
+          before: null,
+          after: announcementAuditSnapshot(row)
+        },
         client
       );
       return {
@@ -1882,6 +2121,31 @@ export class PolicyRepository {
           "公告结束时间不得早于开始时间"
         );
       }
+      const requestedStatus = input.status ?? before.status;
+      if (before.status === "draft") {
+        if (
+          requestedStatus !== "draft" &&
+          requestedStatus !== "published"
+        ) {
+          throw new ApiError(
+            409,
+            "ANNOUNCEMENT_TRANSITION_INVALID",
+            "公告必须从草稿发布后再归档"
+          );
+        }
+      } else if (
+        before.status === "published" &&
+        requestedStatus === "archived" &&
+        Object.keys(input).every((key) => key === "status")
+      ) {
+        // The only mutation allowed after publication is archival.
+      } else {
+        throw new ApiError(
+          409,
+          "ANNOUNCEMENT_IMMUTABLE",
+          "已发布或归档公告不可修改或回退为草稿"
+        );
+      }
       const updated = await client.query<{
         id: string;
         title: string;
@@ -1911,7 +2175,7 @@ export class PolicyRepository {
           input.title ?? before.title,
           input.body ?? before.body,
           input.placement ?? before.placement,
-          input.status ?? before.status,
+          requestedStatus,
           startsAt,
           endsAt
         ]
@@ -1923,16 +2187,8 @@ export class PolicyRepository {
         "announcement",
         id,
         {
-          before: {
-            title: before.title,
-            status: before.status,
-            placement: before.placement
-          },
-          after: {
-            title: row.title,
-            status: row.status,
-            placement: row.placement
-          }
+          before: announcementAuditSnapshot(before),
+          after: announcementAuditSnapshot(row)
         },
         client
       );

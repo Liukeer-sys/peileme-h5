@@ -28,6 +28,73 @@ const baseInput = (): PolicyInput => ({
   employeeAverageMonthlyWageFen: 1_250_000
 });
 
+const engineRules = () => ({
+  schemaVersion: 1 as const,
+  serviceYearFraction: {
+    lessThanSixMonths: 0.5,
+    atLeastSixMonths: 1
+  },
+  highSalaryCap: {
+    localAverageMultiplier: 3,
+    serviceYearCap: 12
+  },
+  termination: {
+    mutualAgreementEmployer: {
+      compensationMultiplier: 1,
+      noticePayMonths: 0
+    },
+    mutualAgreementEmployee: {
+      compensationMultiplier: 0,
+      noticePayMonths: 0,
+      reviewRange: {
+        candidates: [
+          { compensationMultiplier: 0, noticePayMonths: 0 },
+          { compensationMultiplier: 1, noticePayMonths: 0 }
+        ]
+      }
+    },
+    article40Notice30Days: {
+      compensationMultiplier: 1,
+      noticePayMonths: 0
+    },
+    article40PaymentInLieu: {
+      compensationMultiplier: 1,
+      noticePayMonths: 1
+    },
+    article38EmployeeTermination: {
+      compensationMultiplier: 1,
+      noticePayMonths: 0
+    },
+    statutoryCompensation: {
+      compensationMultiplier: 1,
+      noticePayMonths: 0
+    },
+    article39NoCompensation: {
+      compensationMultiplier: 0,
+      noticePayMonths: 0
+    },
+    voluntaryResignation: {
+      compensationMultiplier: 0,
+      noticePayMonths: 0
+    },
+    unlawfulTermination: {
+      compensationMultiplier: 2,
+      noticePayMonths: 0
+    },
+    unclear: {
+      compensationMultiplier: 0,
+      noticePayMonths: 0,
+      reviewRange: {
+        candidates: [
+          { compensationMultiplier: 0, noticePayMonths: 0 },
+          { compensationMultiplier: 2, noticePayMonths: 0 },
+          { compensationMultiplier: 1, noticePayMonths: 1 }
+        ]
+      }
+    }
+  }
+});
+
 const deepFreeze = <T>(value: T): T => {
   if (value && typeof value === "object") {
     Object.freeze(value);
@@ -781,6 +848,276 @@ describe("calculatePolicy legal scenario matrix", () => {
     expect(
       result.formulaSteps.some((step) => step.value.includes("待事实复核"))
     ).toBe(false);
+  });
+});
+
+describe("calculatePolicy controlled runtime rules", () => {
+  it("uses configured service fractions and high-salary cap parameters", () => {
+    const rules = engineRules();
+    rules.serviceYearFraction.lessThanSixMonths = 0.25;
+    rules.serviceYearFraction.atLeastSixMonths = 0.75;
+    rules.highSalaryCap.localAverageMultiplier = 2;
+    rules.highSalaryCap.serviceYearCap = 5;
+
+    const shortService = calculatePolicy({
+      ...baseInput(),
+      startDate: "2026-03-01"
+    }, rules);
+    const sixMonthService = calculatePolicy({
+      ...baseInput(),
+      startDate: "2026-01-01"
+    }, rules);
+    const highSalaryLongService = calculatePolicy({
+      ...baseInput(),
+      startDate: "2000-01-01",
+      monthlyEarnedWagesFen: Array(12).fill(4_000_000),
+      employeeAverageMonthlyWageFen: 1_000_000
+    }, rules);
+
+    expect(shortService.compensationMonths).toBe(0.25);
+    expect(sixMonthService.compensationMonths).toBe(0.75);
+    expect(highSalaryLongService.salaryBasisFen).toBe(2_000_000);
+    expect(highSalaryLongService.compensationMonths).toBe(5);
+    expect(highSalaryLongService.baseCompensationFen).toBe(10_000_000);
+    expect(
+      highSalaryLongService.formulaSteps.find(
+        (step) => step.key === "cap"
+      )
+    ).toEqual({
+      key: "cap",
+      label: "当地职工月平均工资2倍上限",
+      value:
+        "触发2000000分上限，工资基数为2000000分且计发年限最多5年"
+    });
+  });
+
+  it.each([
+    [
+      "employer mutual agreement",
+      { kind: "MUTUAL_AGREEMENT", proposedBy: "employer" },
+      "mutualAgreementEmployer",
+      0.8,
+      0.1
+    ],
+    [
+      "Article 40 with notice",
+      { kind: "ARTICLE_40", noticeMethod: "notice_30_days" },
+      "article40Notice30Days",
+      0.9,
+      0.2
+    ],
+    [
+      "Article 40 payment in lieu",
+      { kind: "ARTICLE_40", noticeMethod: "payment_in_lieu" },
+      "article40PaymentInLieu",
+      1.1,
+      1.2
+    ],
+    [
+      "Article 38 employee termination",
+      { kind: "ARTICLE_38_EMPLOYEE_TERMINATION" },
+      "article38EmployeeTermination",
+      1.2,
+      0.3
+    ],
+    [
+      "statutory compensation",
+      { kind: "STATUTORY_COMPENSATION" },
+      "statutoryCompensation",
+      1.3,
+      0.4
+    ],
+    [
+      "Article 39 no-compensation",
+      { kind: "ARTICLE_39_NO_COMPENSATION" },
+      "article39NoCompensation",
+      0.2,
+      0.5
+    ],
+    [
+      "voluntary resignation",
+      { kind: "VOLUNTARY_RESIGNATION" },
+      "voluntaryResignation",
+      0.1,
+      0.6
+    ],
+    [
+      "unlawful termination fallback",
+      {
+        kind: "UNLAWFUL_TERMINATION",
+        continuedPerformanceRequested: false,
+        continuedPerformancePossible: true
+      },
+      "unlawfulTermination",
+      1.7,
+      0.7
+    ]
+  ] as const)(
+    "applies configured compensation and notice-pay multipliers for %s",
+    (_name, scenario, ruleKey, compensationMultiplier, noticePayMonths) => {
+      const rules = engineRules();
+      rules.termination[ruleKey].compensationMultiplier =
+        compensationMultiplier;
+      rules.termination[ruleKey].noticePayMonths = noticePayMonths;
+
+      const result = calculatePolicy({
+        ...baseInput(),
+        terminationScenario: scenario as TerminationScenario
+      }, rules);
+
+      expect(result.noticePayFen).toBe(
+        result.noticePayBasisFen * noticePayMonths
+      );
+      expect(result.payableFen).toBe(
+        Math.round(
+          result.baseCompensationFen * compensationMultiplier
+        ) +
+          Math.round(
+            result.noticePayBasisFen * noticePayMonths
+          )
+      );
+      expect(
+        result.formulaSteps.find((step) => step.key === "notice")?.value
+      ).toContain(`${noticePayMonths}个月`);
+      expect(
+        result.formulaSteps.find((step) => step.key === "scenario")?.value
+      ).toContain(`${compensationMultiplier}N`);
+    }
+  );
+
+  it("drives employee-proposed review bounds from configured candidates", () => {
+    const rules = engineRules();
+    rules.termination.mutualAgreementEmployee.reviewRange.candidates = [
+      { compensationMultiplier: 0.25, noticePayMonths: 0 },
+      { compensationMultiplier: 1.25, noticePayMonths: 0.5 }
+    ];
+
+    const result = calculatePolicy({
+      ...baseInput(),
+      terminationScenario: {
+        kind: "MUTUAL_AGREEMENT",
+        proposedBy: "employee"
+      }
+    }, rules);
+
+    expect(result.rangeFen).toEqual({
+      low: 2_625_000,
+      high: 13_875_000
+    });
+    expect(result.reviewRequired).toBe(true);
+  });
+
+  it("drives UNCLEAR bounds from candidates and preserves trimmed fact gaps", () => {
+    const rules = engineRules();
+    rules.termination.unclear.reviewRange.candidates = [
+      { compensationMultiplier: 0.5, noticePayMonths: 2 },
+      { compensationMultiplier: 1.5, noticePayMonths: 0.25 }
+    ];
+
+    const result = calculatePolicy({
+      ...baseInput(),
+      terminationScenario: {
+        kind: "UNCLEAR",
+        factGaps: ["  需核验解除依据  ", "需核验送达材料"]
+      }
+    }, rules);
+
+    expect(result.rangeFen).toEqual({
+      low: 8_250_000,
+      high: 16_125_000
+    });
+    expect(result.payableDetermined).toBe(false);
+    expect(
+      result.formulaSteps.find((step) => step.key === "fact-gaps")
+    ).toEqual({
+      key: "fact-gaps",
+      label: "待核验事实",
+      value: "1. 需核验解除依据；2. 需核验送达材料"
+    });
+  });
+
+  it.each([
+    ["wrong schema version", { ...engineRules(), schemaVersion: 2 }],
+    [
+      "unknown top-level field",
+      { ...engineRules(), unexpected: true }
+    ],
+    [
+      "out-of-bounds service fraction",
+      {
+        ...engineRules(),
+        serviceYearFraction: {
+          lessThanSixMonths: -0.1,
+          atLeastSixMonths: 1
+        }
+      }
+    ],
+    [
+      "reversed service fractions",
+      {
+        ...engineRules(),
+        serviceYearFraction: {
+          lessThanSixMonths: 0.75,
+          atLeastSixMonths: 0.5
+        }
+      }
+    ],
+    [
+      "non-integer year cap",
+      {
+        ...engineRules(),
+        highSalaryCap: {
+          localAverageMultiplier: 3,
+          serviceYearCap: 12.5
+        }
+      }
+    ],
+    [
+      "out-of-bounds compensation multiplier",
+      {
+        ...engineRules(),
+        termination: {
+          ...engineRules().termination,
+          statutoryCompensation: {
+            compensationMultiplier: 4.1,
+            noticePayMonths: 0
+          }
+        }
+      }
+    ],
+    [
+      "empty review candidates",
+      {
+        ...engineRules(),
+        termination: {
+          ...engineRules().termination,
+          unclear: {
+            compensationMultiplier: 0,
+            noticePayMonths: 0,
+            reviewRange: { candidates: [] }
+          }
+        }
+      }
+    ]
+  ])("rejects %s in a controlled rule definition", (_name, rules) => {
+    expectPolicyEngineError(
+      () => calculatePolicy(baseInput(), rules),
+      "INVALID_POLICY_RULES"
+    );
+  });
+
+  it("keeps the default behavior when explicit rules are omitted", () => {
+    const input = {
+      ...baseInput(),
+      terminationScenario: {
+        kind: "ARTICLE_40" as const,
+        noticeMethod: "payment_in_lieu" as const
+      }
+    };
+
+    expect(calculatePolicy(input)).toEqual(
+      calculatePolicy(input, engineRules())
+    );
   });
 });
 

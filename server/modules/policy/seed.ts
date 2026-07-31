@@ -178,9 +178,17 @@ export const seedPolicyFoundation = async () => {
          definition,
          source_snapshot,
          effective_from,
-         published_at
+         published_at,
+         regression_status,
+         regression_summary,
+         regression_run_at
        )
-       VALUES ($1, 1, 'published', $2::jsonb, $3::jsonb, $4::date, now())
+       VALUES (
+         $1, 1, 'published', $2::jsonb, $3::jsonb, $4::date, now(),
+         'passed',
+         '{"total": 0, "passed": 0, "failed": 0, "source": "seed-baseline"}'::jsonb,
+         now()
+       )
        ON CONFLICT (rule_set_id, version) DO NOTHING`,
       [
         ruleSetId,

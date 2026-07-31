@@ -1240,7 +1240,8 @@ test("管理员校验草稿后发布并创建可追踪回滚版本", async ({ pa
       items: Array<{ effectiveFrom: string }>;
     }
   ).items.map((item) => Number(item.effectiveFrom.slice(0, 4)));
-  const publishYear = Math.max(2198, ...existingYears) + 1;
+  expect(Math.max(...existingYears)).toBeLessThan(2098);
+  const publishYear = 2098;
   const rollbackYear = publishYear + 1;
   const publishDate = `${publishYear}-01-01`;
   const rollbackDate = `${rollbackYear}-01-01`;
@@ -1250,7 +1251,7 @@ test("管理员校验草稿后发布并创建可追踪回滚版本", async ({ pa
   await page.getByRole("button", { name: /政策规则/ }).click();
   await expect(page.getByRole("heading", { name: "规则版本" })).toBeVisible();
   await expect(page.getByText(/当前生效 v\d+/)).toBeVisible();
-  await expect(page.getByText("回归校验通过").first()).toBeVisible();
+  await expect(page.getByText("服务端回归通过").first()).toBeVisible();
 
   await page.getByRole("button", { name: "新建规则草稿" }).click();
   const editor = page.getByRole("region", { name: "规则草稿编辑器" });
@@ -1268,12 +1269,24 @@ test("管理员校验草稿后发布并创建可追踪回滚版本", async ({ pa
   );
 
   const assertCleanRuntime = watchRuntime(page);
-  await definition.fill(
+  const controlledDefinition = JSON.parse(
     (await definition.inputValue()).replace(
       '"schemaVersion": 99',
       '"schemaVersion": 2'
     )
-  );
+  ) as {
+    decisionModel: {
+      article40EmployerTermination: {
+        notice30Days: { compensation: string };
+      };
+    };
+  };
+  controlledDefinition.decisionModel.article40EmployerTermination
+    .notice30Days.compensation = "TWO_N";
+  await definition.fill(JSON.stringify(controlledDefinition, null, 2));
+  const beforePublication = await createPolicyFixture({
+    endDate: `${publishYear}-07-01`
+  }) as { result: { baseCompensationFen: number; payableFen: number } };
   await editor.getByRole("button", { name: "保存草稿" }).click();
   await expect(page.getByRole("status")).toContainText("草稿已创建");
   const draft = page
@@ -1283,6 +1296,23 @@ test("管理员校验草稿后发布并创建可追踪回滚版本", async ({ pa
   page.once("dialog", (dialog) => dialog.accept());
   await draft.getByRole("button", { name: "发布版本" }).click();
   await expect(page.getByRole("status")).toContainText("版本已发布");
+  await expect(draft).toContainText("服务端回归通过");
+  const afterPublication = await createPolicyFixture({
+    endDate: `${publishYear}-07-01`
+  }) as {
+    ruleVersion: number;
+    result: { baseCompensationFen: number; payableFen: number };
+  };
+  expect(afterPublication.ruleVersion).toBeGreaterThan(1);
+  expect(afterPublication.result.baseCompensationFen).toBe(
+    beforePublication.result.baseCompensationFen
+  );
+  expect(afterPublication.result.payableFen).toBe(
+    beforePublication.result.payableFen * 2
+  );
+  const beforeRollback = await createPolicyFixture({
+    endDate: `${rollbackYear}-07-01`
+  }) as { result: { payableFen: number } };
 
   const rollback = page.getByRole("region", { name: "版本回滚" });
   await rollback.getByLabel("回滚目标版本").selectOption("1");
@@ -1293,6 +1323,18 @@ test("管理员校验草稿后发布并创建可追踪回滚版本", async ({ pa
   await expect(
     page.getByRole("article", { name: /规则版本 v\d+/ }).first()
   ).toContainText(rollbackDate);
+  const afterRollback = await createPolicyFixture({
+    endDate: `${rollbackYear}-07-01`
+  }) as {
+    ruleVersion: number;
+    result: { payableFen: number };
+  };
+  expect(afterRollback.ruleVersion).toBeGreaterThan(
+    afterPublication.ruleVersion
+  );
+  expect(afterRollback.result.payableFen).toBe(
+    beforeRollback.result.payableFen / 2
+  );
   assertCleanRuntime();
 });
 
@@ -1334,7 +1376,7 @@ test("管理员筛选编辑区域参数并覆盖严格 CSV 成功与失败", asy
   await editor.getByLabel("参数金额（元）").fill("9500");
   await editor.getByLabel("参数状态").selectOption("stale");
   await editor.getByRole("button", { name: "保存参数" }).click();
-  await expect(page.getByRole("status")).toContainText("参数已保存");
+  await expect(page.getByText("参数已保存", { exact: true })).toBeVisible();
   await expect(page.getByRole("row", { name: /武汉市.*2024/ })).toContainText(
     "已过期"
   );
@@ -1350,7 +1392,9 @@ test("管理员筛选编辑区域参数并覆盖严格 CSV 成功与失败", asy
     )
   });
   await page.getByRole("button", { name: "导入 CSV" }).click();
-  await expect(page.getByRole("status")).toContainText("已导入 1 条参数");
+  await expect(
+    page.getByText("已导入 1 条参数", { exact: true })
+  ).toBeVisible();
   assertCleanRuntime();
 
   await csvInput.setInputFiles({
@@ -1362,6 +1406,45 @@ test("管理员筛选编辑区域参数并覆盖严格 CSV 成功与失败", asy
   await expect(page.getByRole("alert")).toContainText(
     "CSV header must be exactly"
   );
+});
+
+test("区域参数完整分页且较慢旧筛选不会覆盖最新结果", async ({ page }) => {
+  await loginAs(page, policyAdmin);
+  await page.goto("/admin");
+  let delayed2024 = false;
+  await page.route(
+    "**/api/admin/policy/regional-parameters?*",
+    async (route) => {
+      const year = new URL(route.request().url()).searchParams.get("year");
+      if (year === "2024" && !delayed2024) {
+        delayed2024 = true;
+        await new Promise((resolve) => setTimeout(resolve, 600));
+      }
+      await route.fallback();
+    }
+  );
+  await page.getByRole("button", { name: /区域参数/ }).click();
+  await expect(page.getByText(/第 1 \/ \d+ 页/)).toBeVisible();
+  const firstPageSummary = await page
+    .getByRole("status", { name: "区域参数分页" })
+    .textContent();
+  await page.getByRole("button", { name: "下一页" }).click();
+  await expect(page.getByText(/第 2 \/ \d+ 页/)).toBeVisible();
+  expect(
+    await page.getByRole("status", { name: "区域参数分页" }).textContent()
+  ).not.toBe(firstPageSummary);
+
+  await page.getByLabel("年份").fill("2024");
+  await page.getByRole("button", { name: "应用筛选" }).click();
+  await page.getByLabel("年份").fill("2026");
+  await page.getByRole("button", { name: "应用筛选" }).click();
+  await expect(
+    page.getByRole("row").filter({ hasText: "2026" }).first()
+  ).toBeVisible();
+  await page.waitForTimeout(700);
+  await expect(
+    page.getByRole("row").filter({ hasText: "2024" })
+  ).toHaveCount(0);
 });
 
 test("管理员完成公告草稿发布归档与草稿删除", async ({ page }) => {
@@ -1405,6 +1488,120 @@ test("管理员完成公告草稿发布归档与草稿删除", async ({ page }) 
   await expect(deletable).toHaveCount(0);
 });
 
+test.describe("公告按 Asia/Shanghai 运营时区排期", () => {
+  test.use({ timezoneId: "America/Los_Angeles" });
+
+  test("非 UTC 浏览器正确回显排期并阻止非法排期和状态回退", async ({
+    page
+  }) => {
+    await loginAs(page, policyAdmin);
+    await page.goto("/admin");
+    await page.getByRole("button", { name: /公告设置/ }).click();
+    await page.getByRole("button", { name: "新建公告" }).click();
+    const editor = page.getByRole("region", { name: "公告编辑器" });
+    const title = `上海时区公告 ${runId}`;
+    await editor.getByLabel("公告标题").fill(title);
+    await editor.getByLabel("公告正文").fill("按上海运营时间投放。");
+    await editor.getByLabel("开始时间").fill("2026-08-01T08:00");
+    await editor.getByLabel("结束时间").fill("2026-08-01T09:00");
+    await editor.getByRole("button", { name: "保存公告" }).click();
+    const announcement = page.getByRole("article", {
+      name: `公告 ${title}`
+    });
+    await announcement.getByRole("button", { name: "编辑公告" }).click();
+    await expect(editor.getByLabel("开始时间")).toHaveValue(
+      "2026-08-01T08:00"
+    );
+    await expect(editor.getByLabel("结束时间")).toHaveValue(
+      "2026-08-01T09:00"
+    );
+
+    await editor.getByLabel("开始时间").fill("2026-08-01T10:00");
+    await editor.getByLabel("结束时间").fill("2026-08-01T09:00");
+    await editor.getByRole("button", { name: "保存公告" }).click();
+    await expect(page.getByRole("alert")).toContainText(
+      "公告结束时间不得早于开始时间"
+    );
+    await editor.getByLabel("开始时间").fill("2026-08-01T08:00");
+    await editor.getByLabel("结束时间").fill("2026-08-01T09:00");
+    await editor.getByRole("button", { name: "保存公告" }).click();
+    await announcement.getByRole("button", { name: "编辑公告" }).click();
+    await editor.getByLabel("公告状态").selectOption("published");
+    await editor.getByRole("button", { name: "保存公告" }).click();
+    await announcement.getByRole("button", { name: "编辑公告" }).click();
+    await expect(editor.getByLabel("公告标题")).toBeDisabled();
+    await expect(
+      editor.getByLabel("公告状态").locator('option[value="draft"]')
+    ).toHaveCount(0);
+
+    const listed = await apiContext.get(
+      "/api/admin/policy/announcements",
+      { headers: { authorization: `Bearer ${adminAccessToken}` } }
+    );
+    const item = (
+      (await listed.json()) as {
+        items: Array<{
+          id: string;
+          title: string;
+          startsAt: string;
+          endsAt: string;
+        }>;
+      }
+    ).items.find((candidate) => candidate.title === title)!;
+    expect(new Date(item.startsAt).toISOString()).toBe(
+      "2026-08-01T00:00:00.000Z"
+    );
+    expect(new Date(item.endsAt).toISOString()).toBe(
+      "2026-08-01T01:00:00.000Z"
+    );
+    const rollback = await apiContext.patch(
+      `/api/admin/policy/announcements/${item.id}`,
+      {
+        headers: { authorization: `Bearer ${adminAccessToken}` },
+        data: { status: "draft" }
+      }
+    );
+    expect(rollback.status()).toBe(409);
+  });
+});
+
+test("具备 policy.write 的分析员可编辑草稿但无法发布", async ({ page }) => {
+  if (!e2eDatabaseUrl) throw new Error("E2E_DATABASE_URL is required");
+  const database = new Client({ connectionString: e2eDatabaseUrl });
+  await database.connect();
+  try {
+    await database.query(
+      `INSERT INTO role_capabilities(role, capability)
+       VALUES ('analyst', 'policy.write')
+       ON CONFLICT DO NOTHING`
+    );
+    await loginAs(page, policyAnalyst);
+    await page.goto("/admin");
+    await page.getByRole("button", { name: /公告设置/ }).click();
+    await page.getByRole("button", { name: "新建公告" }).click();
+    const editor = page.getByRole("region", { name: "公告编辑器" });
+    const title = `分析员草稿 ${runId}`;
+    await editor.getByLabel("公告标题").fill(title);
+    await editor.getByLabel("公告正文").fill("分析员创建的草稿。");
+    await editor.getByRole("button", { name: "保存公告" }).click();
+    const announcement = page.getByRole("article", {
+      name: `公告 ${title}`
+    });
+    await announcement.getByRole("button", { name: "编辑公告" }).click();
+    await editor.getByLabel("公告正文").fill("分析员编辑后的草稿。");
+    await editor.getByRole("button", { name: "保存公告" }).click();
+    await expect(announcement).toContainText("分析员编辑后的草稿");
+    await announcement.getByRole("button", { name: "编辑公告" }).click();
+    await expect(editor.getByLabel("公告状态")).toBeDisabled();
+  } finally {
+    await database.query(
+      `DELETE FROM role_capabilities
+        WHERE role = 'analyst' AND capability = 'policy.write'`
+    );
+    await database.end();
+  }
+});
+
 test("分析员按 capability 只读查看且普通用户被后台 API 拒绝", async ({
   page
 }) => {
@@ -1416,9 +1613,8 @@ test("分析员按 capability 只读查看且普通用户被后台 API 拒绝", 
     page.getByRole("button", { name: "创建回滚版本" })
   ).toBeDisabled();
   const publishButtons = page.getByRole("button", { name: "发布版本" });
-  if (await publishButtons.count()) {
-    await expect(publishButtons.first()).toBeDisabled();
-  }
+  await expect(publishButtons.first()).toBeVisible();
+  await expect(publishButtons.first()).toBeDisabled();
 
   await page.getByRole("button", { name: /区域参数/ }).click();
   await expect(page.getByRole("button", { name: "导入 CSV" })).toBeDisabled();
