@@ -7,6 +7,7 @@ const booleanValue = z
 
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+  PAYMENT_MODE: z.enum(["disabled", "fake"]).default("disabled"),
   PORT: z.coerce.number().int().positive().default(3001),
   DATABASE_URL: z.string().min(1).default("postgresql://peileme:peileme@127.0.0.1:5432/peileme"),
   APP_ORIGIN: z.string().default("http://localhost:5173"),
@@ -45,6 +46,9 @@ export const getConfig = () => {
   if (!cachedConfig) {
     cachedConfig = envSchema.parse(process.env);
     if (cachedConfig.NODE_ENV === "production") {
+      if (cachedConfig.PAYMENT_MODE === "fake") {
+        throw new Error("PAYMENT_MODE=fake is forbidden in production");
+      }
       if (cachedConfig.JWT_SECRET.startsWith("development-only")) {
         throw new Error("JWT_SECRET must be configured in production");
       }

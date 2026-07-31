@@ -16,6 +16,8 @@ import { writeAdminAudit as audit } from "./audit.js";
 import { getConfig } from "./config.js";
 import { query, withTransaction } from "./db.js";
 import { ApiError } from "./errors.js";
+import { createCommerceRouters } from "./modules/commerce/routes.js";
+import type { PaymentProvider } from "./modules/payments/provider.js";
 import { getChannelStatus } from "./notifier.js";
 import {
   createAdminPolicyRouter,
@@ -190,6 +192,7 @@ const removeUploadedFiles = (files: Express.Multer.File[]) => {
 export const createApp = (
   options: {
     policyCalculate?: (input: unknown) => PolicyOutput;
+    paymentProvider?: PaymentProvider;
   } = {}
 ) => {
   const config = getConfig();
@@ -217,6 +220,11 @@ export const createApp = (
   app.use(express.urlencoded({ extended: false, limit: "128kb" }));
   app.use(cookieParser());
   app.use(optionalAuth);
+  const commerceRouters = createCommerceRouters(options.paymentProvider);
+  app.use("/api/commerce", commerceRouters.router);
+  if (config.NODE_ENV === "test") {
+    app.use("/api/test-payments", commerceRouters.testRouter);
+  }
   app.use(
     "/api/policy",
     createPolicyRouter({ calculate: options.policyCalculate })
