@@ -72,7 +72,7 @@ test.describe("separate main and AI web artifacts", () => {
     const shanghai = page.getByRole("button", { name: "上海", exact: true });
     if (await shanghai.isEnabled()) {
       await shanghai.click();
-      await expect(page.locator(".composer input[type=month]")).toBeVisible();
+      await expect(page.locator(".composer input[type=date]")).toBeVisible();
     } else {
       await page.getByRole("button", { name: "选择全部省市" }).click();
       const regionDialog = page.getByRole("dialog", { name: "选择工作地区" });
@@ -108,6 +108,7 @@ test.describe("separate main and AI web artifacts", () => {
       ["邀请码", "邀请码清单"],
       ["埋点统计", "近 30 天埋点"],
       ["审计日志", "管理操作审计"],
+      ["运行日志", "应用错误日志"],
       ["系统状态", "运行状态"]
     ] as const;
     for (const [label, contentHeading] of adminTabs) {
@@ -150,9 +151,9 @@ test.describe("separate main and AI web artifacts", () => {
     await expect(page.getByRole("button", { name: "上海", exact: true })).toHaveCount(
       0
     );
-    await page.getByRole("button", { name: "登录并上传材料" }).click();
+    await page.getByRole("button", { name: "登录并开始分析" }).click();
     await expect(
-      page.getByText("登录后可安全管理你上传的材料", { exact: false })
+      page.getByText("登录后可进行离职补偿分析、文件签署审查", { exact: false })
     ).toBeVisible();
     await page.getByRole("button", { name: "获取验证码" }).click();
     await expect(page.locator(".account-message")).toContainText(
@@ -237,6 +238,8 @@ test.describe("separate main and AI web artifacts", () => {
     );
     await page.goto(aiBaseUrl);
     await meResponse;
-    await expect(page.getByText("AI 深度分析版", { exact: true })).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "离职补偿深度分析" })
+    ).toBeVisible();
   });
 });

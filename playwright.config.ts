@@ -11,7 +11,7 @@ export default defineConfig({
   retries: 0,
   reporter: [["list"], ["html", { open: "never" }]],
   use: {
-    baseURL: process.env.E2E_BASE_URL || "https://peileme.art",
+    baseURL: process.env.E2E_BASE_URL,
     headless: true,
     launchOptions: {
       executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH || undefined

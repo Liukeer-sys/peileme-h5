@@ -1,10 +1,14 @@
 import { expect, test } from "@playwright/test";
 
 const email = process.env.E2E_REGISTER_EMAIL;
+const baseUrl = process.env.E2E_BASE_URL;
 const password = process.env.E2E_REGISTER_PASSWORD || "E2eRegisterPass123";
 
 test("生产验证码注册与会话刷新", async ({ page }) => {
-  test.skip(!email, "需要 E2E_REGISTER_EMAIL，且 API 临时启用 OTP_DEBUG");
+  test.skip(
+    !email || !baseUrl,
+    "需要 E2E_BASE_URL、E2E_REGISTER_EMAIL，且 API 临时启用 OTP_DEBUG"
+  );
   const browserErrors: string[] = [];
   const serverErrors: string[] = [];
   page.on("console", (message) => {

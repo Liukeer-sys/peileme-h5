@@ -298,6 +298,26 @@ test.beforeAll(async () => {
       ]
     );
     await database.query(
+      `INSERT INTO entitlements(
+         user_id, product_id, source_type, source_id,
+         total_uses, remaining_uses, status
+       )
+       SELECT u.id, p.id, 'admin',
+              '00000000-0000-4000-8000-000000000777'::uuid,
+              500, 500, 'active'
+         FROM users u
+         JOIN products p ON p.sku = 'POLICY_CALC'
+        WHERE lower(u.email) = lower($1)
+       ON CONFLICT (user_id, product_id, source_type, source_id)
+         WHERE source_id IS NOT NULL
+       DO UPDATE SET total_uses = 500,
+                     remaining_uses = 500,
+                     status = 'active',
+                     expires_at = NULL,
+                     updated_at = now()`,
+      [policyUser.email]
+    );
+    await database.query(
       `INSERT INTO administrative_regions(
          code, name, level, parent_code, status,
          source_name, source_url, source_snapshot_date
@@ -1241,8 +1261,7 @@ test("管理员校验草稿后发布并创建可追踪回滚版本", async ({ pa
       items: Array<{ effectiveFrom: string }>;
     }
   ).items.map((item) => Number(item.effectiveFrom.slice(0, 4)));
-  expect(Math.max(...existingYears)).toBeLessThan(2098);
-  const publishYear = 2098;
+  const publishYear = Math.max(...existingYears, 2097) + 1;
   const rollbackYear = publishYear + 1;
   const publishDate = `${publishYear}-01-01`;
   const rollbackDate = `${rollbackYear}-01-01`;
@@ -1777,7 +1796,7 @@ test.describe("公告按 Asia/Shanghai 运营时区排期", () => {
   });
 });
 
-test("具备 policy.write 的分析员可编辑草稿但无法发布", async ({ page }) => {
+test("具备 policy.write 的分析员可创建规则草稿但无法发布", async ({ page }) => {
   if (!e2eDatabaseUrl) throw new Error("E2E_DATABASE_URL is required");
   const database = new Client({ connectionString: e2eDatabaseUrl });
   await database.connect();
@@ -1789,22 +1808,15 @@ test("具备 policy.write 的分析员可编辑草稿但无法发布", async ({ 
     );
     await loginAs(page, policyAnalyst);
     await page.goto("/admin");
-    await page.getByRole("button", { name: /公告设置/ }).click();
-    await page.getByRole("button", { name: "新建公告" }).click();
-    const editor = page.getByRole("region", { name: "公告编辑器" });
-    const title = `分析员草稿 ${runId}`;
-    await editor.getByLabel("公告标题").fill(title);
-    await editor.getByLabel("公告正文").fill("分析员创建的草稿。");
-    await editor.getByRole("button", { name: "保存公告" }).click();
-    const announcement = page.getByRole("article", {
-      name: `公告 ${title}`
-    });
-    await announcement.getByRole("button", { name: "编辑公告" }).click();
-    await editor.getByLabel("公告正文").fill("分析员编辑后的草稿。");
-    await editor.getByRole("button", { name: "保存公告" }).click();
-    await expect(announcement).toContainText("分析员编辑后的草稿");
-    await announcement.getByRole("button", { name: "编辑公告" }).click();
-    await expect(editor.getByLabel("公告状态")).toBeDisabled();
+    await page.getByRole("button", { name: /政策规则/ }).click();
+    await page.getByRole("button", { name: "新建规则草稿" }).click();
+    const editor = page.getByRole("region", { name: "规则草稿编辑器" });
+    await editor.getByLabel("生效日期").fill("2026-12-31");
+    await editor.getByRole("button", { name: "保存草稿" }).click();
+    await expect(page.getByRole("status")).toContainText("草稿已创建");
+    const publishButtons = page.getByRole("button", { name: "发布版本" });
+    await expect(publishButtons.last()).toBeVisible();
+    await expect(publishButtons.last()).toBeDisabled();
   } finally {
     await database.query(
       `DELETE FROM role_capabilities

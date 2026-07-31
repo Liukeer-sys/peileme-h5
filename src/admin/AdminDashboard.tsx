@@ -30,6 +30,7 @@ type BaseTab =
   | "invites"
   | "events"
   | "audit"
+  | "operations"
   | "system";
 
 type AdminExtensionContext = {
@@ -67,10 +68,24 @@ const navItems: Array<{ id: BaseTab; label: string; icon: string }> = [
   { id: "invites", label: "邀请码", icon: "码" },
   { id: "events", label: "埋点统计", icon: "数" },
   { id: "audit", label: "审计日志", icon: "审" },
+  { id: "operations", label: "运行日志", icon: "志" },
   { id: "system", label: "系统状态", icon: "稳" }
 ];
 
 const noExtensions: AdminDashboardExtension[] = [];
+
+const roleLabel: Record<User["role"], string> = {
+  admin: "超级管理员",
+  policy_editor: "政策编辑",
+  policy_reviewer: "政策审核",
+  operations: "运营人员",
+  finance: "财务人员",
+  support: "客服人员",
+  ai_operator: "AI 运营",
+  auditor: "审计人员",
+  analyst: "数据分析员",
+  user: "普通用户"
+};
 
 const tabCapability: Partial<Record<BaseTab, string>> = {
   overview: "analytics.read",
@@ -82,6 +97,7 @@ const tabCapability: Partial<Record<BaseTab, string>> = {
   invites: "invites.read",
   events: "analytics.read",
   audit: "audit.read",
+  operations: "operations.read",
   system: "system.read"
 };
 
@@ -123,9 +139,10 @@ export default function AdminDashboard({
   );
 
   useEffect(() => {
+    if (!ready || !isAdmin) return;
     if (!allNavItems.length || allNavItems.some((item) => item.id === tab)) return;
     setTab(allNavItems[0].id);
-  }, [allNavItems, tab]);
+  }, [allNavItems, isAdmin, ready, tab]);
   const activeExtension = useMemo(
     () => extensions.find((extension) => extension.id === tab),
     [extensions, tab]
@@ -142,6 +159,7 @@ export default function AdminDashboard({
         invites: "/api/admin/invites",
         events: "/api/admin/events?days=30",
         audit: "/api/admin/audit-logs?pageSize=100",
+        operations: "/api/admin/operations",
         system: "/api/admin/system"
       } as Record<string, string>)[tab];
       return baseEndpoint ?? activeExtension?.endpoint ?? "";
@@ -338,7 +356,7 @@ export default function AdminDashboard({
         </nav>
         <div className="admin-profile">
           <strong>{adminUser.displayName || adminUser.email || adminUser.phone}</strong>
-          <span>{adminUser.role}</span>
+          <span>{roleLabel[adminUser.role]}</span>
           <button type="button" onClick={() => void logout().then(() => window.location.assign("/"))}>退出</button>
         </div>
       </aside>
@@ -448,7 +466,7 @@ export default function AdminDashboard({
               rows={rows}
               columns={[
                 { key: "display_name", label: "用户", render: (row) => <><b>{value(row.display_name)}</b><br /><small>{value(row.email || row.phone)}</small></> },
-                { key: "role", label: "角色" },
+                { key: "role", label: "角色", render: (row) => roleLabel[row.role as User["role"]] || value(row.role) },
                 { key: "status", label: "状态" },
                 { key: "assessment_count", label: "测算数" },
                 { key: "created_at", label: "注册时间", render: (row) => dateTime(row.created_at) },
@@ -551,6 +569,38 @@ export default function AdminDashboard({
           </section>
         )}
 
+        {tab === "operations" && (
+          <div className="admin-system-grid">
+            <section className="admin-card">
+              <h2>应用错误日志</h2>
+              <DataTable
+                rows={(data.errors || []) as UnknownRow[]}
+                columns={[
+                  { key: "created_at", label: "时间", render: (row) => dateTime(row.created_at) },
+                  { key: "request_id", label: "请求 ID" },
+                  { key: "method", label: "方法" },
+                  { key: "path", label: "路径" },
+                  { key: "status_code", label: "状态码" },
+                  { key: "code", label: "错误码" }
+                ]}
+              />
+            </section>
+            <section className="admin-card">
+              <h2>后台任务日志</h2>
+              <DataTable
+                rows={(data.jobs || []) as UnknownRow[]}
+                columns={[
+                  { key: "job_name", label: "任务" },
+                  { key: "status", label: "状态" },
+                  { key: "started_at", label: "开始时间", render: (row) => dateTime(row.started_at) },
+                  { key: "finished_at", label: "结束时间", render: (row) => dateTime(row.finished_at) },
+                  { key: "detail", label: "详情", render: (row) => JSON.stringify(row.detail || {}) }
+                ]}
+              />
+            </section>
+          </div>
+        )}
+
         {tab === "system" && (
           <div className="admin-system-grid">
             <section className="admin-card">
@@ -575,6 +625,28 @@ export default function AdminDashboard({
                 {Object.entries((data.channels || {}) as Record<string, UnknownRow | boolean>).map(([key, channel]) => (
                   <div key={key}><dt>{key}</dt><dd>{typeof channel === "boolean" ? value(channel) : channel.configured ? "已配置" : "待配置"}</dd></div>
                 ))}
+              </dl>
+            </section>
+            <section className="admin-card">
+              <h2>AI 模型通道</h2>
+              <DataTable
+                rows={(data.aiProviders || []) as UnknownRow[]}
+                columns={[
+                  { key: "key", label: "Provider" },
+                  { key: "model", label: "模型" },
+                  { key: "enabled", label: "状态", render: (row) => row.enabled ? "已启用" : "待配置" },
+                  { key: "primary", label: "顺序", render: (row) => row.primary ? "主通道" : "降级通道" }
+                ]}
+              />
+            </section>
+            <section className="admin-card">
+              <h2>异常与待处理任务</h2>
+              <dl>
+                <div><dt>24 小时应用错误</dt><dd>{value(((data.operational as UnknownRow | undefined)?.errors as UnknownRow | undefined)?.last24Hours)}</dd></div>
+                <div><dt>待对账</dt><dd>{value(((data.operational as UnknownRow | undefined)?.tasks as UnknownRow | undefined)?.reconciliationDue)}</dd></div>
+                <div><dt>失败通知</dt><dd>{value(((data.operational as UnknownRow | undefined)?.tasks as UnknownRow | undefined)?.failedNotifications)}</dd></div>
+                <div><dt>失败上传</dt><dd>{value(((data.operational as UnknownRow | undefined)?.tasks as UnknownRow | undefined)?.failedUploads)}</dd></div>
+                <div><dt>失败验证码</dt><dd>{value(((data.operational as UnknownRow | undefined)?.tasks as UnknownRow | undefined)?.failedOtpDeliveries)}</dd></div>
               </dl>
             </section>
           </div>
