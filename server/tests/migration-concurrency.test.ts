@@ -53,6 +53,41 @@ const runMigrationProcess = (
   );
 
 describe("migration concurrency", () => {
+  it("trusts only an exact first-line no-transaction directive and preserves SQL semicolons", async () => {
+    const migrationModule = await import("../migrate.js");
+    const parser = (
+      migrationModule as typeof migrationModule & {
+        parseMigrationSql?: (sql: string) => {
+          transactional: boolean;
+          statements: string[];
+        };
+      }
+    ).parseMigrationSql;
+
+    expect(typeof parser).toBe("function");
+    if (!parser) return;
+
+    const concurrent = [
+      "-- migrate:no-transaction\r",
+      "DO $$ BEGIN PERFORM 1; END $$;",
+      "-- migrate:statement-break",
+      "SELECT 'keeps;semicolons'::text;"
+    ].join("\n");
+    expect(parser(concurrent)).toEqual({
+      transactional: false,
+      statements: [
+        "DO $$ BEGIN PERFORM 1; END $$;",
+        "SELECT 'keeps;semicolons'::text;"
+      ]
+    });
+
+    const untrusted = " -- migrate:no-transaction\nSELECT 1;";
+    expect(parser(untrusted)).toEqual({
+      transactional: true,
+      statements: [untrusted]
+    });
+  });
+
   it(
     "backfills immutable parameter provenance when upgrading from 002 to 003",
     async () => {

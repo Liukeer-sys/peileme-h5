@@ -24,6 +24,18 @@ const promiseStateAfter = async (
     })
   ]);
 
+const waitUntil = async (
+  predicate: () => Promise<boolean>,
+  timeoutMs = 5_000
+) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Condition was not met within ${timeoutMs}ms`);
+};
+
 const runMigrationProcess = (
   databaseUrl: string,
   timeoutMs = 12_000
@@ -437,6 +449,92 @@ const createLegacyRefund = async (
   return result.rows[0].id;
 };
 
+const createMigratedRefundFact = async (client: pg.Client) => {
+  const marker = randomUUID().replaceAll("-", "").toUpperCase();
+  const userId = await createLegacyUser(client, `online-${marker}`);
+  const orderId = await createLegacyOrder(
+    client,
+    userId,
+    `ONLINE${marker.slice(0, 20)}`,
+    "PAID"
+  );
+  const attemptId = randomUUID();
+  const providerPaymentOrderId = randomUUID();
+  const providerOrderNo = `WX${marker.slice(0, 28)}`;
+
+  await client.query("BEGIN");
+  try {
+    await client.query("SET CONSTRAINTS ALL DEFERRED");
+    await enableIdentityPaymentWrites(client);
+    await client.query(
+      `INSERT INTO provider_payment_orders(
+         id,
+         order_id,
+         channel,
+         provider_order_no,
+         origin,
+         allocated_at,
+         canonical_attempt_id,
+         manual_review_required
+       )
+       VALUES ($1, $2, 'wechat_h5', $3, 'attempt_v1', now(), $4, false)`,
+      [providerPaymentOrderId, orderId, providerOrderNo, attemptId]
+    );
+    await client.query(
+      `INSERT INTO payment_attempts(
+         id,
+         order_id,
+         channel,
+         status,
+         provider_payment_order_id,
+         provider_identity_role,
+         provider_operation_eligible,
+         request_snapshot
+       )
+       VALUES (
+         $1,
+         $2,
+         'wechat_h5',
+         'SUCCEEDED',
+         $3,
+         'canonical_owner',
+         true,
+         jsonb_build_object(
+           'providerOrderNo', $4::text,
+           'orderNo', $4::text
+         )
+       )`,
+      [attemptId, orderId, providerPaymentOrderId, providerOrderNo]
+    );
+    const transaction = await client.query<{ id: string }>(
+      `INSERT INTO payment_transactions(
+         order_id,
+         payment_attempt_id,
+         channel,
+         channel_transaction_id,
+         amount_fen,
+         currency,
+         status,
+         verified_payload,
+         paid_at
+       )
+       VALUES ($1, $2, 'wechat_h5', $3, 100, 'CNY', 'SUCCESS', '{}'::jsonb, now())
+       RETURNING id`,
+      [orderId, attemptId, `WX-TXN-${marker}`]
+    );
+    await client.query("COMMIT");
+    return {
+      orderId,
+      attemptId,
+      transactionId: transaction.rows[0].id,
+      marker
+    };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  }
+};
+
 beforeAll(async () => {
   await runMigrations();
 });
@@ -502,6 +600,188 @@ describe("Task 4 real payment migration contract (RED)", () => {
       }
     );
   });
+
+  it("replaces a same-name wrong refund index with one valid ready unfiltered index on the payment fact", async () => {
+    await withApplied011WithoutRefundReverseIndex(
+      async (client, databaseUrl) => {
+        await client.query(
+          `CREATE INDEX refunds_payment_transaction_idx
+             ON refunds(order_id)
+          WHERE status = 'PENDING'`
+        );
+
+        const migrated = await runMigrationProcess(databaseUrl);
+        expect(
+          migrated.status,
+          `${migrated.stdout}\n${migrated.stderr}`
+        ).toBe(0);
+
+        const index = await client.query<{
+          column_definition: string;
+          indisvalid: boolean;
+          indisready: boolean;
+          predicate: string | null;
+        }>(
+          `SELECT pg_get_indexdef(indexrelid, 1, true) AS column_definition,
+                  indisvalid,
+                  indisready,
+                  pg_get_expr(indpred, indrelid) AS predicate
+             FROM pg_index
+            WHERE indexrelid =
+                  'refunds_payment_transaction_idx'::regclass`
+        );
+        expect(index.rows).toEqual([
+          {
+            column_definition: "payment_transaction_id",
+            indisvalid: true,
+            indisready: true,
+            predicate: null
+          }
+        ]);
+      }
+    );
+  });
+
+  it("does not record a failed online migration and heals on the next run", async () => {
+    await withApplied011WithoutRefundReverseIndex(
+      async (client, databaseUrl) => {
+        await client.query(
+          "CREATE TABLE refunds_payment_transaction_idx(id integer)"
+        );
+
+        const failed = await runMigrationProcess(databaseUrl);
+        expect(failed.status, `${failed.stdout}\n${failed.stderr}`).not.toBe(0);
+        const recordedAfterFailure = await client.query<{ recorded: boolean }>(
+          `SELECT EXISTS (
+             SELECT 1
+               FROM schema_migrations
+              WHERE version =
+                    '012_refunds_payment_transaction_index.sql'
+           ) AS recorded`
+        );
+        expect(recordedAfterFailure.rows).toEqual([{ recorded: false }]);
+
+        await client.query("DROP TABLE refunds_payment_transaction_idx");
+        const healed = await runMigrationProcess(databaseUrl);
+        expect(
+          healed.status,
+          `${healed.stdout}\n${healed.stderr}`
+        ).toBe(0);
+        const finalState = await client.query<{
+          index_name: string | null;
+          recorded: boolean;
+        }>(
+          `SELECT to_regclass(
+                    'public.refunds_payment_transaction_idx'
+                  )::text AS index_name,
+                  EXISTS (
+                    SELECT 1
+                      FROM schema_migrations
+                     WHERE version =
+                           '012_refunds_payment_transaction_index.sql'
+                  ) AS recorded`
+        );
+        expect(finalState.rows).toEqual([
+          {
+            index_name: "refunds_payment_transaction_idx",
+            recorded: true
+          }
+        ]);
+      }
+    );
+  });
+
+  it("keeps refund inserts, updates, and deletes available during the online index build", async () => {
+    await withApplied011WithoutRefundReverseIndex(
+      async (client, databaseUrl) => {
+        const fact = await createMigratedRefundFact(client);
+        const blocker = new Client({ connectionString: databaseUrl });
+        const writer = new Client({ connectionString: databaseUrl });
+        let blockerInTransaction = false;
+        let migrationPromise:
+          | Promise<{ status: number | null; stdout: string; stderr: string }>
+          | undefined;
+        try {
+          await blocker.connect();
+          await writer.connect();
+          await blocker.query("BEGIN");
+          blockerInTransaction = true;
+          await blocker.query(
+            "LOCK TABLE refunds IN SHARE UPDATE EXCLUSIVE MODE"
+          );
+
+          migrationPromise = runMigrationProcess(databaseUrl, 20_000);
+          await waitUntil(async () => {
+            const waiting = await client.query<{ waiting: boolean }>(
+              `SELECT EXISTS (
+                 SELECT 1
+                   FROM pg_stat_activity
+                  WHERE datname = current_database()
+                    AND pid <> pg_backend_pid()
+                    AND wait_event_type = 'Lock'
+                    AND query LIKE '%refunds_payment_transaction_idx%'
+               ) AS waiting`
+            );
+            return waiting.rows[0].waiting;
+          });
+          expect(await promiseStateAfter(migrationPromise)).toBe("pending");
+
+          await writer.query("SET lock_timeout TO '1s'");
+          const refundNo = `RF-ONLINE-${fact.marker}`;
+          const inserted = await writer.query<{ id: string }>(
+            `INSERT INTO refunds(
+               refund_no,
+               provider_refund_no,
+               order_id,
+               payment_attempt_id,
+               payment_transaction_id,
+               channel,
+               amount_fen,
+               reason,
+               status,
+               provider_operation_eligible,
+               request_snapshot
+             )
+             VALUES (
+               $1, $1, $2, $3, $4, 'wechat_h5', 100,
+               'online migration insert', 'PENDING', true, '{}'::jsonb
+             )
+             RETURNING id`,
+            [
+              refundNo,
+              fact.orderId,
+              fact.attemptId,
+              fact.transactionId
+            ]
+          );
+          const updated = await writer.query(
+            `UPDATE refunds
+                SET reason = 'online migration update'
+              WHERE id = $1`,
+            [inserted.rows[0].id]
+          );
+          const deleted = await writer.query(
+            "DELETE FROM refunds WHERE id = $1",
+            [inserted.rows[0].id]
+          );
+          expect(updated.rowCount).toBe(1);
+          expect(deleted.rowCount).toBe(1);
+
+          await blocker.query("COMMIT");
+          blockerInTransaction = false;
+          const migrated = await migrationPromise;
+          expect(
+            migrated.status,
+            `${migrated.stdout}\n${migrated.stderr}`
+          ).toBe(0);
+        } finally {
+          if (blockerInTransaction) await blocker.query("ROLLBACK");
+          if (migrationPromise) await Promise.allSettled([migrationPromise]);
+          await Promise.allSettled([blocker.end(), writer.end()]);
+        }
+      }
+    );
+  }, 30_000);
 
   it("creates immutable provider identities with one canonical query owner", async () => {
     const identities = await query<{
