@@ -2012,7 +2012,7 @@ describe("policy capability administration", () => {
       listed.body.items[0].definition.regressionExpectations.cases
     ).toHaveLength(14);
     const seeded = await query<{
-      definition: {
+      definition: Record<string, unknown> & {
         regressionExpectations?: { schemaVersion: number; cases: unknown[] };
       };
     }>(
@@ -2054,6 +2054,37 @@ describe("policy capability administration", () => {
       ).toHaveLength(14);
       expect(created.body.regressionStatus).toBe("passed");
     }
+
+    const legacyBaseline = structuredClone(seeded.rows[0].definition);
+    delete legacyBaseline.regressionExpectations;
+    await query(
+      `UPDATE policy_rule_versions
+          SET definition = $1::jsonb
+        WHERE version = 1
+          AND rule_set_id = (
+            SELECT id FROM policy_rule_sets WHERE code = 'cn-severance'
+          )`,
+      [JSON.stringify(legacyBaseline)]
+    );
+    const rollback = await request(createApp())
+      .post("/api/admin/policy/rule-sets/cn-severance/rollback")
+      .set(authHeader(adminToken))
+      .send({ targetVersion: 1, effectiveFrom: "2087-01-01" })
+      .expect(201);
+    const persistedRollback = await query<{
+      definition: {
+        regressionExpectations?: { schemaVersion: number; cases: unknown[] };
+      };
+    }>(
+      "SELECT definition FROM policy_rule_versions WHERE id = $1",
+      [rollback.body.id]
+    );
+    expect(
+      persistedRollback.rows[0].definition.regressionExpectations
+    ).toMatchObject({ schemaVersion: 1 });
+    expect(
+      persistedRollback.rows[0].definition.regressionExpectations?.cases
+    ).toHaveLength(14);
   });
 
   it("blocks an unsynchronized rule change and persists semantic expected actual diffs", async () => {
@@ -2123,25 +2154,30 @@ describe("policy capability administration", () => {
     ).not.toHaveLength(0);
   });
 
-  it("refuses to publish a draft whose persisted regression did not pass", async () => {
+  it("reruns current semantics and blocks a stale persisted pass", async () => {
     const path = "/api/admin/policy/rule-sets/cn-severance/versions";
     const listed = await request(createApp())
       .get(path)
       .set(authHeader(adminToken))
       .expect(200);
+    const definition = structuredClone(listed.body.items[0].definition);
+    definition.decisionModel.article40EmployerTermination
+      .notice30Days.compensation = "TWO_N";
     const draft = await request(createApp())
       .post(path)
       .set(authHeader(adminToken))
       .send({
-        definition: listed.body.items[0].definition,
-        sourceSnapshot: [{ source: "regression gate test" }],
+        definition,
+        sourceSnapshot: [{ source: "stale regression gate test" }],
         effectiveFrom: "2055-01-01"
       })
       .expect(201);
+    expect(draft.body.regressionStatus).toBe("failed");
     await query(
       `UPDATE policy_rule_versions
-          SET regression_status = 'failed',
-              regression_summary = '{"total": 8, "passed": 7, "failed": 1}'::jsonb
+          SET regression_status = 'passed',
+              regression_summary = '{"sentinel":"stale-pass"}'::jsonb,
+              regression_run_at = TIMESTAMPTZ '2000-01-01T00:00:00Z'
         WHERE id = $1`,
       [draft.body.id]
     );
@@ -2153,11 +2189,30 @@ describe("policy capability administration", () => {
     expect(rejected.body).toMatchObject({
       error: "POLICY_REGRESSION_REQUIRED"
     });
-    const state = await query<{ status: string }>(
-      "SELECT status FROM policy_rule_versions WHERE id = $1",
+    const state = await query<{
+      status: string;
+      regression_status: string;
+      regression_summary: {
+        failed: number;
+        cases: Array<{ id: string; diff: unknown[] }>;
+      };
+      regression_run_at: string;
+    }>(
+      `SELECT status, regression_status, regression_summary,
+              regression_run_at::text
+         FROM policy_rule_versions
+        WHERE id = $1`,
       [draft.body.id]
     );
     expect(state.rows[0].status).toBe("draft");
+    expect(state.rows[0].regression_status).toBe("failed");
+    expect(state.rows[0].regression_summary.failed).toBe(1);
+    expect(
+      state.rows[0].regression_summary.cases.find(
+        (item) => item.id === "article-40-notice"
+      )?.diff
+    ).not.toHaveLength(0);
+    expect(state.rows[0].regression_run_at).not.toContain("2000-01-01");
   });
 
   it("keeps a failed policy write and its audit in the same transaction", async () => {

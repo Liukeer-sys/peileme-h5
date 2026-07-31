@@ -1319,7 +1319,7 @@ export class PolicyRepository {
     id: string;
     request: Request;
   }) {
-    return withTransaction(async (client) => {
+    const outcome = await withTransaction(async (client) => {
       const ruleSet = await client.query<{ id: string }>(
         `SELECT id
            FROM policy_rule_sets
@@ -1371,20 +1371,36 @@ export class PolicyRepository {
           "仅草稿版本可以发布"
         );
       }
-      if (draft.regression_status !== "passed") {
-        throw new ApiError(
-          409,
-          "POLICY_REGRESSION_REQUIRED",
-          "规则回归校验通过后才可发布",
-          { regressionSummary: draft.regression_summary }
-        );
-      }
-      if (!policyDefinitionSchema.safeParse(draft.definition).success) {
+      const parsedDefinition = policyDefinitionSchema.safeParse(
+        draft.definition
+      );
+      if (!parsedDefinition.success) {
         throw new ApiError(
           400,
           "INVALID_POLICY_DEFINITION",
           "政策规则定义不符合 schemaVersion 1/2"
         );
+      }
+      const regression = runPolicyRegression(
+        policyDefinitionToEngineRules(parsedDefinition.data),
+        parsedDefinition.data.regressionExpectations
+      );
+      const regressionStatus =
+        regression.failed === 0 ? "passed" : "failed";
+      await client.query(
+        `UPDATE policy_rule_versions
+            SET regression_status = $2,
+                regression_summary = $3::jsonb,
+                regression_run_at = now(),
+                updated_at = now()
+          WHERE id = $1`,
+        [draft.id, regressionStatus, JSON.stringify(regression)]
+      );
+      if (regressionStatus === "failed") {
+        return {
+          kind: "blocked" as const,
+          regression
+        };
       }
       await this.preparePublishedInterval(
         client,
@@ -1433,8 +1449,20 @@ export class PolicyRepository {
         },
         client
       );
-      return formatVersion(published.rows[0]);
+      return {
+        kind: "published" as const,
+        version: formatVersion(published.rows[0])
+      };
     });
+    if (outcome.kind === "blocked") {
+      throw new ApiError(
+        409,
+        "POLICY_REGRESSION_REQUIRED",
+        "规则回归校验通过后才可发布",
+        { regressionSummary: outcome.regression }
+      );
+    }
+    return outcome.version;
   }
 
   async rollback({
@@ -1565,7 +1593,7 @@ export class PolicyRepository {
         [
           ruleSet.rows[0].id,
           maximum.rows[0].version + 1,
-          JSON.stringify(target.rows[0].definition),
+          JSON.stringify(parsedTarget.data),
           JSON.stringify(target.rows[0].source_snapshot),
           effectiveFrom,
           request.authUser!.id,

@@ -1409,14 +1409,27 @@ test("管理员真实操作区域参数编辑、模板下载和严格 CSV 全边
 }) => {
   const assertCleanRuntime = watchRuntime(page);
   if (!e2eDatabaseUrl) throw new Error("E2E_DATABASE_URL is required");
-  const countParameters = async () => {
+  const snapshotRegionalImportState = async () => {
     const database = new Client({ connectionString: e2eDatabaseUrl });
     await database.connect();
     try {
-      const result = await database.query<{ count: string }>(
-        "SELECT count(*)::text AS count FROM regional_parameters"
+      const parameters = await database.query(
+        `SELECT id, region_code, region_name, year, parameter_type,
+                amount_fen::text, source_name, source_url,
+                source_published_at::text, status, reviewed_by,
+                reviewed_at::text, created_at::text, updated_at::text
+           FROM regional_parameters
+          ORDER BY region_code, year, parameter_type`
       );
-      return result.rows[0].count;
+      const audits = await database.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+           FROM admin_audit_logs
+          WHERE action = 'policy.parameter.import'`
+      );
+      return {
+        parameters: parameters.rows,
+        successfulImportAudits: audits.rows[0].count
+      };
     } finally {
       await database.end();
     }
@@ -1550,7 +1563,7 @@ test("管理员真实操作区域参数编辑、模板下载和严格 CSV 全边
     sourceUrl: "https://example.test/task8/source?a=1,b=2",
     status: "draft"
   });
-  const countAfterSuccess = await countParameters();
+  const stateAfterSuccess = await snapshotRegionalImportState();
   assertCleanRuntime();
 
   await csvInput.setInputFiles({
@@ -1568,7 +1581,7 @@ test("管理员真实操作区域参数编辑、模板下载和严格 CSV 全边
   await expect(page.getByRole("alert")).toContainText(
     "第 3 行：区域参数 310000:2098:minimum_monthly_wage 重复"
   );
-  expect(await countParameters()).toBe(countAfterSuccess);
+  expect(await snapshotRegionalImportState()).toEqual(stateAfterSuccess);
 
   await csvInput.setInputFiles({
     name: "formula.csv",
@@ -1584,7 +1597,7 @@ test("管理员真实操作区域参数编辑、模板下载和严格 CSV 全边
   await expect(page.getByRole("alert")).toContainText(
     "文本字段不得以 =、+、- 或 @ 开头"
   );
-  expect(await countParameters()).toBe(countAfterSuccess);
+  expect(await snapshotRegionalImportState()).toEqual(stateAfterSuccess);
 
   await csvInput.setInputFiles({
     name: "oversize.csv",
@@ -1593,7 +1606,7 @@ test("管理员真实操作区域参数编辑、模板下载和严格 CSV 全边
   });
   await page.getByRole("button", { name: "导入 CSV" }).click();
   await expect(page.getByRole("alert")).toContainText("500000");
-  expect(await countParameters()).toBe(countAfterSuccess);
+  expect(await snapshotRegionalImportState()).toEqual(stateAfterSuccess);
 
   await csvInput.setInputFiles({
     name: "invalid.csv",
@@ -1604,7 +1617,7 @@ test("管理员真实操作区域参数编辑、模板下载和严格 CSV 全边
   await expect(page.getByRole("alert")).toContainText(
     "CSV header must be exactly"
   );
-  expect(await countParameters()).toBe(countAfterSuccess);
+  expect(await snapshotRegionalImportState()).toEqual(stateAfterSuccess);
 });
 
 test("区域参数完整分页且较慢旧筛选不会覆盖最新结果", async ({ page }) => {
