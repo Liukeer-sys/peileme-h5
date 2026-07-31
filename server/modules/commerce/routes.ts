@@ -1,4 +1,4 @@
-import { Router, type Request } from "express";
+import { Router, type Request, type RequestHandler } from "express";
 import { z } from "zod";
 import { writeAdminAudit } from "../../audit.js";
 import { ApiError } from "../../errors.js";
@@ -28,6 +28,7 @@ import {
   FakePaymentProvider
 } from "../payments/fake.js";
 import type { PaymentProvider } from "../payments/provider.js";
+import type { ProductChannel } from "../../product-host.js";
 
 const commerceStatuses: Partial<
   Record<CommerceErrorCode, { status: number; message: string }>
@@ -92,30 +93,85 @@ const invoiceBodySchema = z
 const requestIp = (request: Request) =>
   request.ip || request.socket.remoteAddress || "127.0.0.1";
 
-const originForChannel = (
-  configuredOrigins: string,
-  channel: "main" | "ai"
-) => {
-  const origins = configuredOrigins
-    .split(",")
-    .map((item) => item.trim().replace(/\/+$/, ""))
-    .filter(Boolean);
-  const classifyOrigin = (origin: string) => {
-    try {
-      const parsed = new URL(origin);
-      if (!["http:", "https:"].includes(parsed.protocol)) return undefined;
-      return parsed.hostname.split(".")[0] === "ai" ? "ai" : "main";
-    } catch {
-      return undefined;
-    }
-  };
-  const selected = origins.find(
-    (origin) => classifyOrigin(origin) === channel
-  );
-  if (!selected) {
-    throw new CommerceError("PAYMENT_PROVIDER_FAILED");
+const productChannelFrom = (request: Request): ProductChannel => {
+  if (!request.productChannel) {
+    throw new ApiError(404, "PRODUCT_HOST_NOT_FOUND", "产品站点不存在");
   }
-  return selected;
+  return request.productChannel;
+};
+
+const assertRequestedProductChannel = (
+  requested: unknown,
+  derived: ProductChannel
+) => {
+  if (requested === undefined) return;
+  if (
+    typeof requested !== "string" ||
+    (requested !== "main" && requested !== "ai") ||
+    requested !== derived
+  ) {
+    throw new ApiError(
+      400,
+      "PRODUCT_CHANNEL_HOST_MISMATCH",
+      "请求渠道与产品站点不一致"
+    );
+  }
+};
+
+const assertSkuForProductChannel = (
+  requested: unknown,
+  channel: ProductChannel
+) => {
+  const mainSkus = new Set(["POLICY_CALC"]);
+  const aiSkus = new Set([
+    "AI_SEVERANCE_ANALYSIS",
+    "AI_DOCUMENT_REVIEW"
+  ]);
+  if (
+    typeof requested === "string" &&
+    ((mainSkus.has(requested) && channel !== "main") ||
+      (aiSkus.has(requested) && channel !== "ai"))
+  ) {
+    throw new ApiError(
+      400,
+      "PRODUCT_CHANNEL_HOST_MISMATCH",
+      "商品与产品站点不一致"
+    );
+  }
+};
+
+const requireOrderProductBoundary: RequestHandler = (
+  request,
+  _response,
+  next
+) => {
+  try {
+    const channel = productChannelFrom(request);
+    if (request.body && typeof request.body === "object") {
+      const body = request.body as Record<string, unknown>;
+      assertRequestedProductChannel(body.channel, channel);
+      assertSkuForProductChannel(body.sku, channel);
+    }
+    next();
+  } catch (error) {
+    next(commerceApiError(error));
+  }
+};
+
+const requireQueryProductBoundary: RequestHandler = (
+  request,
+  _response,
+  next
+) => {
+  try {
+    assertRequestedProductChannel(
+      request.query.channel,
+      productChannelFrom(request)
+    );
+    next();
+  } catch (error) {
+    next(commerceApiError(error));
+  }
 };
 
 export const createCommerceRouters = (
@@ -133,48 +189,62 @@ export const createCommerceRouters = (
 
   router.get("/catalog", async (request, response, next) => {
     try {
-      const channel = z
-        .enum(["main", "ai"])
-        .parse(request.query.channel);
+      const channel = productChannelFrom(request);
+      assertRequestedProductChannel(request.query.channel, channel);
       response.json({ items: await getActiveCatalog(channel) });
     } catch (error) {
       next(commerceApiError(error));
     }
   });
 
-  router.post("/orders", requireAuth, async (request, response, next) => {
-    try {
-      const body = orderBodySchema.parse(request.body);
-      response.status(201).json(
-        await createOrder({
-          userId: request.authUser!.id,
-          ...body
-        })
-      );
-    } catch (error) {
-      next(commerceApiError(error));
+  router.post(
+    "/orders",
+    requireOrderProductBoundary,
+    requireAuth,
+    async (request, response, next) => {
+      try {
+        const body = orderBodySchema.parse(request.body);
+        const channel = productChannelFrom(request);
+        assertRequestedProductChannel(body.channel, channel);
+        assertSkuForProductChannel(body.sku, channel);
+        response.status(201).json(
+          await createOrder({
+            userId: request.authUser!.id,
+            ...body,
+            channel
+          })
+        );
+      } catch (error) {
+        next(commerceApiError(error));
+      }
     }
-  });
+  );
 
   router.post(
     "/orders/:id/pay",
     requireAuth,
     async (request, response, next) => {
       try {
+        const orderId = uuidSchema.parse(request.params.id);
+        const productChannel = productChannelFrom(request);
+        await getOwnedOrder(
+          request.authUser!.id,
+          orderId,
+          productChannel
+        );
         paymentBodySchema.parse(request.body);
         if (!paymentProvider || paymentProvider.channel !== "fake") {
           throw new CommerceError("PAYMENT_PROVIDER_FAILED");
         }
-        const orderId = uuidSchema.parse(request.params.id);
-        const order = await getOwnedOrder(request.authUser!.id, orderId);
-        const returnOrigin = originForChannel(
-          config.APP_ORIGIN,
-          order.channel
-        );
+        const returnOrigin =
+          productChannel === "main"
+            ? config.MAIN_APP_ORIGIN
+            : config.AI_APP_ORIGIN;
         response.json(
           await startPayment({
             userId: request.authUser!.id,
             orderId,
+            productChannel,
             provider: paymentProvider,
             clientIp: requestIp(request),
             returnUrl: `${returnOrigin}/orders/${orderId}`,
@@ -187,8 +257,14 @@ export const createCommerceRouters = (
     }
   );
 
-  router.get("/orders", requireAuth, async (request, response, next) => {
+  router.get(
+    "/orders",
+    requireQueryProductBoundary,
+    requireAuth,
+    async (request, response, next) => {
     try {
+      const channel = productChannelFrom(request);
+      assertRequestedProductChannel(request.query.channel, channel);
       const pagination = z
         .object({
           page: z.coerce.number().int().positive().default(1),
@@ -199,37 +275,55 @@ export const createCommerceRouters = (
         await listOwnedOrders(
           request.authUser!.id,
           pagination.page,
-          pagination.pageSize
+          pagination.pageSize,
+          channel
         )
       );
     } catch (error) {
       next(commerceApiError(error));
     }
-  });
+    }
+  );
 
-  router.get("/orders/:id", requireAuth, async (request, response, next) => {
+  router.get(
+    "/orders/:id",
+    requireQueryProductBoundary,
+    requireAuth,
+    async (request, response, next) => {
     try {
+      const channel = productChannelFrom(request);
+      assertRequestedProductChannel(request.query.channel, channel);
       response.json(
         await getOwnedOrder(
           request.authUser!.id,
-          uuidSchema.parse(request.params.id)
+          uuidSchema.parse(request.params.id),
+          channel
         )
       );
     } catch (error) {
       next(commerceApiError(error));
     }
-  });
+    }
+  );
 
   router.post(
     "/orders/:id/invoice",
     requireAuth,
     async (request, response, next) => {
       try {
+        const orderId = uuidSchema.parse(request.params.id);
+        const productChannel = productChannelFrom(request);
+        await getOwnedOrder(
+          request.authUser!.id,
+          orderId,
+          productChannel
+        );
         const body = invoiceBodySchema.parse(request.body);
         response.status(201).json(
           await createInvoiceRequest({
             userId: request.authUser!.id,
-            orderId: uuidSchema.parse(request.params.id),
+            orderId,
+            productChannel,
             ...body
           })
         );

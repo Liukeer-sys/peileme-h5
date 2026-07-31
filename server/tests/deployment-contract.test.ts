@@ -65,6 +65,18 @@ describe("dual web deployment contract", () => {
     expect(example).not.toMatch(/^WEB_PORT=/m);
   });
 
+  it("keeps production product Host templates free of loopback aliases", async () => {
+    const example = await readProjectFile(".env.example");
+
+    expect(example).toMatch(
+      /^MAIN_PRODUCT_HOSTS=peileme\.art,www\.peileme\.art$/m
+    );
+    expect(example).toMatch(/^AI_PRODUCT_HOSTS=ai\.peileme\.art$/m);
+    expect(example).not.toMatch(
+      /^(?:MAIN|AI)_PRODUCT_HOSTS=.*(?:localhost|127\.0\.0\.1|\[::1\])/m
+    );
+  });
+
   it("routes both domains through isolated TLS logs and certificates", async () => {
     const template = await readProjectFile(
       "deploy/openresty-site.conf.template"

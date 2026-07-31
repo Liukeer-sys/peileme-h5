@@ -296,6 +296,8 @@ describe("shared authentication sessions", () => {
     const original = {
       NODE_ENV: process.env.NODE_ENV,
       APP_ORIGIN: process.env.APP_ORIGIN,
+      MAIN_APP_ORIGIN: process.env.MAIN_APP_ORIGIN,
+      AI_APP_ORIGIN: process.env.AI_APP_ORIGIN,
       COOKIE_DOMAIN: process.env.COOKIE_DOMAIN,
       JWT_SECRET: process.env.JWT_SECRET,
       OTP_SECRET: process.env.OTP_SECRET,
@@ -305,6 +307,8 @@ describe("shared authentication sessions", () => {
       process.env.NODE_ENV = "production";
       process.env.APP_ORIGIN =
         "https://peileme.art,https://www.peileme.art,https://ai.peileme.art";
+      process.env.MAIN_APP_ORIGIN = "https://peileme.art";
+      process.env.AI_APP_ORIGIN = "https://ai.peileme.art";
       process.env.COOKIE_DOMAIN = ".peileme.art";
       process.env.JWT_SECRET =
         "production-jwt-secret-that-is-longer-than-thirty-two-characters";

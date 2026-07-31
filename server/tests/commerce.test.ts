@@ -18,8 +18,10 @@ import {
 } from "../modules/commerce/entitlements.js";
 import {
   closeExpiredOrders,
+  createInvoiceRequest,
   createOrder,
   fulfillOrder,
+  getOwnedOrder,
   listOwnedOrders,
   markOrderPaid,
   reconcileAndCloseExpiredOrders,
@@ -1076,6 +1078,21 @@ describe("commerce catalog foundation", () => {
     );
   });
 
+  it("installs the channel-scoped owned-order lookup index from migration 010", async () => {
+    const index = await query<{ indexdef: string }>(
+      `SELECT indexdef
+         FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND tablename = 'orders'
+          AND indexname = 'orders_user_product_channel_created_id_idx'`
+    );
+
+    expect(index.rows).toHaveLength(1);
+    expect(index.rows[0].indexdef).toContain(
+      "(user_id, product_channel, created_at DESC, id DESC)"
+    );
+  });
+
   it("rejects invalid payment reconciliation result and schedule combinations", async () => {
     await seedPolicyFoundation();
     let userId: string | undefined;
@@ -2079,6 +2096,139 @@ describe("atomic commerce entitlements", () => {
 });
 
 describe("atomic commerce orders and payments", () => {
+  it("isolates one user's main and AI order reads, payments and invoices", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const [mainOrder, aiOrder] = await Promise.all([
+        createOrder({
+          userId,
+          sku: "POLICY_CALC",
+          channel: "main",
+          idempotencyKey: `isolation-main-${randomUUID()}`,
+          businessDraftId: await insertPolicyDraft(userId, "main")
+        }),
+        createOrder({
+          userId,
+          sku: "AI_DOCUMENT_REVIEW",
+          channel: "ai",
+          idempotencyKey: `isolation-ai-${randomUUID()}`,
+          businessDraftId: await insertPolicyDraft(userId, "ai")
+        })
+      ]);
+
+      const [mainList, aiList] = await Promise.all([
+        listOwnedOrders(userId, 1, 20, "main"),
+        listOwnedOrders(userId, 1, 20, "ai")
+      ]);
+      expect(mainList).toMatchObject({ total: "1" });
+      expect(mainList.items.map((item) => item.id)).toEqual([mainOrder.id]);
+      expect(aiList).toMatchObject({ total: "1" });
+      expect(aiList.items.map((item) => item.id)).toEqual([aiOrder.id]);
+      await expect(
+        getOwnedOrder(userId, mainOrder.id, "ai")
+      ).rejects.toMatchObject({ code: "ORDER_NOT_FOUND" });
+      await expect(
+        getOwnedOrder(userId, aiOrder.id, "main")
+      ).rejects.toMatchObject({ code: "ORDER_NOT_FOUND" });
+
+      let createPaymentCalls = 0;
+      let queryPaymentCalls = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          createPaymentCalls += 1;
+          throw new Error("cross-channel provider call");
+        },
+        async queryPayment() {
+          queryPaymentCalls += 1;
+          return null;
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      await expect(
+        startPayment({
+          userId,
+          orderId: mainOrder.id,
+          productChannel: "ai",
+          provider,
+          clientIp: "127.0.0.1",
+          returnUrl: "https://ai.peileme.art/orders/cross-channel",
+          notifyUrl: "/api/test-payments/notify"
+        })
+      ).rejects.toMatchObject({ code: "ORDER_NOT_FOUND" });
+      await expect(
+        createInvoiceRequest({
+          userId,
+          orderId: aiOrder.id,
+          productChannel: "main",
+          title: "Cross channel",
+          email: "cross-channel@peileme.test"
+        })
+      ).rejects.toMatchObject({ code: "ORDER_NOT_FOUND" });
+      expect({ createPaymentCalls, queryPaymentCalls }).toEqual({
+        createPaymentCalls: 0,
+        queryPaymentCalls: 0
+      });
+      const token = await signAccessToken({
+        id: userId,
+        role: "user",
+        email: "channel-owner@peileme.test",
+        phone: null,
+        displayName: null,
+        status: "active"
+      });
+      const app = createApp({ paymentProvider: provider });
+      await request(app)
+        .get(`/api/commerce/orders/${mainOrder.id}`)
+        .set("host", "ai.peileme.art")
+        .set("authorization", `Bearer ${token}`)
+        .expect(404, {
+          error: "ORDER_NOT_FOUND",
+          message: "订单不存在"
+        });
+      for (const action of ["pay", "invoice"]) {
+        const crossHost = await request(app)
+          .post(`/api/commerce/orders/${mainOrder.id}/${action}`)
+          .set("host", "ai.peileme.art")
+          .set("authorization", `Bearer ${token}`)
+          .send({});
+        expect(crossHost.status).toBe(404);
+        expect(crossHost.body.error).toBe("ORDER_NOT_FOUND");
+      }
+      await request(app)
+        .post(`/api/commerce/orders/${mainOrder.id}/pay`)
+        .set("host", "peileme.art")
+        .set("authorization", `Bearer ${token}`)
+        .send({})
+        .expect(400);
+      await request(app)
+        .post(`/api/commerce/orders/${mainOrder.id}/invoice`)
+        .set("host", "peileme.art")
+        .set("authorization", `Bearer ${token}`)
+        .send({})
+        .expect(400);
+      const sideEffects = await query<{
+        attempts: string;
+        invoices: string;
+      }>(
+        `SELECT
+           (SELECT count(*)::text FROM payment_attempts WHERE order_id = ANY($1::uuid[])) AS attempts,
+           (SELECT count(*)::text FROM invoice_requests WHERE order_id = ANY($1::uuid[])) AS invoices`,
+        [[mainOrder.id, aiOrder.id]]
+      );
+      expect(sideEffects.rows[0]).toEqual({
+        attempts: "0",
+        invoices: "0"
+      });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
   it("rejects completed, abandoned and wrong-step policy drafts without writes", async () => {
     await seedPolicyFoundation();
     let userId: string | undefined;
@@ -2314,12 +2464,12 @@ describe("atomic commerce orders and payments", () => {
         [userId]
       );
       const expectedOrder = await query<{ id: string }>(
-        "SELECT id FROM orders WHERE user_id = $1 ORDER BY created_at DESC, id DESC",
+        "SELECT id FROM orders WHERE user_id = $1 AND product_channel = 'main' ORDER BY created_at DESC, id DESC",
         [userId]
       );
       const [pageOne, pageTwo] = await Promise.all([
-        listOwnedOrders(userId, 1, 2),
-        listOwnedOrders(userId, 2, 2)
+        listOwnedOrders(userId, 1, 2, "main"),
+        listOwnedOrders(userId, 2, 2, "main")
       ]);
       expect([
         ...pageOne.items.map((item) => item.id),
@@ -2986,6 +3136,7 @@ describe("atomic commerce orders and payments", () => {
         startPayment({
           userId: userId!,
           orderId: order.id,
+          productChannel: order.channel,
           provider,
           clientIp: "127.0.0.1",
           returnUrl: "http://peileme.test/return",
@@ -3567,6 +3718,7 @@ describe("atomic commerce orders and payments", () => {
       const payment = startPayment({
         userId,
         orderId: order.id,
+        productChannel: order.channel,
         clientIp: "127.0.0.1",
         returnUrl: "http://peileme.test/return",
         notifyUrl: "http://peileme.test/notify",
@@ -3653,6 +3805,7 @@ describe("atomic commerce orders and payments", () => {
         startPayment({
           userId: userId!,
           orderId: order.id,
+          productChannel: order.channel,
           provider,
           clientIp: "127.0.0.1",
           returnUrl: "http://peileme.test/return",
@@ -3746,6 +3899,7 @@ describe("atomic commerce orders and payments", () => {
         startPayment({
           userId,
           orderId: order.id,
+          productChannel: order.channel,
           provider,
           clientIp: "127.0.0.1",
           returnUrl: "http://peileme.test/return",
@@ -3848,6 +4002,7 @@ describe("atomic commerce orders and payments", () => {
         startPayment({
           userId,
           orderId: order.id,
+          productChannel: order.channel,
           provider: fakeProvider,
           clientIp: "127.0.0.1",
           returnUrl: "http://peileme.test/return",
@@ -3855,6 +4010,22 @@ describe("atomic commerce orders and payments", () => {
           providerTimeoutMs: 20
         });
 
+      await expect(
+        startPayment({
+          userId: ownerId,
+          orderId: order.id,
+          productChannel: "ai",
+          provider: fakeProvider,
+          clientIp: "127.0.0.1",
+          returnUrl: "http://ai.peileme.test/return",
+          notifyUrl: "http://peileme.test/notify",
+          providerTimeoutMs: 20
+        })
+      ).rejects.toMatchObject({ code: "ORDER_NOT_FOUND" });
+      expect({ createCalls, queryCalls }).toEqual({
+        createCalls: 0,
+        queryCalls: 0
+      });
       await expect(start(otherUserId)).rejects.toMatchObject({
         code: "ORDER_NOT_FOUND"
       });
@@ -3900,6 +4071,7 @@ describe("atomic commerce orders and payments", () => {
         startPayment({
           userId: ownerId,
           orderId: order.id,
+          productChannel: order.channel,
           provider: alipayProvider,
           clientIp: "127.0.0.1",
           returnUrl: "http://peileme.test/return",
@@ -3976,6 +4148,7 @@ describe("atomic commerce orders and payments", () => {
         startPayment({
           userId: userId!,
           orderId: order.id,
+          productChannel: order.channel,
           provider,
           clientIp: "127.0.0.1",
           returnUrl: "http://peileme.test/return",
@@ -4078,6 +4251,7 @@ describe("atomic commerce orders and payments", () => {
         startPayment({
           userId,
           orderId: order.id,
+          productChannel: order.channel,
           provider,
           clientIp: "127.0.0.1",
           returnUrl: "http://peileme.test/return",
@@ -6090,6 +6264,7 @@ describe("atomic commerce orders and payments", () => {
         startPayment({
           userId: userId!,
           orderId: order.id,
+          productChannel: order.channel,
           provider,
           clientIp: "127.0.0.1",
           returnUrl: "http://peileme.test/return",
@@ -6173,6 +6348,7 @@ describe("atomic commerce orders and payments", () => {
         startPayment({
           userId,
           orderId: failed.order.id,
+          productChannel: failed.order.channel,
           provider,
           clientIp: "127.0.0.1",
           returnUrl: "http://peileme.test/return",
@@ -6247,6 +6423,7 @@ describe("atomic commerce orders and payments", () => {
       const retried = await startPayment({
         userId,
         orderId: failed.order.id,
+        productChannel: failed.order.channel,
         provider,
         clientIp: "127.0.0.1",
         returnUrl: "http://peileme.test/return",
@@ -6298,6 +6475,7 @@ describe("atomic commerce orders and payments", () => {
         startPayment({
           userId,
           orderId: failed.order.id,
+          productChannel: failed.order.channel,
           provider,
           clientIp: "127.0.0.1",
           returnUrl: "http://peileme.test/return",
@@ -6389,6 +6567,7 @@ describe("atomic commerce orders and payments", () => {
         startPayment({
           userId: userId!,
           orderId,
+          productChannel: "main",
           provider,
           clientIp: "127.0.0.1",
           returnUrl: "http://peileme.test/return",
@@ -7849,10 +8028,14 @@ describe("atomic commerce orders and payments", () => {
   it("uses the matching main and AI site origins for payment returns", async () => {
     await seedPolicyFoundation();
     const previousOrigin = process.env.APP_ORIGIN;
+    const previousMainOrigin = process.env.MAIN_APP_ORIGIN;
+    const previousAiOrigin = process.env.AI_APP_ORIGIN;
     const userIds: string[] = [];
     try {
       process.env.APP_ORIGIN =
         "https://peileme.art,https://ai.peileme.art";
+      process.env.MAIN_APP_ORIGIN = "https://peileme.art";
+      process.env.AI_APP_ORIGIN = "https://ai.peileme.art";
       resetConfigForTests();
       const userId = await createEntitlementTestUser(true);
       userIds.push(userId);
@@ -7910,6 +8093,12 @@ describe("atomic commerce orders and payments", () => {
       for (const order of orders) {
         await request(app)
           .post(`/api/commerce/orders/${order.id}/pay`)
+          .set(
+            "host",
+            order.channel === "main"
+              ? "peileme.art"
+              : "ai.peileme.art"
+          )
           .set("authorization", `Bearer ${token}`)
           .send({ channel: "fake" })
           .expect(200);
@@ -7920,15 +8109,6 @@ describe("atomic commerce orders and payments", () => {
       expect(seen.get(orders[1].orderNo)).toBe(
         `https://ai.peileme.art/orders/${orders[1].id}`
       );
-
-      process.env.APP_ORIGIN = "https://peileme.art";
-      resetConfigForTests();
-      const misconfiguredApp = createApp({ paymentProvider: provider });
-      await request(misconfiguredApp)
-        .post(`/api/commerce/orders/${orders[1].id}/pay`)
-        .set("authorization", `Bearer ${token}`)
-        .send({ channel: "fake" })
-        .expect(503);
       expect(seen.size).toBe(2);
     } finally {
       await cleanupEntitlementTestUsers(userIds);
@@ -7936,6 +8116,16 @@ describe("atomic commerce orders and payments", () => {
         delete process.env.APP_ORIGIN;
       } else {
         process.env.APP_ORIGIN = previousOrigin;
+      }
+      if (previousMainOrigin === undefined) {
+        delete process.env.MAIN_APP_ORIGIN;
+      } else {
+        process.env.MAIN_APP_ORIGIN = previousMainOrigin;
+      }
+      if (previousAiOrigin === undefined) {
+        delete process.env.AI_APP_ORIGIN;
+      } else {
+        process.env.AI_APP_ORIGIN = previousAiOrigin;
       }
       resetConfigForTests();
     }

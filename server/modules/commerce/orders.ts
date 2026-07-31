@@ -1085,15 +1085,18 @@ export const markOrderPaid = async (
 
 export const getOwnedOrder = async (
   userIdInput: string,
-  orderIdInput: string
+  orderIdInput: string,
+  channelInput: OrderProductChannel
 ) => {
   const userId = requireUuid(userIdInput);
   const orderId = requireUuid(orderIdInput);
+  const channel = requireChannel(channelInput);
   const result = await query<OrderRow>(
     `${orderSelect}
      WHERE o.id = $1
-       AND o.user_id = $2`,
-    [orderId, userId]
+       AND o.user_id = $2
+       AND o.product_channel = $3`,
+    [orderId, userId, channel]
   );
   if (!result.rows[0]) throw new CommerceError("ORDER_NOT_FOUND");
   return mapOrder(result.rows[0]);
@@ -1102,21 +1105,27 @@ export const getOwnedOrder = async (
 export const listOwnedOrders = async (
   userIdInput: string,
   page: number,
-  pageSize: number
+  pageSize: number,
+  channelInput: OrderProductChannel
 ) => {
   const userId = requireUuid(userIdInput);
+  const channel = requireChannel(channelInput);
   const offset = (page - 1) * pageSize;
   const [items, total] = await Promise.all([
     query<OrderRow>(
       `${orderSelect}
        WHERE o.user_id = $1
+         AND o.product_channel = $2
        ORDER BY o.created_at DESC, o.id DESC
-       LIMIT $2 OFFSET $3`,
-      [userId, pageSize, offset]
+       LIMIT $3 OFFSET $4`,
+      [userId, channel, pageSize, offset]
     ),
     query<{ count: string }>(
-      "SELECT count(*)::text AS count FROM orders WHERE user_id = $1",
-      [userId]
+      `SELECT count(*)::text AS count
+         FROM orders
+        WHERE user_id = $1
+          AND product_channel = $2`,
+      [userId, channel]
     )
   ]);
   return {
@@ -2198,7 +2207,8 @@ export const reconcileAndCloseExpiredOrders = async (input: {
 const getFailedPaymentRecovery = async (
   userId: string,
   orderId: string,
-  channel: PaymentChannel
+  productChannel: OrderProductChannel,
+  paymentChannel: PaymentChannel
 ): Promise<FailedPaymentRecovery | undefined> => {
   const result = await query<{
     id: string;
@@ -2220,14 +2230,15 @@ const getFailedPaymentRecovery = async (
        SELECT id, error_code, updated_at
        FROM payment_attempts
        WHERE order_id = o.id
-         AND channel = $3
+         AND channel = $4
        ORDER BY created_at DESC, id DESC
        LIMIT 1
      ) attempt ON true
      WHERE o.id = $1
        AND o.user_id = $2
+       AND o.product_channel = $3
        AND o.status IN ('PAYING', 'PAYMENT_FAILED', 'CLOSED')`,
-    [orderId, userId, channel]
+    [orderId, userId, productChannel, paymentChannel]
   );
   const row = result.rows[0];
   return row
@@ -2245,6 +2256,7 @@ const getFailedPaymentRecovery = async (
 const preparePayment = async (
   userId: string,
   orderId: string,
+  productChannel: OrderProductChannel,
   provider: PaymentProvider
 ): Promise<PreparedPayment> =>
   withTransaction(async (client) => {
@@ -2253,8 +2265,9 @@ const preparePayment = async (
       `${orderSelect}
        WHERE o.id = $1
          AND o.user_id = $2
+         AND o.product_channel = $3
        FOR UPDATE OF o`,
-      [orderId, userId]
+      [orderId, userId, productChannel]
     );
     const row = selected.rows[0];
     if (!row) throw new CommerceError("ORDER_NOT_FOUND");
@@ -2457,6 +2470,7 @@ export const startPayment = async (
   input: {
     userId: string;
     orderId: string;
+    productChannel: OrderProductChannel;
     provider: PaymentProvider;
     clientIp: string;
     returnUrl: string;
@@ -2466,6 +2480,7 @@ export const startPayment = async (
 ): Promise<PaymentStartResult> => {
   const userId = requireUuid(input.userId);
   const orderId = requireUuid(input.orderId);
+  const productChannel = requireChannel(input.productChannel);
   const providerTimeoutMs = input.providerTimeoutMs ?? 15_000;
   if (
     !Number.isInteger(providerTimeoutMs) ||
@@ -2477,6 +2492,7 @@ export const startPayment = async (
   const failedRecovery = await getFailedPaymentRecovery(
     userId,
     orderId,
+    productChannel,
     input.provider.channel
   );
   if (failedRecovery) {
@@ -2525,6 +2541,7 @@ export const startPayment = async (
   const prepared = await preparePayment(
     userId,
     orderId,
+    productChannel,
     input.provider
   );
   if (prepared.expired) {
@@ -2659,20 +2676,23 @@ export const startPayment = async (
 export const createInvoiceRequest = async (input: {
   userId: string;
   orderId: string;
+  productChannel: OrderProductChannel;
   title: string;
   taxNumber?: string;
   email: string;
 }) => {
   const userId = requireUuid(input.userId);
   const orderId = requireUuid(input.orderId);
+  const productChannel = requireChannel(input.productChannel);
   return withTransaction(async (client) => {
     const order = await client.query<{ status: OrderStatus }>(
       `SELECT status
        FROM orders
        WHERE id = $1
          AND user_id = $2
+         AND product_channel = $3
        FOR UPDATE`,
-      [orderId, userId]
+      [orderId, userId, productChannel]
     );
     if (!order.rows[0]) throw new CommerceError("ORDER_NOT_FOUND");
     if (

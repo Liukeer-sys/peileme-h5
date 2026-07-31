@@ -15,6 +15,8 @@ let userToken = "";
 let analystToken = "";
 let inviteCode = "";
 let anonymousAssessmentId = "";
+let aiAssessmentId = "";
+let aiUploadId = "";
 
 const visitorHeaders = {
   "x-visitor-id": "visitor_test_12345678",
@@ -80,6 +82,20 @@ describe("CORS policy", () => {
       .expect(200);
 
     expect(response.headers["access-control-allow-origin"]).toBeUndefined();
+  });
+
+  it("publishes upload limits only on the AI product host", async () => {
+    const main = await request(createApp())
+      .get("/api/public/config")
+      .set("host", "localhost")
+      .expect(200);
+    const ai = await request(createApp())
+      .get("/api/public/config")
+      .set("host", "ai.localhost")
+      .expect(200);
+
+    expect(main.body).not.toHaveProperty("maxUploadMb");
+    expect(ai.body.maxUploadMb).toBeGreaterThan(0);
   });
 });
 
@@ -1750,7 +1766,8 @@ describe("policy persistence foundation", () => {
       { version: "006_policy_result_shares.sql" },
       { version: "007_policy_rule_regressions.sql" },
       { version: "008_commerce.sql" },
-      { version: "009_payment_reconciliation.sql" }
+      { version: "009_payment_reconciliation.sql" },
+      { version: "010_order_channel_lookup.sql" }
     ]);
 
     const preserved = await query<{
@@ -1975,17 +1992,119 @@ describe("assessments, events and uploads", () => {
     expect(Number(overview.body.summary.completed_assessments)).toBeGreaterThanOrEqual(1);
   });
 
+  it("hides material metadata from shared main-host admin pages", async () => {
+    await request(createApp())
+      .post("/api/events/batch")
+      .set("host", "ai.localhost")
+      .set(visitorHeaders)
+      .send({
+        events: [
+          { name: "document_uploaded", path: "/account" },
+          { name: "ai_document_uploaded", path: "/account" },
+          { name: "ai_document_downloaded", path: "/account" }
+        ]
+      })
+      .expect(202);
+    await query(
+      `INSERT INTO admin_audit_logs(action, target_type, detail)
+       VALUES
+         ('upload.delete', 'upload', '{}'::jsonb),
+         ('policy.rules.update', 'policy', '{}'::jsonb)`
+    );
+
+    const authenticatedGet = (host: string, path: string) =>
+      request(createApp())
+        .get(path)
+        .set("host", host)
+        .set("authorization", `Bearer ${adminToken}`);
+    const [mainOverview, aiOverview, mainEvents, aiEvents] =
+      await Promise.all([
+        authenticatedGet("localhost", "/api/admin/overview?days=30").expect(
+          200
+        ),
+        authenticatedGet(
+          "ai.localhost",
+          "/api/admin/overview?days=30"
+        ).expect(200),
+        authenticatedGet("localhost", "/api/admin/events?days=30").expect(
+          200
+        ),
+        authenticatedGet(
+          "ai.localhost",
+          "/api/admin/events?days=30"
+        ).expect(200)
+      ]);
+    expect(mainOverview.body.summary).not.toHaveProperty("uploaded_files");
+    expect(aiOverview.body.summary).toHaveProperty("uploaded_files");
+    const mainEventNames = mainEvents.body.items.map(
+      (item: { event_name: string }) => item.event_name
+    );
+    const aiEventNames = aiEvents.body.items.map(
+      (item: { event_name: string }) => item.event_name
+    );
+    expect(mainEventNames).not.toContain("document_uploaded");
+    expect(mainEventNames).not.toContain("ai_document_uploaded");
+    expect(mainEventNames).not.toContain("ai_document_downloaded");
+    expect(aiEventNames).toEqual(
+      expect.arrayContaining([
+        "document_uploaded",
+        "ai_document_uploaded",
+        "ai_document_downloaded"
+      ])
+    );
+
+    const [mainAudit, aiAudit, mainSystem, aiSystem] = await Promise.all([
+      authenticatedGet(
+        "localhost",
+        "/api/admin/audit-logs?pageSize=100"
+      ).expect(200),
+      authenticatedGet(
+        "ai.localhost",
+        "/api/admin/audit-logs?pageSize=100"
+      ).expect(200),
+      authenticatedGet("localhost", "/api/admin/system").expect(200),
+      authenticatedGet("ai.localhost", "/api/admin/system").expect(200)
+    ]);
+    expect(
+      mainAudit.body.items.map((item: { action: string }) => item.action)
+    ).not.toContain("upload.delete");
+    expect(
+      aiAudit.body.items.map((item: { action: string }) => item.action)
+    ).toContain("upload.delete");
+    expect(
+      mainSystem.body.tableCounts.map(
+        (item: { name: string }) => item.name
+      )
+    ).not.toContain("uploads");
+    expect(
+      aiSystem.body.tableCounts.map((item: { name: string }) => item.name)
+    ).toContain("uploads");
+  });
+
   it("stores a private document upload", async () => {
+    const assessment = await request(createApp())
+      .post("/api/assessments")
+      .set("host", "ai.localhost")
+      .set(visitorHeaders)
+      .send({
+        status: "in_progress",
+        currentStep: "document",
+        answers: { city: "上海" }
+      })
+      .expect(201);
+    aiAssessmentId = assessment.body.id;
     await request(createApp())
       .post("/api/assessments/claim")
+      .set("host", "ai.localhost")
       .set("authorization", `Bearer ${userToken}`)
       .set(visitorHeaders)
       .expect(200);
     const response = await request(createApp())
       .post("/api/uploads")
+      .set("host", "ai.localhost")
       .set("authorization", `Bearer ${userToken}`)
       .set(visitorHeaders)
-      .field("assessmentId", anonymousAssessmentId)
+      .field("assessmentId", aiAssessmentId)
       .attach("files", Buffer.from("%PDF-1.4 test document"), {
         filename: "解除协议.pdf",
         contentType: "application/pdf"
@@ -1993,6 +2112,155 @@ describe("assessments, events and uploads", () => {
       .expect(201);
     expect(response.body.files[0].original_name).toBe("解除协议.pdf");
     expect(response.body.files[0].status).toBe("stored");
+    aiUploadId = response.body.files[0].id;
+  });
+
+  it("keeps authenticated AI user and admin material APIs operational", async () => {
+    const userFiles = await request(createApp())
+      .get("/api/uploads/mine")
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${userToken}`)
+      .expect(200);
+    expect(
+      userFiles.body.files.map((file: { id: string }) => file.id)
+    ).toContain(aiUploadId);
+    const userDownload = await request(createApp())
+      .get(`/api/uploads/${aiUploadId}/download`)
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${userToken}`)
+      .expect(200);
+    expect(userDownload.headers["content-disposition"]).toContain(
+      "attachment"
+    );
+
+    const adminFiles = await request(createApp())
+      .get("/api/admin/uploads?pageSize=100")
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${adminToken}`)
+      .expect(200);
+    expect(
+      adminFiles.body.items.map((file: { id: string }) => file.id)
+    ).toContain(aiUploadId);
+    const adminDownload = await request(createApp())
+      .get(`/api/admin/uploads/${aiUploadId}/download`)
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${adminToken}`)
+      .expect(200);
+    expect(adminDownload.headers["content-disposition"]).toContain(
+      "attachment"
+    );
+  });
+
+  it("scopes assessment history and updates to the active product host", async () => {
+    await request(createApp())
+      .post("/api/assessments/claim")
+      .set("host", "localhost")
+      .set("authorization", `Bearer ${userToken}`)
+      .set(visitorHeaders)
+      .expect(200);
+    const [mainHistory, aiHistory] = await Promise.all([
+      request(createApp())
+        .get("/api/assessments/mine?pageSize=100")
+        .set("host", "localhost")
+        .set("authorization", `Bearer ${userToken}`)
+        .expect(200),
+      request(createApp())
+        .get("/api/assessments/mine?pageSize=100")
+        .set("host", "ai.localhost")
+        .set("authorization", `Bearer ${userToken}`)
+        .expect(200)
+    ]);
+    const ids = (response: typeof mainHistory) =>
+      response.body.items.map((item: { id: string }) => item.id);
+    expect(ids(mainHistory)).toContain(anonymousAssessmentId);
+    expect(ids(mainHistory)).not.toContain(aiAssessmentId);
+    expect(ids(aiHistory)).toContain(aiAssessmentId);
+    expect(ids(aiHistory)).not.toContain(anonymousAssessmentId);
+
+    await request(createApp())
+      .patch(`/api/assessments/${aiAssessmentId}`)
+      .set("host", "localhost")
+      .set("authorization", `Bearer ${userToken}`)
+      .set(visitorHeaders)
+      .send({ currentStep: "cross-host-write" })
+      .expect(404);
+    await request(createApp())
+      .patch(`/api/assessments/${anonymousAssessmentId}`)
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${userToken}`)
+      .set(visitorHeaders)
+      .send({ currentStep: "cross-host-write" })
+      .expect(404);
+  });
+
+  it("scopes admin user counts and assessment details to the product Host", async () => {
+    const expectedCounts = await query<{
+      product_channel: string;
+      count: string;
+    }>(
+      `SELECT a.product_channel, count(*)::text AS count
+         FROM assessments a
+         JOIN users u ON u.id = a.user_id
+        WHERE u.email = 'user@peileme.test'
+        GROUP BY a.product_channel`
+    );
+    const counts = new Map(
+      expectedCounts.rows.map((row) => [row.product_channel, row.count])
+    );
+    const authenticatedAdminGet = (host: string, path: string) =>
+      request(createApp())
+        .get(path)
+        .set("host", host)
+        .set("authorization", `Bearer ${adminToken}`);
+    const [mainUsers, aiUsers, mainAssessments, aiAssessments] =
+      await Promise.all([
+        authenticatedAdminGet(
+          "localhost",
+          "/api/admin/users?search=user%40peileme.test&pageSize=100"
+        ).expect(200),
+        authenticatedAdminGet(
+          "ai.localhost",
+          "/api/admin/users?search=user%40peileme.test&pageSize=100"
+        ).expect(200),
+        authenticatedAdminGet(
+          "localhost",
+          "/api/admin/assessments?pageSize=100"
+        ).expect(200),
+        authenticatedAdminGet(
+          "ai.localhost",
+          "/api/admin/assessments?pageSize=100"
+        ).expect(200)
+      ]);
+    const selectedUser = (response: typeof mainUsers) =>
+      response.body.items.find(
+        (item: { email: string }) => item.email === "user@peileme.test"
+      );
+    expect(String(selectedUser(mainUsers).assessment_count)).toBe(
+      counts.get("main")
+    );
+    expect(String(selectedUser(aiUsers).assessment_count)).toBe(
+      counts.get("ai")
+    );
+    const mainIds = mainAssessments.body.items.map(
+      (item: { id: string }) => item.id
+    );
+    const aiIds = aiAssessments.body.items.map(
+      (item: { id: string }) => item.id
+    );
+    expect(mainIds).toContain(anonymousAssessmentId);
+    expect(mainIds).not.toContain(aiAssessmentId);
+    expect(aiIds).toContain(aiAssessmentId);
+    expect(aiIds).not.toContain(anonymousAssessmentId);
+    expect(
+      mainAssessments.body.items.find(
+        (item: { id: string }) => item.id === anonymousAssessmentId
+      ).answers
+    ).toMatchObject({ city: "上海" });
+    expect(
+      aiAssessments.body.items.find(
+        (item: { id: string }) => item.id === aiAssessmentId
+      ).answers
+    ).toMatchObject({ city: "上海" });
   });
 
   it("rejects spoofed file content and foreign assessment attachments", async () => {
@@ -2001,6 +2269,7 @@ describe("assessments, events and uploads", () => {
     );
     await request(createApp())
       .post("/api/uploads")
+      .set("host", "ai.localhost")
       .set("authorization", `Bearer ${userToken}`)
       .set(visitorHeaders)
       .attach("files", Buffer.from("plain text disguised as PDF"), {
@@ -2011,6 +2280,7 @@ describe("assessments, events and uploads", () => {
 
     const foreign = await request(createApp())
       .post("/api/assessments")
+      .set("host", "ai.localhost")
       .set({
         "x-visitor-id": "visitor_foreign_12345678",
         "x-session-id": "session_foreign_12345678"
@@ -2019,6 +2289,7 @@ describe("assessments, events and uploads", () => {
       .expect(201);
     await request(createApp())
       .post("/api/uploads")
+      .set("host", "ai.localhost")
       .set("authorization", `Bearer ${userToken}`)
       .set(visitorHeaders)
       .field("assessmentId", foreign.body.id)

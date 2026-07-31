@@ -53,6 +53,12 @@ import {
   requireAuth,
   requireSuperAdmin
 } from "./security.js";
+import {
+  attachProductChannel,
+  createProductHostResolver,
+  requireAiProductHost,
+  requireProductHost
+} from "./product-host.js";
 
 const identifierSchema = z.string().trim().min(4).max(160);
 const codeSchema = z.string().regex(/^\d{6}$/, "验证码应为 6 位数字");
@@ -211,6 +217,29 @@ export const createApp = (
   app.use(helmet({ crossOriginResourcePolicy: { policy: "same-site" } }));
   app.use(compression());
   app.use(
+    attachProductChannel(
+      createProductHostResolver(
+        config.MAIN_PRODUCT_HOSTS,
+        config.AI_PRODUCT_HOSTS
+      )
+    )
+  );
+  app.use(
+    "/api",
+    (request: Request, response: Response, next: NextFunction) => {
+      if (
+        request.path === "/health" &&
+        (request.method === "GET" || request.method === "HEAD")
+      ) {
+        next();
+        return;
+      }
+      requireProductHost(request, response, next);
+    }
+  );
+  app.use("/api/uploads", requireAiProductHost);
+  app.use("/api/admin/uploads", requireAiProductHost);
+  app.use(
     cors({
       origin: config.APP_ORIGIN.split(",").map((item) => item.trim()),
       credentials: true
@@ -245,11 +274,13 @@ export const createApp = (
     });
   });
 
-  app.get("/api/public/config", (_request, response) => {
+  app.get("/api/public/config", (request, response) => {
     response.json({
       registrationRequireInvite: config.REGISTRATION_REQUIRE_INVITE,
       channels: getChannelStatus(),
-      maxUploadMb: config.MAX_UPLOAD_MB
+      ...(request.productChannel === "ai"
+        ? { maxUploadMb: config.MAX_UPLOAD_MB }
+        : {})
     });
   });
 
@@ -500,8 +531,8 @@ export const createApp = (
     const identity = getRequestIdentity(request);
     const saved = await query<{ id: string; created_at: Date; updated_at: Date }>(
       `INSERT INTO assessments
-         (user_id, visitor_id, session_id, status, current_step, answers, result, completed_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, CASE WHEN $4 = 'completed' THEN now() END)
+         (user_id, visitor_id, session_id, status, current_step, answers, result, completed_at, product_channel)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, CASE WHEN $4 = 'completed' THEN now() END, $8)
        RETURNING id, created_at, updated_at`,
       [
         request.authUser?.id || null,
@@ -510,7 +541,8 @@ export const createApp = (
         body.status,
         body.currentStep || null,
         body.answers,
-        body.result || null
+        body.result || null,
+        request.productChannel!
       ]
     );
     response.status(201).json(saved.rows[0]);
@@ -533,6 +565,7 @@ export const createApp = (
               END,
               updated_at = now()
         WHERE id = $1
+          AND product_channel = $8
           AND (
             ($6::uuid IS NOT NULL AND user_id = $6)
             OR (user_id IS NULL AND visitor_id = $7)
@@ -545,7 +578,8 @@ export const createApp = (
         body.answers || null,
         body.result === undefined ? null : body.result,
         request.authUser?.id || null,
-        identity.visitorId
+        identity.visitorId,
+        request.productChannel!
       ]
     );
     if (!result.rowCount) throw new ApiError(404, "ASSESSMENT_NOT_FOUND", "评估记录不存在");
@@ -558,8 +592,9 @@ export const createApp = (
       `UPDATE assessments
           SET user_id = $1, updated_at = now()
         WHERE visitor_id = $2
+          AND product_channel = $3
           AND user_id IS NULL`,
-      [request.authUser!.id, visitorId]
+      [request.authUser!.id, visitorId, request.productChannel!]
     );
     await query(
       `UPDATE visitor_sessions SET user_id = $1 WHERE visitor_id = $2 AND user_id IS NULL`,
@@ -575,13 +610,19 @@ export const createApp = (
         `SELECT id, status, current_step, answers, result, completed_at, created_at, updated_at
            FROM assessments
           WHERE user_id = $1
+            AND product_channel = $4
           ORDER BY created_at DESC
           LIMIT $2 OFFSET $3`,
-        [request.authUser!.id, pageSize, offset]
+        [
+          request.authUser!.id,
+          pageSize,
+          offset,
+          request.productChannel!
+        ]
       ),
       query<{ count: string }>(
-        "SELECT count(*)::text AS count FROM assessments WHERE user_id = $1",
-        [request.authUser!.id]
+        "SELECT count(*)::text AS count FROM assessments WHERE user_id = $1 AND product_channel = $2",
+        [request.authUser!.id, request.productChannel!]
       )
     ]);
     response.json({
@@ -660,7 +701,7 @@ export const createApp = (
       const stored = await withTransaction(async (client) => {
         if (assessmentId) {
           const owned = await client.query(
-            "SELECT 1 FROM assessments WHERE id = $1 AND user_id = $2",
+            "SELECT 1 FROM assessments WHERE id = $1 AND user_id = $2 AND product_channel = 'ai'",
             [assessmentId, request.authUser!.id]
           );
           if (!owned.rowCount) {
@@ -728,21 +769,27 @@ export const createApp = (
   app.get("/api/admin/overview", requireAdmin, async (request, response) => {
     const days = Math.min(365, Math.max(1, Number(request.query.days) || 30));
     const interval = `${days} days`;
+    const productChannel = request.productChannel!;
+    const includeMaterialMetrics = productChannel === "ai";
     const [summary, funnel, trend, recent] = await Promise.all([
       query<{
         visitors: string;
         sessions: string;
         completed_assessments: string;
         registered_users: string;
-        uploaded_files: string;
+        uploaded_files?: string;
       }>(
         `SELECT
            (SELECT count(DISTINCT visitor_id)::text FROM analytics_events WHERE occurred_at > now() - $1::interval) AS visitors,
            (SELECT count(*)::text FROM visitor_sessions WHERE started_at > now() - $1::interval) AS sessions,
-           (SELECT count(*)::text FROM assessments WHERE status = 'completed' AND completed_at > now() - $1::interval) AS completed_assessments,
-           (SELECT count(*)::text FROM users WHERE created_at > now() - $1::interval) AS registered_users,
-           (SELECT count(*)::text FROM uploads WHERE created_at > now() - $1::interval) AS uploaded_files`,
-        [interval]
+           (SELECT count(*)::text FROM assessments WHERE product_channel = $2 AND status = 'completed' AND completed_at > now() - $1::interval) AS completed_assessments,
+           (SELECT count(*)::text FROM users WHERE created_at > now() - $1::interval) AS registered_users
+           ${
+             includeMaterialMetrics
+               ? ", (SELECT count(*)::text FROM uploads WHERE created_at > now() - $1::interval) AS uploaded_files"
+               : ""
+           }`,
+        [interval, productChannel]
       ),
       query<{ event_name: string; count: string; users: string }>(
         `SELECT event_name, count(*)::text AS count, count(DISTINCT visitor_id)::text AS users
@@ -758,7 +805,7 @@ export const createApp = (
             "assessment_completed",
             "auth_registered",
             "invite_redeemed",
-            "document_uploaded"
+            ...(includeMaterialMetrics ? ["document_uploaded"] : [])
           ]
         ]
       ),
@@ -771,18 +818,22 @@ export const createApp = (
                 count(DISTINCT a.id)::text AS assessments
            FROM days d
            LEFT JOIN analytics_events e ON e.occurred_at >= d.day AND e.occurred_at < d.day + interval '1 day'
-           LEFT JOIN assessments a ON a.completed_at >= d.day AND a.completed_at < d.day + interval '1 day'
+           LEFT JOIN assessments a ON a.product_channel = $2
+                                  AND a.completed_at >= d.day
+                                  AND a.completed_at < d.day + interval '1 day'
           GROUP BY d.day
           ORDER BY d.day`,
-        [days]
+        [days, productChannel]
       ),
       query(
         `SELECT id, status, current_step, answers->>'city' AS city,
                 answers->>'terminationReason' AS termination_reason,
                 created_at, completed_at
            FROM assessments
+          WHERE product_channel = $1
           ORDER BY created_at DESC
-          LIMIT 8`
+          LIMIT 8`,
+        [productChannel]
       )
     ]);
     response.json({
@@ -805,6 +856,7 @@ export const createApp = (
                 count(DISTINCT r.id)::int AS invite_redemption_count
            FROM users u
            LEFT JOIN assessments a ON a.user_id = u.id
+                                  AND a.product_channel = $4
            LEFT JOIN invite_redemptions r ON r.user_id = u.id
           WHERE ($1 = '' OR coalesce(u.email, '') ILIKE '%' || $1 || '%'
                        OR coalesce(u.phone, '') ILIKE '%' || $1 || '%'
@@ -812,7 +864,7 @@ export const createApp = (
           GROUP BY u.id
           ORDER BY u.created_at DESC
           LIMIT $2 OFFSET $3`,
-        [search, pageSize, offset]
+        [search, pageSize, offset, request.productChannel!]
       ),
       query<{ count: string }>(
         `SELECT count(*)::text AS count
@@ -860,19 +912,20 @@ export const createApp = (
     const status = String(request.query.status || "");
     const [items, total] = await Promise.all([
       query(
-        `SELECT a.id, a.status, a.current_step, a.answers, a.result,
+        `SELECT a.id, a.product_channel, a.status, a.current_step, a.answers, a.result,
                 a.visitor_id, a.session_id, a.completed_at, a.created_at, a.updated_at,
                 u.email, u.phone, u.display_name
            FROM assessments a
            LEFT JOIN users u ON u.id = a.user_id
-          WHERE ($1 = '' OR a.status = $1)
+          WHERE a.product_channel = $4
+            AND ($1 = '' OR a.status = $1)
           ORDER BY a.created_at DESC
           LIMIT $2 OFFSET $3`,
-        [status, pageSize, offset]
+        [status, pageSize, offset, request.productChannel!]
       ),
       query<{ count: string }>(
-        "SELECT count(*)::text AS count FROM assessments WHERE ($1 = '' OR status = $1)",
-        [status]
+        "SELECT count(*)::text AS count FROM assessments WHERE product_channel = $2 AND ($1 = '' OR status = $1)",
+        [status, request.productChannel!]
       )
     ]);
     response.json({
@@ -970,6 +1023,7 @@ export const createApp = (
 
   app.get("/api/admin/events", requireAdmin, async (request, response) => {
     const days = Math.min(365, Math.max(1, Number(request.query.days) || 30));
+    const includeMaterialEvents = request.productChannel === "ai";
     const result = await query(
       `SELECT event_name,
               count(*)::int AS event_count,
@@ -977,8 +1031,13 @@ export const createApp = (
               count(DISTINCT session_id)::int AS session_count,
               min(occurred_at) AS first_seen_at,
               max(occurred_at) AS last_seen_at
-         FROM analytics_events
+        FROM analytics_events
         WHERE occurred_at > now() - ($1 || ' days')::interval
+          ${
+            includeMaterialEvents
+              ? ""
+              : "AND event_name NOT LIKE 'document_%' AND event_name NOT LIKE 'ai_document_%'"
+          }
         GROUP BY event_name
         ORDER BY event_count DESC`,
       [days]
@@ -988,11 +1047,17 @@ export const createApp = (
 
   app.get("/api/admin/audit-logs", requireAdmin, async (request, response) => {
     const { pageSize, offset, page } = parsePagination(request);
+    const includeMaterialAudit = request.productChannel === "ai";
     const result = await query(
       `SELECT l.id, l.action, l.target_type, l.target_id, l.detail, l.ip, l.created_at,
               u.email AS admin_email, u.display_name AS admin_name
          FROM admin_audit_logs l
          LEFT JOIN users u ON u.id = l.admin_user_id
+        ${
+          includeMaterialAudit
+            ? ""
+            : "WHERE COALESCE(l.target_type, '') NOT IN ('upload', 'uploads', 'document') AND l.action NOT LIKE 'upload.%' AND l.action NOT LIKE 'document.%' AND l.action NOT LIKE 'ai_document.%'"
+        }
         ORDER BY l.created_at DESC
         LIMIT $1 OFFSET $2`,
       [pageSize, offset]
@@ -1028,7 +1093,8 @@ export const createApp = (
     });
   });
 
-  app.get("/api/admin/system", requireAdmin, async (_request, response) => {
+  app.get("/api/admin/system", requireAdmin, async (request, response) => {
+    const includeMaterialTables = request.productChannel === "ai";
     const [databaseSize, tableCounts, migration] = await Promise.all([
       query<{ size: string }>("SELECT pg_size_pretty(pg_database_size(current_database())) AS size"),
       query<{ name: string; count: string }>(
@@ -1037,7 +1103,11 @@ export const createApp = (
              SELECT 'users' AS name, count(*)::text AS count FROM users
              UNION ALL SELECT 'assessments', count(*)::text FROM assessments
              UNION ALL SELECT 'analytics_events', count(*)::text FROM analytics_events
-             UNION ALL SELECT 'uploads', count(*)::text FROM uploads
+             ${
+               includeMaterialTables
+                 ? "UNION ALL SELECT 'uploads', count(*)::text FROM uploads"
+                 : ""
+             }
              UNION ALL SELECT 'invite_codes', count(*)::text FROM invite_codes
            ) counts`
       ),
