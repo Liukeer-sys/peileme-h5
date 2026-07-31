@@ -506,4 +506,261 @@ describe("payment evidence full-content digest", () => {
     expect(sanitizePaymentEvidence(evidence)).toEqual({ safe: "kept" });
     expect(getterCalls).toBe(0);
   });
+
+  it("replaces PostgreSQL-unsafe text while preserving valid Unicode", () => {
+    const evidence = Object.create(null) as Record<string, unknown>;
+    evidence.legalUnicode = "支付成功😀 café";
+    evidence.nulText = "before\0after";
+    evidence.highSurrogate = "before\ud800after";
+    evidence.lowSurrogate = "before\udc00after";
+    Object.defineProperty(evidence, "unsafe\0\ud800key", {
+      value: "kept",
+      enumerable: true
+    });
+
+    expect(sanitizePaymentEvidence(evidence)).toEqual({
+      legalUnicode: "支付成功😀 café",
+      nulText: "before�after",
+      highSurrogate: "before�after",
+      lowSurrogate: "before�after",
+      "unsafe��key": "kept"
+    });
+  });
+
+  it("filters precise payment PII tokens without erasing audit status fields", () => {
+    const sanitized = sanitizePaymentEvidence({
+      buyer_user_id: "buyer-user-secret",
+      buyer_logon_id: "buyer-logon-secret",
+      openId: "openid-secret",
+      unionId: "unionid-secret",
+      account_no: "account-secret",
+      bank_account_no: "bank-account-secret",
+      mobile: "mobile-secret",
+      identity_no: "identity-secret",
+      passphrase: "passphrase-secret",
+      cvv: "cvv-secret",
+      microphone_status: "enabled",
+      tokenization_status: "complete",
+      name: "provider-audit",
+      key: "provider-audit-key"
+    });
+
+    expect(sanitized).toEqual({
+      microphone_status: "enabled",
+      tokenization_status: "complete",
+      name: "provider-audit",
+      key: "provider-audit-key"
+    });
+  });
+
+  it("does not execute getters on proxy-provided descriptor objects", () => {
+    let descriptorGetterCalls = 0;
+    let outerDescriptorCalls = 0;
+    const descriptorResult = Object.create(null) as Record<string, unknown>;
+    for (const [key, value] of [
+      ["enumerable", true],
+      ["configurable", true],
+      ["writable", true],
+      ["value", "descriptor-secret"]
+    ] as const) {
+      Object.defineProperty(descriptorResult, key, {
+        enumerable: true,
+        get: () => {
+          descriptorGetterCalls += 1;
+          return value;
+        }
+      });
+    }
+    const target = {};
+    Object.defineProperty(target, "safe", {
+      value: "target-value",
+      enumerable: true,
+      configurable: true
+    });
+    const evidence = new Proxy(target, {
+      ownKeys: () => ["safe"],
+      getOwnPropertyDescriptor: () => {
+        outerDescriptorCalls += 1;
+        return descriptorResult;
+      }
+    });
+
+    const first = hashOf(evidence);
+    expect(hashOf(evidence)).toBe(first);
+    expect(outerDescriptorCalls).toBe(0);
+    expect(descriptorGetterCalls).toBe(0);
+  });
+
+  it("does not execute get/set getters on proxy accessor descriptors", () => {
+    let descriptorGetterCalls = 0;
+    const descriptorResult = Object.create(null) as Record<string, unknown>;
+    for (const key of ["enumerable", "configurable", "get", "set"] as const) {
+      Object.defineProperty(descriptorResult, key, {
+        enumerable: true,
+        get: () => {
+          descriptorGetterCalls += 1;
+          if (key === "enumerable" || key === "configurable") return true;
+          return undefined;
+        }
+      });
+    }
+    const target = {};
+    Object.defineProperty(target, "safe", {
+      value: "target-value",
+      enumerable: true,
+      configurable: true
+    });
+    const evidence = new Proxy(target, {
+      ownKeys: () => ["safe"],
+      getOwnPropertyDescriptor: () => descriptorResult
+    });
+
+    const first = hashOf(evidence);
+    expect(hashOf(evidence)).toBe(first);
+    expect(descriptorGetterCalls).toBe(0);
+  });
+
+  it("hashes Map entries through captured intrinsics across realms", () => {
+    expectDistinctStableHashes(
+      { oversized: "x".repeat(5_000), value: new Map([["key", "A"]]) },
+      { oversized: "x".repeat(5_000), value: new Map([["key", "B"]]) }
+    );
+    expectDistinctStableHashes(
+      {
+        oversized: "x".repeat(5_000),
+        value: runInNewContext("new Map([['key', 'A']])")
+      },
+      {
+        oversized: "x".repeat(5_000),
+        value: runInNewContext("new Map([['key', 'B']])")
+      }
+    );
+  });
+
+  it("hashes Set entries through captured intrinsics across realms", () => {
+    expectDistinctStableHashes(
+      { oversized: "x".repeat(5_000), value: new Set(["A"]) },
+      { oversized: "x".repeat(5_000), value: new Set(["B"]) }
+    );
+    expectDistinctStableHashes(
+      {
+        oversized: "x".repeat(5_000),
+        value: runInNewContext("new Set(['A'])")
+      },
+      {
+        oversized: "x".repeat(5_000),
+        value: runInNewContext("new Set(['B'])")
+      }
+    );
+  });
+
+  it("hashes self-referential and instance-shadowed collections safely", () => {
+    let shadowGetterCalls = 0;
+    const left = new Map<unknown, unknown>();
+    left.set("self", left);
+    left.set("value", "A");
+    Object.defineProperty(left, "entries", {
+      enumerable: true,
+      get: () => {
+        shadowGetterCalls += 1;
+        throw new Error("shadowed entries must not run");
+      }
+    });
+    const right = new Map<unknown, unknown>();
+    right.set("self", right);
+    right.set("value", "B");
+    Object.defineProperty(right, "entries", {
+      enumerable: true,
+      get: () => {
+        shadowGetterCalls += 1;
+        throw new Error("shadowed entries must not run");
+      }
+    });
+
+    expectDistinctStableHashes(
+      { oversized: "x".repeat(5_000), value: left },
+      { oversized: "x".repeat(5_000), value: right }
+    );
+    expect(shadowGetterCalls).toBe(0);
+
+    let proxyGetCalls = 0;
+    const proxied = new Proxy(new Set(["secret"]), {
+      get: () => {
+        proxyGetCalls += 1;
+        throw new Error("collection proxy get must not run");
+      }
+    });
+    const first = hashOf({ oversized: "x".repeat(5_000), value: proxied });
+    expect(
+      hashOf({ oversized: "x".repeat(5_000), value: proxied })
+    ).toBe(first);
+    expect(proxyGetCalls).toBe(0);
+  });
+
+  it("preserves prototype-shaped own keys without prototype mutation", () => {
+    const evidence = Object.create(null) as Record<string, unknown>;
+    Object.defineProperty(evidence, "__proto__", {
+      value: { polluted: true },
+      enumerable: true
+    });
+    Object.defineProperties(evidence, {
+      constructor: {
+        value: "constructor-audit",
+        enumerable: true
+      },
+      prototype: {
+        value: "prototype-audit",
+        enumerable: true
+      }
+    });
+
+    const sanitized = sanitizePaymentEvidence(evidence) as Record<
+      string,
+      unknown
+    >;
+    expect(Object.getPrototypeOf(sanitized)).toBeNull();
+    expect(Object.getOwnPropertyDescriptor(sanitized, "__proto__")?.value)
+      .toEqual({ polluted: true });
+    expect(sanitized.constructor).toBe("constructor-audit");
+    expect(sanitized.prototype).toBe("prototype-audit");
+    expect(({} as { polluted?: boolean }).polluted).toBeUndefined();
+  });
+
+  it("hashes maximum-length sparse arrays in bounded time", () => {
+    const evidence = new Array<unknown>(2 ** 32 - 1);
+    evidence[2 ** 32 - 2] = "tail";
+    Object.defineProperty(evidence, "meta", {
+      value: "kept",
+      enumerable: true
+    });
+
+    const startedAt = performance.now();
+    const first = hashOf(evidence);
+    const elapsedMs = performance.now() - startedAt;
+
+    expect(elapsedMs).toBeLessThan(1_500);
+    expect(hashOf(evidence)).toBe(first);
+  });
+
+  it("distinguishes sparse present indices and extra own keys", () => {
+    const atStart = new Array<unknown>(51);
+    const atEnd = new Array<unknown>(51);
+    atStart[0] = "present";
+    atEnd[50] = "present";
+    expectDistinctStableHashes(atStart, atEnd);
+
+    const alpha = new Array<unknown>(51);
+    const beta = new Array<unknown>(51);
+    Object.defineProperty(alpha, "alpha", { value: "present" });
+    Object.defineProperty(beta, "beta", { value: "present" });
+    expectDistinctStableHashes(alpha, beta);
+  });
+
+  it("distinguishes sparse holes from explicit undefined", () => {
+    const hole = new Array<unknown>(51);
+    const explicitUndefined = new Array<unknown>(51);
+    explicitUndefined[25] = undefined;
+
+    expectDistinctStableHashes(hole, explicitUndefined);
+  });
 });

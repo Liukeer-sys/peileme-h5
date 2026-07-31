@@ -822,6 +822,125 @@ describe("Task 4 real payment migration contract (RED)", () => {
       )
     ).toBe(true);
   });
+
+  it("creates one idempotent refund payment-transaction reverse index", async () => {
+    await withPre011Database(async (client, databaseUrl) => {
+      const firstRun = await runMigrationProcess(databaseUrl);
+      expect(firstRun).toMatchObject({ status: 0, stderr: "" });
+      const secondRun = await runMigrationProcess(databaseUrl);
+      expect(secondRun).toMatchObject({ status: 0, stderr: "" });
+      const indexes = await client.query<{
+        indexname: string;
+        indexdef: string;
+      }>(
+        `SELECT indexname, indexdef
+           FROM pg_indexes
+          WHERE schemaname = 'public'
+            AND tablename = 'refunds'
+            AND indexname = 'refunds_payment_transaction_idx'`
+      );
+
+      expect(indexes.rows).toHaveLength(1);
+      expect(indexes.rows[0]?.indexdef).toMatch(
+        /CREATE INDEX refunds_payment_transaction_idx .*\(payment_transaction_id\)/i
+      );
+    });
+  });
+
+  it("uses the refund payment-transaction reverse index with unrelated refunds", async () => {
+    await withPre011Database(async (client, databaseUrl) => {
+      const userId = await createLegacyUser(client, "refund-reverse-index");
+      const createPaidFact = async (suffix: string) => {
+        const orderId = await createLegacyOrder(
+          client,
+          userId,
+          `REFUNDIDX${suffix}`,
+          "PAID"
+        );
+        const attemptId = await createLegacyAttempt(client, {
+          orderId,
+          channel: "wechat_h5",
+          status: "SUCCEEDED",
+          requestSnapshot: { orderNo: `WXREFUNDIDX${suffix}` }
+        });
+        const transaction = await client.query<{ id: string }>(
+          `INSERT INTO payment_transactions(
+             order_id,
+             payment_attempt_id,
+             channel,
+             channel_transaction_id,
+             amount_fen,
+             currency,
+             status,
+             verified_payload,
+             paid_at
+           )
+           VALUES ($1, $2, 'wechat_h5', $3, 100, 'CNY', 'SUCCESS', '{}'::jsonb, now())
+           RETURNING id`,
+          [orderId, attemptId, `WX-TXN-REFUND-IDX-${suffix}`]
+        );
+        return { orderId, transactionId: transaction.rows[0].id };
+      };
+
+      const target = await createPaidFact("TARGET");
+      const unrelated = await createPaidFact("OTHER");
+      await client.query(
+        `INSERT INTO refunds(
+           refund_no,
+           order_id,
+           channel,
+           amount_fen,
+           reason,
+           status
+         )
+         VALUES ('REFUND-IDX-TARGET', $1, 'wechat_h5', 100, 'reverse index target', 'PENDING')`,
+        [target.orderId]
+      );
+      await client.query(
+        `INSERT INTO refunds(
+           refund_no,
+           order_id,
+           channel,
+           amount_fen,
+           reason,
+           status
+         )
+         SELECT 'REFUND-IDX-OTHER-' || value::text,
+                $1,
+                'wechat_h5',
+                100,
+                'reverse index unrelated',
+                'PENDING'
+           FROM generate_series(1, 10000) AS value`,
+        [unrelated.orderId]
+      );
+
+      const firstRun = await runMigrationProcess(databaseUrl, 30_000);
+      expect(firstRun).toMatchObject({ status: 0, stderr: "" });
+      const secondRun = await runMigrationProcess(databaseUrl, 30_000);
+      expect(secondRun).toMatchObject({ status: 0, stderr: "" });
+
+      const indexCount = await client.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+           FROM pg_indexes
+          WHERE schemaname = 'public'
+            AND tablename = 'refunds'
+            AND indexname = 'refunds_payment_transaction_idx'`
+      );
+      await client.query("ANALYZE refunds");
+      const explained = await client.query<{ "QUERY PLAN": unknown }>(
+        `EXPLAIN (FORMAT JSON)
+         SELECT id
+           FROM refunds
+          WHERE payment_transaction_id = $1`,
+        [target.transactionId]
+      );
+      expect(JSON.stringify(explained.rows[0]["QUERY PLAN"])).toContain(
+        "refunds_payment_transaction_idx"
+      );
+      expect(indexCount.rows).toEqual([{ count: "1" }]);
+    });
+  }, 45_000);
 });
 
 describe("Task 4 real payment migration behavior (RED)", () => {

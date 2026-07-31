@@ -249,7 +249,28 @@ const paymentSensitiveSentinels = () => ({
   accountNumber: `AccountNumber-${randomUUID()}`,
   certificate: `Certificate-${randomUUID()}`,
   privateCertificate: `PrivateCertificate-${randomUUID()}`,
-  sessionKey: `SessionKey-${randomUUID()}`
+  sessionKey: `SessionKey-${randomUUID()}`,
+  buyerLogonId: `BuyerLogonId-${randomUUID()}`,
+  buyerUserId: `BuyerUserId-${randomUUID()}`,
+  mobile: `Mobile-${randomUUID()}`,
+  address: `Address-${randomUUID()}`,
+  unionid: `UnionId-${randomUUID()}`,
+  certNo: `CertNo-${randomUUID()}`,
+  cvv: `Cvv-${randomUUID()}`,
+  cvv2: `Cvv2-${randomUUID()}`,
+  cvc: `Cvc-${randomUUID()}`,
+  cvc2: `Cvc2-${randomUUID()}`,
+  pin: `Pin-${randomUUID()}`,
+  buyerAccount: `BuyerAccount-${randomUUID()}`,
+  payerAccount: `PayerAccount-${randomUUID()}`,
+  bankAccount: `BankAccount-${randomUUID()}`,
+  bankAccountNo: `BankAccountNo-${randomUUID()}`,
+  accountNo: `AccountNo-${randomUUID()}`,
+  identityNo: `IdentityNo-${randomUUID()}`,
+  passphrase: `Passphrase-${randomUUID()}`,
+  certNumber: `CertNumber-${randomUUID()}`,
+  clientIp: `ClientIp-${randomUUID()}`,
+  spbillCreateIp: `SpbillCreateIp-${randomUUID()}`
 });
 
 const paymentSensitiveFields = (
@@ -282,8 +303,61 @@ const paymentSensitiveFields = (
   accountNumber: sentinels.accountNumber,
   certificate: sentinels.certificate,
   private_certificate: sentinels.privateCertificate,
-  session_key: sentinels.sessionKey
+  session_key: sentinels.sessionKey,
+  buyer_logon_id: sentinels.buyerLogonId,
+  buyer_user_id: sentinels.buyerUserId,
+  mobile: sentinels.mobile,
+  shipping_address: sentinels.address,
+  unionid: sentinels.unionid,
+  cert_no: sentinels.certNo,
+  cvv: sentinels.cvv,
+  cvv2: sentinels.cvv2,
+  cvc: sentinels.cvc,
+  cvc2: sentinels.cvc2,
+  pin: sentinels.pin,
+  buyer_account: sentinels.buyerAccount,
+  payer_account: sentinels.payerAccount,
+  bank_account: sentinels.bankAccount,
+  bank_account_no: sentinels.bankAccountNo,
+  account_no: sentinels.accountNo,
+  identity_no: sentinels.identityNo,
+  passphrase: sentinels.passphrase,
+  cert_number: sentinels.certNumber,
+  client_ip: sentinels.clientIp,
+  spbill_create_ip: sentinels.spbillCreateIp
 });
+
+const paymentAuditFields = (prefix: "create" | "verify") => ({
+  app_id: `${prefix}-app-id`,
+  seller_id: `${prefix}-seller-id`,
+  out_trade_no: `${prefix}-out-trade-no`,
+  transaction_id: `${prefix}-transaction-id`,
+  trade_no: `${prefix}-trade-no`,
+  total_amount: "100.00",
+  amount: "100.00",
+  trade_status: "TRADE_SUCCESS",
+  status: "SUCCESS",
+  provider_order_no: `${prefix}-provider-order-no`,
+  name: `${prefix}-audit-name`,
+  key: `${prefix}-audit-key`,
+  microphone_status: "enabled",
+  tokenization_status: "complete",
+  shipping: "standard"
+});
+
+const paymentUnicodeEvidence = () => ({
+  legalUnicode: "支付成功😀 café",
+  nulText: "before\0after",
+  highSurrogate: "before\ud800after",
+  lowSurrogate: "before\udc00after"
+});
+
+const expectedPaymentUnicodeEvidence = {
+  legalUnicode: "支付成功😀 café",
+  nulText: "before�after",
+  highSurrogate: "before�after",
+  lowSurrogate: "before�after"
+};
 
 const emptyClosedRecoverySummary = () => ({
   scannedCount: 0,
@@ -2653,11 +2727,13 @@ describe("atomic commerce orders and payments", () => {
         returnUrl: "https://peileme.test/return",
         notifyUrl: "https://peileme.test/notify",
         provider: paymentProviderWithResponse({
-          safe: { code: "CREATE_OK" },
+          safe: {
+            code: "CREATE_OK",
+            unicode: paymentUnicodeEvidence()
+          },
           nested: {
             publicStatus: "accepted",
-            name: "provider-create-audit",
-            key: "create-audit-key",
+            audit: paymentAuditFields("create"),
             providerDetails: paymentSensitiveFields(sentinels)
           }
         })
@@ -2669,11 +2745,13 @@ describe("atomic commerce orders and payments", () => {
         [order.id]
       );
       expect(persisted.rows[0].response_snapshot).toEqual({
-        safe: { code: "CREATE_OK" },
+        safe: {
+          code: "CREATE_OK",
+          unicode: expectedPaymentUnicodeEvidence
+        },
         nested: {
           publicStatus: "accepted",
-          name: "provider-create-audit",
-          key: "create-audit-key",
+          audit: paymentAuditFields("create"),
           providerDetails: {}
         }
       });
@@ -2718,10 +2796,12 @@ describe("atomic commerce orders and payments", () => {
           currency: "CNY",
           paidAt: new Date().toISOString(),
           raw: {
-            safe: { providerState: "paid" },
+            safe: {
+              providerState: "paid",
+              unicode: paymentUnicodeEvidence()
+            },
             nested: {
-              name: "provider-verify-audit",
-              key: "verify-audit-key",
+              audit: paymentAuditFields("verify"),
               providerDetails: paymentSensitiveFields(sentinels)
             }
           }
@@ -2732,12 +2812,17 @@ describe("atomic commerce orders and payments", () => {
         amount_fen: string;
         currency: string;
         verified_payload: unknown;
+        order_status: string;
+        entitlements: string;
       }>(
         `SELECT
            channel_transaction_id,
            amount_fen,
            currency,
-           verified_payload
+           verified_payload,
+           (SELECT status FROM orders WHERE id = $1) AS order_status,
+           (SELECT count(*)::text FROM entitlements WHERE source_id = $1)
+             AS entitlements
          FROM payment_transactions
          WHERE order_id = $1`,
         [order.id]
@@ -2746,11 +2831,15 @@ describe("atomic commerce orders and payments", () => {
         channel_transaction_id: channelTransactionId,
         amount_fen: order.amountFen,
         currency: "CNY",
+        order_status: "COMPLETED",
+        entitlements: "1",
         verified_payload: {
-          safe: { providerState: "paid" },
+          safe: {
+            providerState: "paid",
+            unicode: expectedPaymentUnicodeEvidence
+          },
           nested: {
-            name: "provider-verify-audit",
-            key: "verify-audit-key",
+            audit: paymentAuditFields("verify"),
             providerDetails: {}
           }
         }

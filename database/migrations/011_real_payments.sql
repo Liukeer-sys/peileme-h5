@@ -830,6 +830,9 @@ ALTER TABLE refunds
     )
   );
 
+CREATE INDEX refunds_payment_transaction_idx
+  ON refunds(payment_transaction_id);
+
 CREATE FUNCTION refund_payment_fact_guard()
 RETURNS trigger
 LANGUAGE plpgsql
