@@ -333,6 +333,341 @@ describe("migration concurrency", () => {
   );
 
   it(
+    "backfills only the latest legacy CLOSED attempt per order and channel for bounded recovery",
+    async () => {
+      const baseUrl = new URL(process.env.DATABASE_URL!);
+      const databaseName =
+        `peileme_payment_upgrade_${randomUUID().replaceAll("-", "")}`;
+      const adminUrl = new URL(baseUrl);
+      adminUrl.pathname = "/postgres";
+      const databaseUrl = new URL(baseUrl);
+      databaseUrl.pathname = `/${databaseName}`;
+      const admin = new Client({ connectionString: adminUrl.toString() });
+      let databaseCreated = false;
+      const previousDatabaseUrl = process.env.DATABASE_URL;
+      let closeDynamicPool: (() => Promise<void>) | undefined;
+      let resetDynamicConfig: (() => void) | undefined;
+      try {
+        await admin.connect();
+        await admin.query(`CREATE DATABASE "${databaseName}"`);
+        databaseCreated = true;
+
+        const setup = new Client({ connectionString: databaseUrl.toString() });
+        await setup.connect();
+        let orderId = "";
+        let orderNo = "";
+        let amountFen = "";
+        try {
+          for (const version of [
+            "001_initial.sql",
+            "002_policy_foundation.sql",
+            "003_policy_parameter_provenance.sql",
+            "004_refresh_session_rotation.sql",
+            "005_remove_document_review_grants.sql",
+            "006_policy_result_shares.sql",
+            "007_policy_rule_regressions.sql",
+            "008_commerce.sql"
+          ]) {
+            const sql = await readFile(
+              path.resolve("database/migrations", version),
+              "utf8"
+            );
+            await setup.query(sql);
+            await setup.query(
+              `INSERT INTO schema_migrations(version)
+               VALUES ($1)
+               ON CONFLICT DO NOTHING`,
+              [version]
+            );
+          }
+          const legacy = await setup.query<{
+            id: string;
+            order_no: string;
+            total_fen: string;
+          }>(
+            `WITH legacy_user AS (
+               INSERT INTO users(email, email_verified_at)
+               VALUES ('legacy-payment@peileme.test', now())
+               RETURNING id
+             ),
+             legacy_product AS (
+               INSERT INTO products(
+                 sku,
+                 name,
+                 description,
+                 product_channel,
+                 fulfillment_type,
+                 status,
+                 entitlement_policy
+               )
+               VALUES (
+                 'POLICY_CALC',
+                 '政策计算',
+                 '升级恢复测试',
+                 'main',
+                 'policy_calculation',
+                 'active',
+                 '{"grantCount":1}'::jsonb
+               )
+               RETURNING id
+             ),
+             legacy_order AS (
+               INSERT INTO orders(
+                 order_no,
+                 user_id,
+                 product_channel,
+                 status,
+                 total_fen,
+                 currency,
+                 idempotency_key,
+                 expires_at,
+                 closed_at,
+                 created_at
+               )
+               SELECT
+                 'PLMLEGACYUPGRADE',
+                 legacy_user.id,
+                 'main',
+                 'CLOSED',
+                 990,
+                 'CNY',
+                 'legacy-payment-upgrade',
+                 now() - interval '1 minute',
+                 now(),
+                 now() - interval '10 minutes'
+               FROM legacy_user
+               RETURNING id, order_no, total_fen
+             ),
+             legacy_item AS (
+               INSERT INTO order_items(
+                 order_id,
+                 product_id,
+                 sku,
+                 product_name,
+                 unit_price_fen,
+                 quantity,
+                 entitlement_policy
+               )
+               SELECT
+                 legacy_order.id,
+                 legacy_product.id,
+                 'POLICY_CALC',
+                 '政策计算',
+                 legacy_order.total_fen,
+                 1,
+                 '{"grantCount":1}'::jsonb
+               FROM legacy_order, legacy_product
+             ),
+             old_fake_attempt AS (
+               INSERT INTO payment_attempts(
+                 order_id,
+                 channel,
+                 status,
+                 created_at,
+                 updated_at
+               )
+               SELECT
+                 id,
+                 'fake',
+                 'CLOSED',
+                 now() - interval '3 minutes',
+                 now() - interval '3 minutes'
+               FROM legacy_order
+             ),
+             latest_fake_attempt AS (
+               INSERT INTO payment_attempts(
+                 order_id,
+                 channel,
+                 status,
+                 created_at,
+                 updated_at
+               )
+               SELECT
+                 id,
+                 'fake',
+                 'CLOSED',
+                 now() - interval '2 minutes',
+                 now() - interval '2 minutes'
+               FROM legacy_order
+             ),
+             latest_alipay_attempt AS (
+               INSERT INTO payment_attempts(
+                 order_id,
+                 channel,
+                 status,
+                 created_at,
+                 updated_at
+               )
+               SELECT
+                 id,
+                 'alipay_wap',
+                 'PENDING',
+                 now() - interval '1 minute',
+                 now() - interval '1 minute'
+               FROM legacy_order
+             )
+             SELECT id, order_no, total_fen
+             FROM legacy_order`
+          );
+          orderId = legacy.rows[0].id;
+          orderNo = legacy.rows[0].order_no;
+          amountFen = legacy.rows[0].total_fen;
+        } finally {
+          await setup.end();
+        }
+
+        const migrated = await runMigrationProcess(databaseUrl.toString());
+        expect(migrated.status, `${migrated.stdout}\n${migrated.stderr}`).toBe(
+          0
+        );
+
+        const verify = new Client({ connectionString: databaseUrl.toString() });
+        await verify.connect();
+        try {
+          const attempts = await verify.query<{
+            channel: string;
+            reconciliation_state: string;
+          }>(
+            `SELECT channel, reconciliation_state
+             FROM payment_attempts
+             WHERE order_id = $1
+             ORDER BY channel, created_at`,
+            [orderId]
+          );
+          expect(attempts.rows).toEqual([
+            {
+              channel: "alipay_wap",
+              reconciliation_state: "REQUIRED"
+            },
+            {
+              channel: "fake",
+              reconciliation_state: "NONE"
+            },
+            {
+              channel: "fake",
+              reconciliation_state: "REQUIRED"
+            }
+          ]);
+          await expect(
+            verify.query(
+              `UPDATE payment_attempts
+               SET reconciliation_state = 'RETRY_SCHEDULED',
+                   reconciliation_next_at = now(),
+                   reconciliation_deadline_at = now() + interval '1 hour',
+                   reconciliation_last_result = 'QUERY_ERROR'
+               WHERE order_id = $1
+                 AND channel = 'fake'
+                 AND reconciliation_state = 'NONE'`,
+              [orderId]
+            )
+          ).rejects.toMatchObject({
+            constraint:
+              "payment_attempts_one_scheduled_reconciliation_per_channel"
+          });
+          await verify.query(
+            `UPDATE payment_attempts
+             SET reconciliation_next_at = now() - interval '1 second'
+             WHERE order_id = $1
+               AND channel = 'fake'
+               AND reconciliation_state = 'REQUIRED'`,
+            [orderId]
+          );
+        } finally {
+          await verify.end();
+        }
+
+        process.env.DATABASE_URL = databaseUrl.toString();
+        const [{ resetConfigForTests }, { closePool }, { reconcileAndCloseExpiredOrders }] =
+          await Promise.all([
+            import("../config.js"),
+            import("../db.js"),
+            import("../modules/commerce/orders.js")
+          ]);
+        closeDynamicPool = closePool;
+        resetDynamicConfig = resetConfigForTests;
+        resetConfigForTests();
+        const recovered = await reconcileAndCloseExpiredOrders({
+          provider: {
+            channel: "fake",
+            async createPayment() {
+              throw new Error("upgrade probe must not create");
+            },
+            async queryPayment(queriedOrderNo: string) {
+              return {
+                orderNo: queriedOrderNo,
+                channel: "fake",
+                channelTransactionId: `legacy-paid-${randomUUID()}`,
+                amountFen,
+                currency: "CNY",
+                paidAt: new Date(Date.now() - 2 * 60_000).toISOString(),
+                raw: { source: "legacy-upgrade-probe" }
+              };
+            },
+            async refund() {
+              return { channelRefundId: "unused", raw: {} };
+            }
+          },
+          limit: 5,
+          providerQueryBudget: 5,
+          providerTimeoutMs: 100
+        });
+        expect(recovered.summary).toMatchObject({
+          providerConfirmedPaidCount: 1,
+          closedRecovery: {
+            recoveredCount: 1
+          }
+        });
+        expect(orderNo).toBe("PLMLEGACYUPGRADE");
+        const recoveredState = new Client({
+          connectionString: databaseUrl.toString()
+        });
+        await recoveredState.connect();
+        try {
+          const state = await recoveredState.query<{
+            status: string;
+            transactions: string;
+            entitlements: string;
+          }>(
+            `SELECT
+               o.status,
+               (SELECT count(*)::text
+                  FROM payment_transactions
+                 WHERE order_id = o.id) AS transactions,
+               (SELECT count(*)::text
+                  FROM entitlements
+                 WHERE source_id = o.id) AS entitlements
+             FROM orders o
+             WHERE o.id = $1`,
+            [orderId]
+          );
+          expect(state.rows[0]).toEqual({
+            status: "COMPLETED",
+            transactions: "1",
+            entitlements: "1"
+          });
+        } finally {
+          await recoveredState.end();
+        }
+      } finally {
+        if (closeDynamicPool) await closeDynamicPool();
+        if (resetDynamicConfig) resetDynamicConfig();
+        process.env.DATABASE_URL = previousDatabaseUrl;
+        if (databaseCreated) {
+          await admin.query(
+            `SELECT pg_terminate_backend(pid)
+             FROM pg_stat_activity
+             WHERE datname = $1 AND pid <> pg_backend_pid()`,
+            [databaseName]
+          );
+          await admin.query(`DROP DATABASE IF EXISTS "${databaseName}"`);
+        }
+        await admin.end();
+      }
+    },
+    20_000
+  );
+
+  it(
     "serializes two migration processes against one clean database",
     async () => {
       const baseUrl = new URL(process.env.DATABASE_URL!);

@@ -1086,64 +1086,104 @@ export const reconcileAndCloseExpiredOrders = async (input: {
 
   if (provider) {
     const candidates = await query<ReconciliationCandidate>(
-      `SELECT
-         o.id,
-         o.order_no,
-         o.status,
-         o.expires_at,
-         attempt.id AS attempt_id,
-         attempt.channel AS attempt_channel,
-         attempt.reconciliation_state,
-         attempt.reconciliation_attempt_count,
-         attempt.reconciliation_no_payment_count,
-         attempt.reconciliation_query_error_count,
-         attempt.reconciliation_next_at,
-         attempt.reconciliation_deadline_at
-       FROM orders o
-       JOIN LATERAL (
+      `WITH closed_due AS MATERIALIZED (
          SELECT
-           id,
-           channel,
-           updated_at,
-           reconciliation_state,
-           reconciliation_attempt_count,
-           reconciliation_no_payment_count,
-           reconciliation_query_error_count,
-           reconciliation_next_at,
-           reconciliation_deadline_at
-         FROM payment_attempts
-         WHERE order_id = o.id
-           AND channel = $2
-         ORDER BY created_at DESC, id DESC
-         LIMIT 1
-       ) attempt ON true
-       WHERE o.expires_at <= now()
-         AND attempt.channel = $2
-         AND (
-           o.status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED')
-           OR (
-             o.status = 'CLOSED'
-             AND attempt.reconciliation_state IN (
-               'REQUIRED',
-               'RETRY_SCHEDULED'
-             )
-             AND (
-               attempt.reconciliation_next_at <= now()
-               OR attempt.reconciliation_deadline_at <= now()
-             )
+           o.id,
+           o.order_no,
+           o.status,
+           o.expires_at,
+           attempt.id AS attempt_id,
+           attempt.channel AS attempt_channel,
+           attempt.reconciliation_state,
+           attempt.reconciliation_attempt_count,
+           attempt.reconciliation_no_payment_count,
+           attempt.reconciliation_query_error_count,
+           attempt.reconciliation_next_at,
+           attempt.reconciliation_deadline_at,
+           LEAST(
+             attempt.reconciliation_next_at,
+             attempt.reconciliation_deadline_at
+           ) AS candidate_at
+         FROM payment_attempts attempt
+         JOIN orders o ON o.id = attempt.order_id
+         WHERE attempt.channel = $2
+           AND attempt.reconciliation_state IN (
+             'REQUIRED',
+             'RETRY_SCHEDULED'
            )
-         )
-       ORDER BY
-         CASE
-           WHEN o.status = 'CLOSED'
-             THEN LEAST(
-               attempt.reconciliation_next_at,
-               attempt.reconciliation_deadline_at
-             )
-           ELSE attempt.updated_at
-         END,
-         o.expires_at,
-         o.id
+           AND (
+             attempt.reconciliation_next_at <= now()
+             OR attempt.reconciliation_deadline_at <= now()
+           )
+           AND o.status = 'CLOSED'
+           AND o.expires_at <= now()
+         ORDER BY
+           LEAST(
+             attempt.reconciliation_next_at,
+             attempt.reconciliation_deadline_at
+           ),
+           attempt.updated_at,
+           attempt.id
+         LIMIT $1
+       ),
+       open_due AS MATERIALIZED (
+         SELECT
+           o.id,
+           o.order_no,
+           o.status,
+           o.expires_at,
+           attempt.id AS attempt_id,
+           attempt.channel AS attempt_channel,
+           attempt.reconciliation_state,
+           attempt.reconciliation_attempt_count,
+           attempt.reconciliation_no_payment_count,
+           attempt.reconciliation_query_error_count,
+           attempt.reconciliation_next_at,
+           attempt.reconciliation_deadline_at,
+           attempt.updated_at AS candidate_at
+         FROM orders o
+         JOIN LATERAL (
+           SELECT
+             id,
+             channel,
+             updated_at,
+             reconciliation_state,
+             reconciliation_attempt_count,
+             reconciliation_no_payment_count,
+             reconciliation_query_error_count,
+             reconciliation_next_at,
+             reconciliation_deadline_at
+           FROM payment_attempts
+           WHERE order_id = o.id
+             AND channel = $2
+           ORDER BY created_at DESC, id DESC
+           LIMIT 1
+         ) attempt ON true
+         WHERE o.expires_at <= now()
+           AND o.status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED')
+         ORDER BY attempt.updated_at, o.expires_at, o.id
+         LIMIT $1
+       ),
+       provider_candidates AS (
+         SELECT * FROM closed_due
+         UNION ALL
+         SELECT * FROM open_due
+       )
+       SELECT
+         id,
+         order_no,
+         status,
+         expires_at,
+         attempt_id,
+         attempt_channel,
+         reconciliation_state,
+         reconciliation_attempt_count,
+         reconciliation_no_payment_count,
+         reconciliation_query_error_count,
+         reconciliation_next_at,
+         reconciliation_deadline_at
+       FROM provider_candidates
+       ORDER BY candidate_at, expires_at, id
        LIMIT $1`,
       [providerQueryBudget, providerChannel]
     );
@@ -1525,66 +1565,65 @@ export const reconcileAndCloseExpiredOrders = async (input: {
     const moreCandidates = await client.query<{ has_more: boolean }>(
       `SELECT EXISTS (
          SELECT 1
-         FROM orders o
-         LEFT JOIN LATERAL (
-           SELECT id
-           FROM payment_attempts
-           WHERE order_id = o.id
-           ORDER BY created_at DESC, id DESC
-           LIMIT 1
-         ) latest_attempt ON true
-         LEFT JOIN LATERAL (
-           SELECT
-             id,
-             channel,
-             reconciliation_state,
-             reconciliation_next_at,
-             reconciliation_deadline_at
-           FROM payment_attempts
-           WHERE order_id = o.id
-             AND channel = $1
-           ORDER BY created_at DESC, id DESC
-           LIMIT 1
-         ) channel_attempt ON $1::text IS NOT NULL
-         WHERE o.expires_at <= now()
-           AND (
-             (o.status = 'CREATED' AND latest_attempt.id IS NULL)
-             OR (
-               $1::text IS NOT NULL
-               AND channel_attempt.channel = $1
-               AND (
-                 o.status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED')
-                 OR (
-                   o.status = 'CLOSED'
-                   AND channel_attempt.reconciliation_state IN (
-                     'REQUIRED',
-                     'RETRY_SCHEDULED'
-                   )
-                   AND (
-                     channel_attempt.reconciliation_next_at <= now()
-                     OR channel_attempt.reconciliation_deadline_at <= now()
-                   )
-                 )
+         FROM (
+           (
+             SELECT o.id
+             FROM orders o
+             WHERE o.expires_at <= now()
+               AND o.status = 'CREATED'
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM payment_attempts
+                 WHERE payment_attempts.order_id = o.id
                )
-             )
+             LIMIT 1
            )
+           UNION ALL
+           (
+             SELECT o.id
+             FROM orders o
+             JOIN LATERAL (
+               SELECT id
+               FROM payment_attempts
+               WHERE order_id = o.id
+                 AND channel = $1
+               ORDER BY created_at DESC, id DESC
+               LIMIT 1
+             ) channel_attempt ON true
+             WHERE $1::text IS NOT NULL
+               AND o.expires_at <= now()
+               AND o.status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED')
+             LIMIT 1
+           )
+           UNION ALL
+           (
+             SELECT attempt.order_id
+             FROM payment_attempts attempt
+             JOIN orders o ON o.id = attempt.order_id
+             WHERE $1::text IS NOT NULL
+               AND attempt.channel = $1
+               AND attempt.reconciliation_state IN (
+                 'REQUIRED',
+                 'RETRY_SCHEDULED'
+               )
+               AND (
+                 attempt.reconciliation_next_at <= now()
+                 OR attempt.reconciliation_deadline_at <= now()
+               )
+               AND o.status = 'CLOSED'
+               AND o.expires_at <= now()
+             LIMIT 1
+           )
+         ) due_candidates
        ) AS has_more`,
       [providerChannel]
     );
     const scheduledRecovery = await client.query<{ count: number }>(
       `SELECT count(*)::integer AS count
-       FROM orders o
-       JOIN LATERAL (
-         SELECT
-           reconciliation_state,
-           reconciliation_deadline_at
-         FROM payment_attempts
-         WHERE order_id = o.id
-           AND channel = $1
-         ORDER BY created_at DESC, id DESC
-         LIMIT 1
-       ) attempt ON $1::text IS NOT NULL
+       FROM payment_attempts attempt
+       JOIN orders o ON o.id = attempt.order_id
        WHERE $1::text IS NOT NULL
+         AND attempt.channel = $1
          AND o.status = 'CLOSED'
          AND attempt.reconciliation_state IN (
            'REQUIRED',

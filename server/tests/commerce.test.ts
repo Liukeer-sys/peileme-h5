@@ -1016,19 +1016,63 @@ describe("commerce catalog foundation", () => {
       }
     ]);
 
-    const indexes = await query<{ indexdef: string }>(
-      `SELECT indexdef
+    const indexes = await query<{ indexname: string; indexdef: string }>(
+      `SELECT indexname, indexdef
          FROM pg_indexes
         WHERE schemaname = 'public'
           AND tablename = 'payment_attempts'
-          AND indexname = 'payment_attempts_reconciliation_due_idx'`
+          AND indexname = ANY($1::text[])
+        ORDER BY indexname`,
+      [[
+        "payment_attempts_one_scheduled_reconciliation_per_channel",
+        "payment_attempts_reconciliation_deadline_due_idx",
+        "payment_attempts_reconciliation_due_idx"
+      ]]
     );
-    expect(indexes.rows).toHaveLength(1);
+    expect(indexes.rows).toHaveLength(3);
+    expect(indexes.rows[0]).toMatchObject({
+      indexname:
+        "payment_attempts_one_scheduled_reconciliation_per_channel"
+    });
     expect(indexes.rows[0].indexdef).toContain(
+      "UNIQUE INDEX"
+    );
+    expect(indexes.rows[0].indexdef).toContain(
+      "(order_id, channel)"
+    );
+    expect(indexes.rows[1]).toMatchObject({
+      indexname: "payment_attempts_reconciliation_deadline_due_idx"
+    });
+    expect(indexes.rows[1].indexdef).toContain(
+      "(channel, reconciliation_deadline_at, updated_at, id)"
+    );
+    expect(indexes.rows[2]).toMatchObject({
+      indexname: "payment_attempts_reconciliation_due_idx"
+    });
+    expect(indexes.rows[2].indexdef).toContain(
       "(channel, reconciliation_next_at, updated_at, id)"
     );
-    expect(indexes.rows[0].indexdef).toContain(
-      "reconciliation_state = ANY (ARRAY['REQUIRED'::text, 'RETRY_SCHEDULED'::text])"
+    for (const index of indexes.rows) {
+      expect(index.indexdef).toContain(
+        "reconciliation_state = ANY (ARRAY['REQUIRED'::text, 'RETRY_SCHEDULED'::text])"
+      );
+    }
+    const openOrderIndex = await query<{
+      indexname: string;
+      indexdef: string;
+    }>(
+      `SELECT indexname, indexdef
+         FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND tablename = 'orders'
+          AND indexname = 'orders_open_reconciliation_due_idx'`
+    );
+    expect(openOrderIndex.rows).toHaveLength(1);
+    expect(openOrderIndex.rows[0].indexdef).toContain(
+      "(expires_at, status, updated_at, id)"
+    );
+    expect(openOrderIndex.rows[0].indexdef).toContain(
+      "status = ANY (ARRAY['CREATED'::text, 'PAYING'::text, 'PAYMENT_FAILED'::text])"
     );
   });
 
@@ -1062,6 +1106,31 @@ describe("commerce catalog foundation", () => {
          RETURNING id`,
         [order.id]
       );
+      await expect(
+        query(
+          `UPDATE payment_attempts
+           SET reconciliation_state = 'REQUIRED',
+               reconciliation_next_at = now() + interval '2 hours',
+               reconciliation_deadline_at = now() + interval '1 hour',
+               reconciliation_last_result =
+                 'LOCAL_CLOSE_PENDING_FINAL_QUERY'
+           WHERE id = $1`,
+          [attempt.rows[0].id]
+        )
+      ).rejects.toMatchObject({ code: "23514" });
+      await expect(
+        query(
+          `UPDATE payment_attempts
+           SET status = 'PENDING',
+               reconciliation_state = 'REQUIRED',
+               reconciliation_next_at = now(),
+               reconciliation_deadline_at = now() + interval '1 hour',
+               reconciliation_last_result =
+                 'LOCAL_CLOSE_PENDING_FINAL_QUERY'
+           WHERE id = $1`,
+          [attempt.rows[0].id]
+        )
+      ).rejects.toMatchObject({ code: "23514" });
       await expect(
         query(
           `UPDATE payment_attempts
@@ -3448,7 +3517,7 @@ describe("atomic commerce orders and payments", () => {
 
       await query(
         `UPDATE payment_attempts
-         SET reconciliation_next_at = now() + interval '1 hour',
+         SET reconciliation_next_at = now() - interval '2 seconds',
              reconciliation_deadline_at = now() - interval '1 second'
          WHERE id = $1`,
         [closed.attemptId]
@@ -4528,6 +4597,205 @@ describe("atomic commerce orders and payments", () => {
       if (userId) await cleanupEntitlementTestUsers([userId]);
     }
   });
+
+  it(
+    "keeps CLOSED reconciliation index-bounded with fifty thousand ineligible attempts",
+    async () => {
+      let userId: string | undefined;
+      try {
+        userId = await createEntitlementTestUser(true);
+        await query(
+          `WITH generated_orders AS (
+             INSERT INTO orders(
+               order_no,
+               user_id,
+               product_channel,
+               status,
+               total_fen,
+               currency,
+               idempotency_key,
+               expires_at,
+               closed_at,
+               created_at,
+               updated_at
+             )
+             SELECT
+               'PLMPLAN' || lpad(value::text, 8, '0'),
+               $1,
+               'main',
+               'CLOSED',
+               0,
+               'CNY',
+               'reconciliation-plan-' || value::text,
+               now() - interval '1 hour',
+               now() - interval '30 minutes',
+               now() - interval '2 hours',
+               now() - interval '30 minutes'
+             FROM generate_series(1, 50010) value
+             RETURNING id, order_no
+           )
+           INSERT INTO payment_attempts(
+             order_id,
+             channel,
+             status,
+             reconciliation_state,
+             reconciliation_next_at,
+             reconciliation_deadline_at,
+             reconciliation_last_result
+           )
+           SELECT
+             id,
+             'fake',
+             'CLOSED',
+             CASE
+               WHEN order_no > 'PLMPLAN00050000'
+                 THEN 'REQUIRED'
+               ELSE 'NONE'
+             END,
+             CASE
+               WHEN order_no > 'PLMPLAN00050000'
+                 THEN now() - interval '1 second'
+               ELSE NULL
+             END,
+             CASE
+               WHEN order_no > 'PLMPLAN00050000'
+                 THEN now() + interval '24 hours'
+               ELSE NULL
+             END,
+             CASE
+               WHEN order_no > 'PLMPLAN00050000'
+                 THEN 'LOCAL_CLOSE_PENDING_FINAL_QUERY'
+               ELSE NULL
+             END
+           FROM generated_orders`,
+          [userId]
+        );
+        await query("ANALYZE orders, payment_attempts");
+        const explained = await query<{ "QUERY PLAN": unknown }>(
+          `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+           WITH due_attempts AS MATERIALIZED (
+             SELECT
+               pa.id,
+               pa.order_id,
+               pa.channel,
+               pa.reconciliation_next_at,
+               pa.reconciliation_deadline_at
+             FROM payment_attempts pa
+             WHERE pa.channel = 'fake'
+               AND pa.reconciliation_state IN (
+                 'REQUIRED',
+                 'RETRY_SCHEDULED'
+               )
+               AND (
+                 pa.reconciliation_next_at <= now()
+                 OR pa.reconciliation_deadline_at <= now()
+               )
+             ORDER BY
+               LEAST(
+                 pa.reconciliation_next_at,
+                 pa.reconciliation_deadline_at
+               ),
+               pa.updated_at,
+               pa.id
+             LIMIT 10
+           )
+           SELECT due_attempts.id
+           FROM due_attempts
+           JOIN orders o ON o.id = due_attempts.order_id
+           WHERE o.status = 'CLOSED'`
+        );
+        const plan = JSON.stringify(explained.rows[0]["QUERY PLAN"]);
+        expect(plan).not.toMatch(
+          /"Node Type":"Seq Scan"[^}]*"Relation Name":"orders"/
+        );
+        expect(plan).not.toMatch(
+          /"Actual Loops":50000|"Actual Loops":50010/
+        );
+
+        await query(
+          `SELECT
+             pg_stat_reset_single_table_counters(
+               'orders'::regclass::oid
+             ),
+             pg_stat_reset_single_table_counters(
+               'payment_attempts'::regclass::oid
+             )`
+        );
+        let queryCalls = 0;
+        const reconciliation = await reconcileAndCloseExpiredOrders({
+          provider: {
+            channel: "fake",
+            async createPayment() {
+              throw new Error("plan probe must not create");
+            },
+            async queryPayment() {
+              queryCalls += 1;
+              return null;
+            },
+            async refund() {
+              return { channelRefundId: "unused", raw: {} };
+            }
+          },
+          limit: 10,
+          providerQueryBudget: 10,
+          providerTimeoutMs: 100
+        });
+        expect(queryCalls).toBe(10);
+        expect(reconciliation.summary).toMatchObject({
+          scannedCount: 10,
+          deferredCount: 10,
+          terminalCount: 0,
+          hasMore: false,
+          scheduledRecoveryCount: 10
+        });
+        await query("SELECT pg_stat_force_next_flush()");
+        const stats = await query<{
+          relname: string;
+          seq_scan: string;
+          idx_scan: string;
+        }>(
+          `SELECT
+             relname,
+             seq_scan::text,
+             idx_scan::text
+           FROM pg_stat_all_tables
+           WHERE schemaname = 'public'
+             AND relname = ANY(ARRAY['orders', 'payment_attempts'])
+           ORDER BY relname`
+        );
+        expect(stats.rows).toEqual([
+          {
+            relname: "orders",
+            seq_scan: "0",
+            idx_scan: expect.any(String)
+          },
+          {
+            relname: "payment_attempts",
+            seq_scan: "0",
+            idx_scan: expect.any(String)
+          }
+        ]);
+        expect(
+          stats.rows.every((row) => Number(row.idx_scan) > 0)
+        ).toBe(true);
+      } finally {
+        if (userId) {
+          await query(
+            `DELETE FROM payment_attempts
+             WHERE order_id IN (
+               SELECT id
+               FROM orders
+               WHERE user_id = $1
+             )`,
+            [userId]
+          );
+          await query("DELETE FROM orders WHERE user_id = $1", [userId]);
+          await query("DELETE FROM users WHERE id = $1", [userId]);
+        }
+      }
+    },
+    30_000
+  );
 
   it("queries attempted expired orders before safe close and defers errors", async () => {
     await seedPolicyFoundation();
