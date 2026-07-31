@@ -248,6 +248,7 @@ export const createCommerceRouters = (
         const result = await query<{
           open_orders: string;
           pending_attempts: string;
+          pending_payment_anomalies: string;
         }>(
           `SELECT
              (
@@ -265,13 +266,20 @@ export const createCommerceRouters = (
                SELECT count(*)::text
                FROM payment_attempts
                WHERE status IN ('CREATED', 'REDIRECT_READY', 'PENDING')
-             ) AS pending_attempts`
+             ) AS pending_attempts,
+             (
+               SELECT count(*)::text
+               FROM payment_anomalies
+               WHERE status = 'PENDING_REVIEW'
+             ) AS pending_payment_anomalies`
         );
         response.json({
           paymentMode: config.PAYMENT_MODE,
           counts: {
             openOrders: result.rows[0]?.open_orders ?? "0",
-            pendingAttempts: result.rows[0]?.pending_attempts ?? "0"
+            pendingAttempts: result.rows[0]?.pending_attempts ?? "0",
+            pendingPaymentAnomalies:
+              result.rows[0]?.pending_payment_anomalies ?? "0"
           }
         });
       } catch (error) {

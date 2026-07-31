@@ -117,6 +117,57 @@ const normalizeAmount = (value: string) => {
   return BigInt(value).toString();
 };
 
+type PaymentAnomalyKind =
+  | "PAYMENT_AFTER_EXPIRY"
+  | "PAYMENT_VERIFICATION_FAILED"
+  | "DUPLICATE_PAYMENT";
+
+const tryNormalizeAmount = (value: string) => {
+  try {
+    return normalizeAmount(value);
+  } catch {
+    return null;
+  }
+};
+
+const sanitizePaymentEvidenceText = (
+  value: unknown,
+  maxLength: number
+) => {
+  const sanitized = String(value ?? "")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength);
+  return sanitized || "[missing]";
+};
+
+const paymentEvidenceFingerprint = (input: {
+  kind: PaymentAnomalyKind;
+  attemptChannel: PaymentChannel;
+  providerChannel: string;
+  channelTransactionId: string;
+  providerOrderNo: string;
+  amountFen: string;
+  currency: string;
+  paidAt: Date | null;
+}) =>
+  crypto
+    .createHash("sha256")
+    .update(
+      JSON.stringify([
+        input.kind,
+        input.attemptChannel,
+        input.providerChannel,
+        input.channelTransactionId,
+        input.providerOrderNo,
+        input.amountFen,
+        input.currency,
+        input.paidAt?.toISOString() ?? null
+      ])
+    )
+    .digest("hex");
+
 const mapOrder = (row: OrderRow): CommerceOrder => ({
   id: row.id,
   orderNo: row.order_no,
@@ -490,6 +541,265 @@ export const fulfillOrder = async (
   });
 };
 
+const recordPaymentAnomalyInTransaction = async (
+  client: pg.PoolClient,
+  input: {
+    order: OrderFulfillmentRow;
+    paymentAttemptId: string;
+    attemptChannel: PaymentChannel;
+    verified: VerifiedPayment;
+    paidAt: Date | null;
+    kind: PaymentAnomalyKind;
+  }
+) => {
+  const providerChannel = sanitizePaymentEvidenceText(
+    input.verified.channel,
+    32
+  );
+  const channelTransactionId = sanitizePaymentEvidenceText(
+    input.verified.channelTransactionId,
+    160
+  );
+  const providerOrderNo = sanitizePaymentEvidenceText(
+    input.verified.orderNo,
+    160
+  );
+  const amountFen = sanitizePaymentEvidenceText(
+    input.verified.amountFen,
+    80
+  );
+  const currency = sanitizePaymentEvidenceText(
+    input.verified.currency,
+    16
+  );
+  const evidenceFingerprint = paymentEvidenceFingerprint({
+    kind: input.kind,
+    attemptChannel: input.attemptChannel,
+    providerChannel,
+    channelTransactionId,
+    providerOrderNo,
+    amountFen,
+    currency,
+    paidAt: input.paidAt
+  });
+  await client.query(
+    `INSERT INTO payment_anomalies(
+       order_id,
+       payment_attempt_id,
+       attempt_channel,
+       provider_channel,
+       kind,
+       status,
+       channel_transaction_id,
+       provider_order_no,
+       amount_fen,
+       currency,
+       paid_at,
+       evidence_fingerprint
+     )
+     VALUES (
+       $1,
+       $2,
+       $3,
+       $4,
+       $5,
+       'PENDING_REVIEW',
+       $6,
+       $7,
+       $8,
+       $9,
+       $10,
+       $11
+     )
+     ON CONFLICT DO NOTHING`,
+    [
+      input.order.id,
+      input.paymentAttemptId,
+      input.attemptChannel,
+      providerChannel,
+      input.kind,
+      channelTransactionId,
+      providerOrderNo,
+      amountFen,
+      currency,
+      input.paidAt?.toISOString() ?? null,
+      evidenceFingerprint
+    ]
+  );
+  const anomalyOwner = await client.query<{
+    order_id: string;
+    payment_attempt_id: string;
+    kind: PaymentAnomalyKind;
+    evidence_fingerprint: string;
+  }>(
+    `SELECT
+       order_id,
+       payment_attempt_id,
+       kind,
+       evidence_fingerprint
+     FROM payment_anomalies
+     WHERE provider_channel = $1
+       AND channel_transaction_id = $2
+     FOR UPDATE`,
+    [providerChannel, channelTransactionId]
+  );
+  const owner = anomalyOwner.rows[0];
+  if (
+    !owner ||
+    owner.order_id !== input.order.id ||
+    owner.payment_attempt_id !== input.paymentAttemptId ||
+    owner.kind !== input.kind ||
+    owner.evidence_fingerprint !== evidenceFingerprint
+  ) {
+    throw new CommerceError("PAYMENT_VERIFICATION_FAILED");
+  }
+  await client.query(
+    `UPDATE payment_attempts
+     SET status = 'CLOSED',
+         reconciliation_state = 'TERMINAL',
+         reconciliation_next_at = NULL,
+         reconciliation_deadline_at = NULL,
+         reconciliation_last_result = $2,
+         error_code = 'PAYMENT_REVIEW_REQUIRED',
+         error_message = CASE
+           WHEN $2 = 'PAYMENT_AFTER_EXPIRY'
+             THEN '渠道付款时间晚于订单有效期，等待人工处理'
+           WHEN $2 = 'DUPLICATE_PAYMENT'
+             THEN '订单完成后收到第二笔付款，等待退款处理'
+           ELSE '支付金额、币种或时间核验不一致，等待人工处理'
+         END,
+         updated_at = now()
+     WHERE id = $1
+       AND status <> 'SUCCEEDED'`,
+    [input.paymentAttemptId, input.kind]
+  );
+  if (input.kind === "DUPLICATE_PAYMENT") {
+    await client.query(
+      `UPDATE payment_attempts
+       SET status = 'CLOSED',
+           reconciliation_state = 'TERMINAL',
+           reconciliation_next_at = NULL,
+           reconciliation_deadline_at = NULL,
+           reconciliation_last_result =
+             'ORDER_COMPLETED_BY_OTHER_ATTEMPT',
+           updated_at = now()
+       WHERE order_id = $1
+         AND id <> $2
+         AND (
+           status IN ('CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED')
+           OR reconciliation_state IN ('REQUIRED', 'RETRY_SCHEDULED')
+         )`,
+      [input.order.id, input.paymentAttemptId]
+    );
+    return;
+  }
+  await client.query(
+    `WITH latest_schedulable_other_channel AS MATERIALIZED (
+       SELECT DISTINCT ON (candidate.channel) candidate.id
+       FROM payment_attempts candidate
+       WHERE candidate.order_id = $1
+         AND candidate.id <> $2
+         AND candidate.channel <> $3
+         AND candidate.status IN (
+           'CREATED',
+           'REDIRECT_READY',
+           'PENDING',
+           'FAILED'
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM payment_attempts scheduled
+           WHERE scheduled.order_id = candidate.order_id
+             AND scheduled.channel = candidate.channel
+             AND scheduled.reconciliation_state IN (
+               'REQUIRED',
+               'RETRY_SCHEDULED'
+             )
+         )
+       ORDER BY candidate.channel, candidate.created_at DESC, candidate.id DESC
+     ),
+     closed_active AS (
+       UPDATE payment_attempts
+       SET status = 'CLOSED',
+           reconciliation_state = CASE
+             WHEN id IN (
+               SELECT id
+               FROM latest_schedulable_other_channel
+             )
+               THEN 'REQUIRED'
+             ELSE 'NONE'
+           END,
+           reconciliation_attempt_count = 0,
+           reconciliation_no_payment_count = 0,
+           reconciliation_query_error_count = 0,
+           reconciliation_next_at = CASE
+             WHEN id IN (
+               SELECT id
+               FROM latest_schedulable_other_channel
+             )
+               THEN now() + ($4::integer * interval '1 second')
+             ELSE NULL
+           END,
+           reconciliation_deadline_at = CASE
+             WHEN id IN (
+               SELECT id
+               FROM latest_schedulable_other_channel
+             )
+               THEN now() + ($5::integer * interval '1 second')
+             ELSE NULL
+           END,
+           reconciliation_last_result = CASE
+             WHEN id IN (
+               SELECT id
+               FROM latest_schedulable_other_channel
+             )
+               THEN 'LOCAL_CLOSE_PENDING_FINAL_QUERY'
+             ELSE NULL
+           END,
+           updated_at = now()
+       WHERE order_id = $1
+         AND id <> $2
+         AND status IN (
+           'CREATED',
+           'REDIRECT_READY',
+           'PENDING',
+           'FAILED'
+         )
+       RETURNING id
+     )
+     UPDATE payment_attempts
+     SET status = 'CLOSED',
+         reconciliation_state = 'TERMINAL',
+         reconciliation_next_at = NULL,
+         reconciliation_deadline_at = NULL,
+         reconciliation_last_result = $6,
+         error_code = 'PAYMENT_REVIEW_REQUIRED',
+         error_message = '同渠道支付核验异常，已停止自动恢复',
+         updated_at = now()
+     WHERE order_id = $1
+       AND id <> $2
+       AND channel = $3
+       AND reconciliation_state IN ('REQUIRED', 'RETRY_SCHEDULED')`,
+    [
+      input.order.id,
+      input.paymentAttemptId,
+      input.attemptChannel,
+      closedPaymentReconciliationInitialDelaySeconds,
+      closedPaymentReconciliationDeadlineSeconds,
+      input.kind
+    ]
+  );
+  await client.query(
+    `UPDATE orders
+     SET status = 'CLOSED',
+         closed_at = COALESCE(closed_at, now()),
+         updated_at = now()
+     WHERE id = $1
+       AND status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED', 'CLOSED')`,
+    [input.order.id]
+  );
+};
+
 export const markOrderPaid = async ({
   orderId: orderIdInput,
   paymentAttemptId: paymentAttemptIdInput,
@@ -497,29 +807,14 @@ export const markOrderPaid = async ({
 }: MarkOrderPaidInput): Promise<CommerceOrder> => {
   const orderId = requireUuid(orderIdInput);
   const paymentAttemptId = requireUuid(paymentAttemptIdInput);
-  const verifiedAmount = normalizeAmount(verified.amountFen);
-  if (
-    !verified.channelTransactionId.trim() ||
-    verified.currency !== "CNY" ||
-    !paymentChannels.includes(verified.channel)
-  ) {
-    throw new CommerceError("PAYMENT_VERIFICATION_FAILED");
-  }
-  const paidAt = new Date(verified.paidAt);
-  if (Number.isNaN(paidAt.getTime())) {
-    throw new CommerceError("PAYMENT_VERIFICATION_FAILED");
-  }
-
-  return withTransaction(async (client) => {
+  const outcome = await withTransaction(async (client) => {
     const order = await loadFulfillmentOrder(client, orderId);
-    if (paidAt.getTime() > order.expires_at.getTime()) {
-      throw new CommerceError("PAYMENT_VERIFICATION_FAILED");
-    }
     const attempt = await client.query<{
       id: string;
       channel: PaymentChannel;
+      error_code: string | null;
     }>(
-      `SELECT id, channel
+      `SELECT id, channel, error_code
        FROM payment_attempts
        WHERE id = $1
          AND order_id = $2
@@ -529,13 +824,21 @@ export const markOrderPaid = async ({
     const selectedAttempt = attempt.rows[0];
     if (
       !selectedAttempt ||
+      !paymentChannels.includes(verified.channel) ||
       selectedAttempt.channel !== verified.channel ||
       order.order_no !== verified.orderNo ||
-      normalizeAmount(order.total_fen) !== verifiedAmount ||
-      order.currency !== verified.currency
+      !verified.channelTransactionId.trim()
     ) {
       throw new CommerceError("PAYMENT_VERIFICATION_FAILED");
     }
+    if (selectedAttempt.error_code === "PAYMENT_REVIEW_REQUIRED") {
+      return { anomaly: true as const };
+    }
+    const verifiedAmount = tryNormalizeAmount(verified.amountFen);
+    const parsedPaidAt = new Date(verified.paidAt);
+    const paidAt = Number.isNaN(parsedPaidAt.getTime())
+      ? null
+      : parsedPaidAt;
 
     const existing = await client.query<{
       order_id: string;
@@ -559,21 +862,43 @@ export const markOrderPaid = async ({
       [verified.channel, verified.channelTransactionId]
     );
     const transaction = existing.rows[0];
-    if (transaction) {
-      if (
-        transaction.order_id !== order.id ||
-        transaction.payment_attempt_id !== selectedAttempt.id ||
-        transaction.channel !== verified.channel ||
-        normalizeAmount(transaction.amount_fen) !== verifiedAmount ||
-        transaction.currency !== verified.currency ||
-        transaction.status !== "SUCCESS"
-      ) {
-        throw new CommerceError("PAYMENT_VERIFICATION_FAILED");
-      }
-      return mapOrder(order);
+    const matchesExistingTransaction =
+      transaction &&
+      verifiedAmount !== null &&
+      transaction.order_id === order.id &&
+      transaction.payment_attempt_id === selectedAttempt.id &&
+      transaction.channel === verified.channel &&
+      normalizeAmount(transaction.amount_fen) === verifiedAmount &&
+      transaction.currency === verified.currency &&
+      transaction.status === "SUCCESS";
+    if (matchesExistingTransaction) {
+      return { order: mapOrder(order) };
     }
-    if (order.status === "COMPLETED") {
-      throw new CommerceError("ORDER_STATE_CONFLICT");
+    let anomalyKind: PaymentAnomalyKind | undefined;
+    if (
+      verifiedAmount === null ||
+      normalizeAmount(order.total_fen) !== verifiedAmount ||
+      order.currency !== verified.currency ||
+      paidAt === null
+    ) {
+      anomalyKind = "PAYMENT_VERIFICATION_FAILED";
+    } else if (transaction) {
+      anomalyKind = "PAYMENT_VERIFICATION_FAILED";
+    } else if (order.status === "COMPLETED") {
+      anomalyKind = "DUPLICATE_PAYMENT";
+    } else if (paidAt.getTime() > order.expires_at.getTime()) {
+      anomalyKind = "PAYMENT_AFTER_EXPIRY";
+    }
+    if (anomalyKind) {
+      await recordPaymentAnomalyInTransaction(client, {
+        order,
+        paymentAttemptId: selectedAttempt.id,
+        attemptChannel: selectedAttempt.channel,
+        verified,
+        paidAt,
+        kind: anomalyKind
+      });
+      return { anomaly: true as const };
     }
     if (
       !["CREATED", "PAYING", "PAYMENT_FAILED", "CLOSED"].includes(
@@ -581,6 +906,9 @@ export const markOrderPaid = async ({
       )
     ) {
       throw new CommerceError("ORDER_STATE_CONFLICT");
+    }
+    if (verifiedAmount === null || paidAt === null) {
+      throw new CommerceError("PAYMENT_VERIFICATION_FAILED");
     }
 
     const insertedTransaction = await client.query<{ id: string }>(
@@ -641,7 +969,15 @@ export const markOrderPaid = async ({
         owner.currency !== verified.currency ||
         owner.status !== "SUCCESS"
       ) {
-        throw new CommerceError("PAYMENT_VERIFICATION_FAILED");
+        await recordPaymentAnomalyInTransaction(client, {
+          order,
+          paymentAttemptId: selectedAttempt.id,
+          attemptChannel: selectedAttempt.channel,
+          verified,
+          paidAt,
+          kind: "PAYMENT_VERIFICATION_FAILED"
+        });
+        return { anomaly: true as const };
       }
     }
     await client.query(
@@ -675,9 +1011,9 @@ export const markOrderPaid = async ({
            updated_at = now()
        WHERE order_id = $1
          AND id <> $2
-         AND reconciliation_state IN (
-           'REQUIRED',
-           'RETRY_SCHEDULED'
+         AND (
+           status IN ('CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED')
+           OR reconciliation_state IN ('REQUIRED', 'RETRY_SCHEDULED')
          )`,
       [order.id, selectedAttempt.id]
     );
@@ -691,11 +1027,17 @@ export const markOrderPaid = async ({
       [order.id, paidAt.toISOString()]
     );
 
-    return fulfillOrderInTransaction(client, {
-      ...order,
-      status: "PAID"
-    });
+    return {
+      order: await fulfillOrderInTransaction(client, {
+        ...order,
+        status: "PAID"
+      })
+    };
   });
+  if ("anomaly" in outcome) {
+    throw new CommerceError("PAYMENT_VERIFICATION_FAILED");
+  }
+  return outcome.order;
 };
 
 export const getOwnedOrder = async (
@@ -1116,7 +1458,6 @@ export const reconcileAndCloseExpiredOrders = async (input: {
              OR attempt.reconciliation_deadline_at <= now()
            )
            AND o.status = 'CLOSED'
-           AND o.expires_at <= now()
          ORDER BY
            LEAST(
              attempt.reconciliation_next_at,
@@ -1395,23 +1736,6 @@ export const reconcileAndCloseExpiredOrders = async (input: {
         return;
       }
       if (verified) {
-        if (isClosedRecovery) {
-          const paidAt = new Date(verified.paidAt);
-          const terminalReason =
-            !Number.isNaN(paidAt.getTime()) &&
-            paidAt.getTime() > candidate.expires_at.getTime()
-              ? "paymentAfterExpiry"
-              : Number.isNaN(paidAt.getTime())
-                ? "paymentVerificationFailed"
-                : undefined;
-          if (terminalReason) {
-            outcomes[candidateIndex] =
-              await markClosedRecoveryTerminal(candidate, terminalReason)
-                ? { closedTerminal: terminalReason }
-                : { closedChangedState: true };
-            return;
-          }
-        }
         try {
           await markOrderPaid({
             orderId: candidate.id,
@@ -1426,15 +1750,29 @@ export const reconcileAndCloseExpiredOrders = async (input: {
           const verificationFailed =
             error instanceof CommerceError &&
             error.code === "PAYMENT_VERIFICATION_FAILED";
-          if (isClosedRecovery && verificationFailed) {
-            outcomes[candidateIndex] =
-              await markClosedRecoveryTerminal(
-                candidate,
-                "paymentVerificationFailed"
-              )
-                ? { closedTerminal: "paymentVerificationFailed" }
-                : { closedChangedState: true };
-            return;
+          if (verificationFailed) {
+            const recordedAnomaly = await query<{
+              reconciliation_last_result: PaymentAnomalyKind;
+            }>(
+              `SELECT reconciliation_last_result
+               FROM payment_attempts
+               WHERE id = $1
+                 AND status = 'CLOSED'
+                 AND reconciliation_state = 'TERMINAL'
+                 AND error_code = 'PAYMENT_REVIEW_REQUIRED'`,
+              [candidate.attempt_id]
+            );
+            const anomalyResult =
+              recordedAnomaly.rows[0]?.reconciliation_last_result;
+            if (anomalyResult) {
+              outcomes[candidateIndex] = {
+                closedTerminal:
+                  anomalyResult === "PAYMENT_AFTER_EXPIRY"
+                    ? "paymentAfterExpiry"
+                    : "paymentVerificationFailed"
+              };
+              return;
+            }
           }
           await query(
             `UPDATE payment_attempts
@@ -1611,7 +1949,6 @@ export const reconcileAndCloseExpiredOrders = async (input: {
                  OR attempt.reconciliation_deadline_at <= now()
                )
                AND o.status = 'CLOSED'
-               AND o.expires_at <= now()
              LIMIT 1
            )
          ) due_candidates
@@ -1941,6 +2278,9 @@ export const startPayment = async (
     input.provider.channel
   );
   if (failedRecovery) {
+    if (failedRecovery.attemptErrorCode === "PAYMENT_REVIEW_REQUIRED") {
+      throw new CommerceError("ORDER_STATE_CONFLICT");
+    }
     let verified: VerifiedPayment | null;
     try {
       verified = await withPaymentProviderTimeout(

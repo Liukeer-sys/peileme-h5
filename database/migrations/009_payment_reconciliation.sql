@@ -31,6 +31,7 @@ ALTER TABLE payment_attempts
         'NO_PAYMENT_LIMIT_EXCEEDED',
         'PAYMENT_AFTER_EXPIRY',
         'PAYMENT_VERIFICATION_FAILED',
+        'DUPLICATE_PAYMENT',
         'ORDER_COMPLETED_BY_OTHER_ATTEMPT'
       )
     ),
@@ -81,6 +82,7 @@ ALTER TABLE payment_attempts
           'NO_PAYMENT_LIMIT_EXCEEDED',
           'PAYMENT_AFTER_EXPIRY',
           'PAYMENT_VERIFICATION_FAILED',
+          'DUPLICATE_PAYMENT',
           'ORDER_COMPLETED_BY_OTHER_ATTEMPT'
         )
       )
@@ -134,3 +136,72 @@ CREATE INDEX payment_attempts_reconciliation_deadline_due_idx
 CREATE INDEX orders_open_reconciliation_due_idx
   ON orders(expires_at, status, updated_at, id)
   WHERE status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED');
+
+CREATE TABLE payment_anomalies (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  payment_attempt_id UUID NOT NULL,
+  attempt_channel TEXT NOT NULL
+    CHECK (
+      attempt_channel IN ('wechat_h5', 'alipay_wap', 'fake')
+    ),
+  provider_channel TEXT NOT NULL
+    CHECK (
+      provider_channel IN ('wechat_h5', 'alipay_wap', 'fake')
+      AND provider_channel = attempt_channel
+    ),
+  kind TEXT NOT NULL
+    CHECK (
+      kind IN (
+        'PAYMENT_AFTER_EXPIRY',
+        'PAYMENT_VERIFICATION_FAILED',
+        'DUPLICATE_PAYMENT'
+      )
+    ),
+  status TEXT NOT NULL DEFAULT 'PENDING_REVIEW'
+    CHECK (status IN ('PENDING_REVIEW', 'RESOLVED')),
+  channel_transaction_id TEXT NOT NULL
+    CHECK (
+      length(btrim(channel_transaction_id)) > 0
+      AND length(channel_transaction_id) <= 160
+    ),
+  provider_order_no TEXT NOT NULL
+    CHECK (
+      length(btrim(provider_order_no)) > 0
+      AND length(provider_order_no) <= 160
+    ),
+  amount_fen TEXT NOT NULL
+    CHECK (
+      length(btrim(amount_fen)) > 0
+      AND length(amount_fen) <= 80
+    ),
+  currency TEXT NOT NULL
+    CHECK (
+      length(btrim(currency)) > 0
+      AND length(currency) <= 16
+    ),
+  paid_at TIMESTAMPTZ,
+  evidence_fingerprint TEXT NOT NULL
+    CHECK (evidence_fingerprint ~ '^[0-9a-f]{64}$'),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT payment_anomalies_attempt_order_fk
+    FOREIGN KEY (order_id, payment_attempt_id, attempt_channel)
+    REFERENCES payment_attempts(order_id, id, channel)
+    ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX payment_anomalies_evidence_unique_idx
+  ON payment_anomalies(
+    order_id,
+    payment_attempt_id,
+    kind,
+    evidence_fingerprint
+  );
+
+CREATE UNIQUE INDEX payment_anomalies_provider_transaction_unique_idx
+  ON payment_anomalies(provider_channel, channel_transaction_id);
+
+CREATE INDEX payment_anomalies_pending_idx
+  ON payment_anomalies(created_at, id)
+  WHERE status = 'PENDING_REVIEW';

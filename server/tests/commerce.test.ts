@@ -1151,6 +1151,133 @@ describe("commerce catalog foundation", () => {
       if (userId) await cleanupEntitlementTestUsers([userId]);
     }
   });
+
+  it("stores structured pending payment anomalies without provider raw payloads", async () => {
+    const columns = await query<{
+      column_name: string;
+      data_type: string;
+      is_nullable: string;
+    }>(
+      `SELECT column_name, data_type, is_nullable
+       FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name = 'payment_anomalies'
+         AND column_name = ANY($1::text[])
+       ORDER BY column_name`,
+      [[
+        "order_id",
+        "payment_attempt_id",
+        "attempt_channel",
+        "provider_channel",
+        "kind",
+        "status",
+        "channel_transaction_id",
+        "provider_order_no",
+        "amount_fen",
+        "currency",
+        "paid_at",
+        "evidence_fingerprint"
+      ]]
+    );
+    expect(columns.rows).toEqual([
+      {
+        column_name: "amount_fen",
+        data_type: "text",
+        is_nullable: "NO"
+      },
+      {
+        column_name: "attempt_channel",
+        data_type: "text",
+        is_nullable: "NO"
+      },
+      {
+        column_name: "channel_transaction_id",
+        data_type: "text",
+        is_nullable: "NO"
+      },
+      {
+        column_name: "currency",
+        data_type: "text",
+        is_nullable: "NO"
+      },
+      {
+        column_name: "evidence_fingerprint",
+        data_type: "text",
+        is_nullable: "NO"
+      },
+      {
+        column_name: "kind",
+        data_type: "text",
+        is_nullable: "NO"
+      },
+      {
+        column_name: "order_id",
+        data_type: "uuid",
+        is_nullable: "NO"
+      },
+      {
+        column_name: "paid_at",
+        data_type: "timestamp with time zone",
+        is_nullable: "YES"
+      },
+      {
+        column_name: "payment_attempt_id",
+        data_type: "uuid",
+        is_nullable: "NO"
+      },
+      {
+        column_name: "provider_channel",
+        data_type: "text",
+        is_nullable: "NO"
+      },
+      {
+        column_name: "provider_order_no",
+        data_type: "text",
+        is_nullable: "NO"
+      },
+      {
+        column_name: "status",
+        data_type: "text",
+        is_nullable: "NO"
+      }
+    ]);
+    const indexes = await query<{ indexname: string; indexdef: string }>(
+      `SELECT indexname, indexdef
+       FROM pg_indexes
+       WHERE schemaname = 'public'
+         AND tablename = 'payment_anomalies'
+       ORDER BY indexname`
+    );
+    expect(indexes.rows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          indexname: "payment_anomalies_evidence_unique_idx",
+          indexdef: expect.stringContaining("UNIQUE INDEX")
+        }),
+        expect.objectContaining({
+          indexname: "payment_anomalies_pending_idx",
+          indexdef: expect.stringContaining(
+            "WHERE (status = 'PENDING_REVIEW'::text)"
+          )
+        }),
+        expect.objectContaining({
+          indexname: "payment_anomalies_provider_transaction_unique_idx",
+          indexdef: expect.stringContaining(
+            "(provider_channel, channel_transaction_id)"
+          )
+        })
+      ])
+    );
+    const channelIdentityConstraint = await query<{ definition: string }>(
+      `SELECT pg_get_constraintdef(oid) AS definition
+       FROM pg_constraint
+       WHERE conrelid = 'payment_anomalies'::regclass
+         AND contype = 'c'
+         AND pg_get_constraintdef(oid) LIKE
+           '%provider_channel = attempt_channel%'`
+    );
+    expect(channelIdentityConstraint.rows).toHaveLength(1);
+  });
 });
 
 describe("effective commerce catalog", () => {
@@ -2214,7 +2341,7 @@ describe("atomic commerce orders and payments", () => {
     }
   });
 
-  it("fulfills a verified payment once and rolls back a mismatch", async () => {
+  it("fulfills a verified payment once", async () => {
     await seedPolicyFoundation();
     let userId: string | undefined;
     try {
@@ -2242,34 +2369,6 @@ describe("atomic commerce orders and payments", () => {
         paidAt: new Date().toISOString(),
         raw: { source: "task3-red" }
       };
-
-      await expect(
-        markOrderPaid({
-          orderId: order.id,
-          paymentAttemptId: attempt.rows[0].id,
-          verified: { ...verified, amountFen: "991" }
-        })
-      ).rejects.toMatchObject({
-        code: "PAYMENT_VERIFICATION_FAILED"
-      });
-      const afterMismatch = await query<{
-        transactions: string;
-        entitlements: string;
-        status: string;
-      }>(
-        `SELECT
-           (SELECT count(*)::text FROM payment_transactions WHERE order_id = $1)
-             AS transactions,
-           (SELECT count(*)::text FROM entitlements WHERE source_id = $1)
-             AS entitlements,
-           (SELECT status FROM orders WHERE id = $1) AS status`,
-        [order.id]
-      );
-      expect(afterMismatch.rows[0]).toEqual({
-        transactions: "0",
-        entitlements: "0",
-        status: "CREATED"
-      });
 
       const completed = await markOrderPaid({
         orderId: order.id,
@@ -2357,17 +2456,28 @@ describe("atomic commerce orders and payments", () => {
         code: "PAYMENT_VERIFICATION_FAILED"
       });
       const rejected = await query<{
+        order_status: string;
+        attempt_status: string;
+        anomalies: string;
         transactions: string;
         entitlements: string;
       }>(
         `SELECT
+           (SELECT status FROM orders WHERE id = $1) AS order_status,
+           (SELECT status FROM payment_attempts WHERE id = $2)
+             AS attempt_status,
+           (SELECT count(*)::text FROM payment_anomalies WHERE order_id = $1)
+             AS anomalies,
            (SELECT count(*)::text FROM payment_transactions WHERE order_id = $1)
              AS transactions,
            (SELECT count(*)::text FROM entitlements WHERE source_id = $1)
              AS entitlements`,
-        [order.id]
+        [order.id, attempt.rows[0].id]
       );
       expect(rejected.rows[0]).toEqual({
+        order_status: "CLOSED",
+        attempt_status: "CLOSED",
+        anomalies: "1",
         transactions: "0",
         entitlements: "0"
       });
@@ -2381,7 +2491,952 @@ describe("atomic commerce orders and payments", () => {
             paidAt: new Date(Date.now() - 120_000).toISOString()
           }
         })
+      ).rejects.toMatchObject({ code: "PAYMENT_VERIFICATION_FAILED" });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("keeps the legal order unchanged when payment identity evidence is forged", async () => {
+    await seedPolicyFoundation();
+    const userIds: string[] = [];
+    try {
+      const userId = await createEntitlementTestUser(true);
+      userIds.push(userId);
+      const makeOrder = async (marker: string) => {
+        const order = await createOrder({
+          userId,
+          sku: "POLICY_CALC",
+          channel: "main",
+          idempotencyKey: `${marker}-${randomUUID()}`,
+          businessDraftId: await insertPolicyDraft(userId)
+        });
+        const attempt = await query<{ id: string }>(
+          `INSERT INTO payment_attempts(order_id, channel, status)
+           VALUES ($1, 'fake', 'PENDING')
+           RETURNING id`,
+          [order.id]
+        );
+        await query(
+          "UPDATE orders SET status = 'PAYING' WHERE id = $1",
+          [order.id]
+        );
+        return { order, attemptId: attempt.rows[0].id };
+      };
+      const legal = await makeOrder("identity-legal");
+      const foreign = await makeOrder("identity-foreign");
+      const base = {
+        orderNo: legal.order.orderNo,
+        channel: "fake" as const,
+        channelTransactionId: `identity-${randomUUID()}`,
+        amountFen: legal.order.amountFen,
+        currency: "CNY" as const,
+        paidAt: new Date().toISOString(),
+        raw: { source: "identity-boundary" }
+      };
+      const invalid = await Promise.allSettled([
+        markOrderPaid({
+          orderId: legal.order.id,
+          paymentAttemptId: legal.attemptId,
+          verified: {
+            ...base,
+            orderNo: foreign.order.orderNo,
+            channelTransactionId: `wrong-order-${randomUUID()}`
+          }
+        }),
+        markOrderPaid({
+          orderId: legal.order.id,
+          paymentAttemptId: legal.attemptId,
+          verified: {
+            ...base,
+            channel: "alipay_wap",
+            channelTransactionId: `wrong-channel-${randomUUID()}`
+          }
+        }),
+        markOrderPaid({
+          orderId: legal.order.id,
+          paymentAttemptId: legal.attemptId,
+          verified: {
+            ...base,
+            channelTransactionId: "   "
+          }
+        }),
+        markOrderPaid({
+          orderId: legal.order.id,
+          paymentAttemptId: foreign.attemptId,
+          verified: {
+            ...base,
+            channelTransactionId: `wrong-attempt-${randomUUID()}`
+          }
+        })
+      ]);
+      expect(invalid).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            status: "rejected",
+            reason: expect.objectContaining({
+              code: "PAYMENT_VERIFICATION_FAILED"
+            })
+          })
+        ])
+      );
+      expect(
+        invalid.every(
+          (result) =>
+            result.status === "rejected" &&
+            result.reason.code === "PAYMENT_VERIFICATION_FAILED"
+        )
+      ).toBe(true);
+      const unchanged = await query<{
+        order_status: string;
+        attempt_status: string;
+        reconciliation_state: string;
+        anomalies: string;
+        transactions: string;
+        entitlements: string;
+      }>(
+        `SELECT
+           o.status AS order_status,
+           pa.status AS attempt_status,
+           pa.reconciliation_state,
+           (SELECT count(*)::text
+              FROM payment_anomalies
+             WHERE order_id = o.id) AS anomalies,
+           (SELECT count(*)::text
+              FROM payment_transactions
+             WHERE order_id = o.id) AS transactions,
+           (SELECT count(*)::text
+              FROM entitlements
+             WHERE source_id = o.id) AS entitlements
+         FROM orders o
+         JOIN payment_attempts pa ON pa.id = $2
+         WHERE o.id = $1`,
+        [legal.order.id, legal.attemptId]
+      );
+      expect(unchanged.rows[0]).toEqual({
+        order_status: "PAYING",
+        attempt_status: "PENDING",
+        reconciliation_state: "NONE",
+        anomalies: "0",
+        transactions: "0",
+        entitlements: "0"
+      });
+      await expect(
+        markOrderPaid({
+          orderId: legal.order.id,
+          paymentAttemptId: legal.attemptId,
+          verified: {
+            ...base,
+            channelTransactionId: `legal-${randomUUID()}`
+          }
+        })
       ).resolves.toMatchObject({ status: "COMPLETED" });
+    } finally {
+      await cleanupEntitlementTestUsers(userIds);
+    }
+  });
+
+  it("persists one sanitized mismatch anomaly and schedules only the latest other channel", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const order = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `mismatch-anomaly-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      const attempts = await query<{
+        id: string;
+        channel: string;
+        marker: string;
+      }>(
+        `INSERT INTO payment_attempts(
+           order_id,
+           channel,
+           status,
+           request_snapshot,
+           created_at,
+           updated_at
+         )
+         VALUES
+           ($1, 'fake', 'CREATED', '{"marker":"old-fake"}', now() - interval '4 minutes', now() - interval '4 minutes'),
+           ($1, 'fake', 'PENDING', '{"marker":"selected"}', now() - interval '1 minute', now() - interval '1 minute'),
+           ($1, 'alipay_wap', 'CREATED', '{"marker":"old-alipay"}', now() - interval '3 minutes', now() - interval '3 minutes'),
+           ($1, 'alipay_wap', 'PENDING', '{"marker":"latest-alipay"}', now() - interval '2 minutes', now() - interval '2 minutes')
+         RETURNING id, channel, request_snapshot->>'marker' AS marker`,
+        [order.id]
+      );
+      const selected = attempts.rows.find(
+        (attempt) => attempt.marker === "selected"
+      )!;
+      const latestAlipay = attempts.rows.find(
+        (attempt) => attempt.marker === "latest-alipay"
+      )!;
+      await query(
+        "UPDATE orders SET status = 'PAYING' WHERE id = $1",
+        [order.id]
+      );
+      const rawSecret = `RAW_MUST_NOT_PERSIST_${randomUUID()}`;
+      const longTransactionId =
+        `mismatch-\n${"x".repeat(220)}-${randomUUID()}`;
+      const verified = {
+        orderNo: order.orderNo,
+        channel: "fake" as const,
+        channelTransactionId: longTransactionId,
+        amountFen: (BigInt(order.amountFen) + 1n).toString(),
+        currency: "CNY" as const,
+        paidAt: new Date().toISOString(),
+        raw: {
+          secret: rawSecret,
+          nested: { credential: "provider-private-material" }
+        }
+      };
+      const outcomes = await Promise.allSettled([
+        markOrderPaid({
+          orderId: order.id,
+          paymentAttemptId: selected.id,
+          verified
+        }),
+        markOrderPaid({
+          orderId: order.id,
+          paymentAttemptId: selected.id,
+          verified
+        })
+      ]);
+      expect(
+        outcomes.every(
+          (result) =>
+            result.status === "rejected" &&
+            result.reason.code === "PAYMENT_VERIFICATION_FAILED"
+        )
+      ).toBe(true);
+      const persisted = await query<{
+        order_status: string;
+        kind: string;
+        anomaly_status: string;
+        attempt_channel: string;
+        provider_channel: string;
+        channel_transaction_id: string;
+        provider_order_no: string;
+        amount_fen: string;
+        currency: string;
+        paid_at: Date | null;
+        anomalies: string;
+        transactions: string;
+        entitlements: string;
+        serialized: string;
+      }>(
+        `SELECT
+           o.status AS order_status,
+           anomaly.kind,
+           anomaly.status AS anomaly_status,
+           anomaly.attempt_channel,
+           anomaly.provider_channel,
+           anomaly.channel_transaction_id,
+           anomaly.provider_order_no,
+           anomaly.amount_fen,
+           anomaly.currency,
+           anomaly.paid_at,
+           (SELECT count(*)::text
+              FROM payment_anomalies
+             WHERE order_id = o.id) AS anomalies,
+           (SELECT count(*)::text
+              FROM payment_transactions
+             WHERE order_id = o.id) AS transactions,
+           (SELECT count(*)::text
+              FROM entitlements
+             WHERE source_id = o.id) AS entitlements,
+           row_to_json(anomaly)::text AS serialized
+         FROM orders o
+         JOIN payment_anomalies anomaly ON anomaly.order_id = o.id
+         WHERE o.id = $1`,
+        [order.id]
+      );
+      expect(persisted.rows[0]).toMatchObject({
+        order_status: "CLOSED",
+        kind: "PAYMENT_VERIFICATION_FAILED",
+        anomaly_status: "PENDING_REVIEW",
+        attempt_channel: "fake",
+        provider_channel: "fake",
+        provider_order_no: order.orderNo,
+        amount_fen: verified.amountFen,
+        currency: "CNY",
+        paid_at: expect.any(Date),
+        anomalies: "1",
+        transactions: "0",
+        entitlements: "0"
+      });
+      expect(persisted.rows[0].channel_transaction_id.length).toBeLessThanOrEqual(
+        160
+      );
+      expect(persisted.rows[0].channel_transaction_id).not.toMatch(
+        /[\u0000-\u001f\u007f]/
+      );
+      expect(persisted.rows[0].serialized).not.toContain(rawSecret);
+      expect(persisted.rows[0].serialized).not.toContain(
+        "provider-private-material"
+      );
+      const attemptStates = await query<{
+        marker: string;
+        status: string;
+        reconciliation_state: string;
+        reconciliation_last_result: string | null;
+        scheduled: boolean;
+      }>(
+        `SELECT
+           request_snapshot->>'marker' AS marker,
+           status,
+           reconciliation_state,
+           reconciliation_last_result,
+           reconciliation_next_at IS NOT NULL
+             AND reconciliation_deadline_at IS NOT NULL AS scheduled
+         FROM payment_attempts
+         WHERE order_id = $1
+         ORDER BY marker`,
+        [order.id]
+      );
+      expect(attemptStates.rows).toEqual([
+        {
+          marker: "latest-alipay",
+          status: "CLOSED",
+          reconciliation_state: "REQUIRED",
+          reconciliation_last_result: "LOCAL_CLOSE_PENDING_FINAL_QUERY",
+          scheduled: true
+        },
+        {
+          marker: "old-alipay",
+          status: "CLOSED",
+          reconciliation_state: "NONE",
+          reconciliation_last_result: null,
+          scheduled: false
+        },
+        {
+          marker: "old-fake",
+          status: "CLOSED",
+          reconciliation_state: "NONE",
+          reconciliation_last_result: null,
+          scheduled: false
+        },
+        {
+          marker: "selected",
+          status: "CLOSED",
+          reconciliation_state: "TERMINAL",
+          reconciliation_last_result: "PAYMENT_VERIFICATION_FAILED",
+          scheduled: false
+        }
+      ]);
+      await query(
+        `UPDATE payment_attempts
+         SET reconciliation_next_at = now() - interval '1 second'
+         WHERE id = $1`,
+        [latestAlipay.id]
+      );
+      let alipayQueries = 0;
+      const recovered = await reconcileAndCloseExpiredOrders({
+        provider: {
+          channel: "alipay_wap",
+          async createPayment() {
+            throw new Error("must not create");
+          },
+          async queryPayment() {
+            alipayQueries += 1;
+            return null;
+          },
+          async refund() {
+            return { channelRefundId: "unused", raw: {} };
+          }
+        },
+        limit: 5,
+        providerQueryBudget: 5,
+        providerTimeoutMs: 100
+      });
+      expect(alipayQueries).toBe(1);
+      expect(recovered.summary).toMatchObject({
+        scannedCount: 1,
+        scheduledRecoveryCount: 1,
+        closedRecovery: {
+          retryScheduledCount: 1,
+          retryByReason: {
+            noPayment: 1,
+            queryError: 0
+          }
+        }
+      });
+      const conflictingOrder = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `mismatch-owner-conflict-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      const conflictingAttempt = await query<{ id: string }>(
+        `INSERT INTO payment_attempts(order_id, channel, status)
+         VALUES ($1, 'fake', 'PENDING')
+         RETURNING id`,
+        [conflictingOrder.id]
+      );
+      await query(
+        "UPDATE orders SET status = 'PAYING' WHERE id = $1",
+        [conflictingOrder.id]
+      );
+      await expect(
+        markOrderPaid({
+          orderId: conflictingOrder.id,
+          paymentAttemptId: conflictingAttempt.rows[0].id,
+          verified: {
+            ...verified,
+            orderNo: conflictingOrder.orderNo,
+            amountFen: (
+              BigInt(conflictingOrder.amountFen) + 1n
+            ).toString()
+          }
+        })
+      ).rejects.toMatchObject({
+        code: "PAYMENT_VERIFICATION_FAILED"
+      });
+      const conflictState = await query<{
+        order_status: string;
+        attempt_status: string;
+        anomalies: string;
+        provider_transaction_anomalies: string;
+      }>(
+        `SELECT
+           o.status AS order_status,
+           pa.status AS attempt_status,
+           (SELECT count(*)::text
+              FROM payment_anomalies
+             WHERE order_id = o.id) AS anomalies,
+           (SELECT count(*)::text
+              FROM payment_anomalies
+             WHERE provider_channel = 'fake'
+               AND channel_transaction_id = $3)
+             AS provider_transaction_anomalies
+         FROM orders o
+         JOIN payment_attempts pa ON pa.id = $2
+         WHERE o.id = $1`,
+        [
+          conflictingOrder.id,
+          conflictingAttempt.rows[0].id,
+          persisted.rows[0].channel_transaction_id
+        ]
+      );
+      expect(conflictState.rows[0]).toEqual({
+        order_status: "PAYING",
+        attempt_status: "PENDING",
+        anomalies: "0",
+        provider_transaction_anomalies: "1"
+      });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("commits a startPayment late-payment anomaly before rejecting and skips repeat provider queries", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const order = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `start-late-anomaly-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      const attempt = await query<{ id: string }>(
+        `INSERT INTO payment_attempts(order_id, channel, status)
+         VALUES ($1, 'fake', 'PENDING')
+         RETURNING id`,
+        [order.id]
+      );
+      await query(
+        `UPDATE orders
+         SET status = 'PAYING',
+             created_at = now() - interval '3 minutes',
+             expires_at = now() - interval '1 minute'
+         WHERE id = $1`,
+        [order.id]
+      );
+      let queryCalls = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          throw new Error("must not create");
+        },
+        async queryPayment(orderNo: string) {
+          queryCalls += 1;
+          return {
+            orderNo,
+            channel: "fake" as const,
+            channelTransactionId: `start-late-${randomUUID()}`,
+            amountFen: order.amountFen,
+            currency: "CNY" as const,
+            paidAt: new Date().toISOString(),
+            raw: { secret: "START_LATE_RAW_MUST_NOT_PERSIST" }
+          };
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      const start = () =>
+        startPayment({
+          userId: userId!,
+          orderId: order.id,
+          provider,
+          clientIp: "127.0.0.1",
+          returnUrl: "http://peileme.test/return",
+          notifyUrl: "http://peileme.test/notify",
+          providerTimeoutMs: 100
+        });
+
+      await expect(start()).rejects.toMatchObject({
+        code: "PAYMENT_VERIFICATION_FAILED"
+      });
+      await expect(start()).rejects.toMatchObject({
+        code: "ORDER_STATE_CONFLICT"
+      });
+      expect(queryCalls).toBe(1);
+      const persisted = await query<{
+        order_status: string;
+        attempt_status: string;
+        reconciliation_state: string;
+        reconciliation_last_result: string;
+        kind: string;
+        anomalies: string;
+        transactions: string;
+        entitlements: string;
+        serialized: string;
+      }>(
+        `SELECT
+           o.status AS order_status,
+           pa.status AS attempt_status,
+           pa.reconciliation_state,
+           pa.reconciliation_last_result,
+           anomaly.kind,
+           (SELECT count(*)::text
+              FROM payment_anomalies
+             WHERE order_id = o.id) AS anomalies,
+           (SELECT count(*)::text
+              FROM payment_transactions
+             WHERE order_id = o.id) AS transactions,
+           (SELECT count(*)::text
+              FROM entitlements
+             WHERE source_id = o.id) AS entitlements,
+           row_to_json(anomaly)::text AS serialized
+         FROM orders o
+         JOIN payment_attempts pa ON pa.id = $2
+         JOIN payment_anomalies anomaly
+           ON anomaly.payment_attempt_id = pa.id
+         WHERE o.id = $1`,
+        [order.id, attempt.rows[0].id]
+      );
+      expect(persisted.rows[0]).toMatchObject({
+        order_status: "CLOSED",
+        attempt_status: "CLOSED",
+        reconciliation_state: "TERMINAL",
+        reconciliation_last_result: "PAYMENT_AFTER_EXPIRY",
+        kind: "PAYMENT_AFTER_EXPIRY",
+        anomalies: "1",
+        transactions: "0",
+        entitlements: "0"
+      });
+      expect(persisted.rows[0].serialized).not.toContain(
+        "START_LATE_RAW_MUST_NOT_PERSIST"
+      );
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("terminalizes open worker late and mismatch results without a hot loop", async () => {
+    await seedPolicyFoundation();
+    const userIds: string[] = [];
+    try {
+      for (const anomalyCase of [
+        {
+          marker: "worker-late",
+          kind: "PAYMENT_AFTER_EXPIRY",
+          amountDelta: 0n,
+          paidAtOffsetMs: 0
+        },
+        {
+          marker: "worker-mismatch",
+          kind: "PAYMENT_VERIFICATION_FAILED",
+          amountDelta: 1n,
+          paidAtOffsetMs: -120_000
+        }
+      ] as const) {
+        const userId = await createEntitlementTestUser(true);
+        userIds.push(userId);
+        const order = await createOrder({
+          userId,
+          sku: "POLICY_CALC",
+          channel: "main",
+          idempotencyKey: `${anomalyCase.marker}-${randomUUID()}`,
+          businessDraftId: await insertPolicyDraft(userId)
+        });
+        const attempt = await query<{ id: string }>(
+          `INSERT INTO payment_attempts(order_id, channel, status)
+           VALUES ($1, 'fake', 'PENDING')
+           RETURNING id`,
+          [order.id]
+        );
+        await query(
+          `UPDATE orders
+           SET status = 'PAYING',
+               created_at = now() - interval '3 minutes',
+               expires_at = now() - interval '1 minute'
+           WHERE id = $1`,
+          [order.id]
+        );
+        let queryCalls = 0;
+        const provider = {
+          channel: "fake" as const,
+          async createPayment() {
+            throw new Error("must not create");
+          },
+          async queryPayment(orderNo: string) {
+            queryCalls += 1;
+            return {
+              orderNo,
+              channel: "fake" as const,
+              channelTransactionId:
+                `${anomalyCase.marker}-${randomUUID()}`,
+              amountFen: (
+                BigInt(order.amountFen) + anomalyCase.amountDelta
+              ).toString(),
+              currency: "CNY" as const,
+              paidAt: new Date(
+                Date.now() + anomalyCase.paidAtOffsetMs
+              ).toISOString(),
+              raw: { secret: `${anomalyCase.marker}-raw` }
+            };
+          },
+          async refund() {
+            return { channelRefundId: "unused", raw: {} };
+          }
+        };
+        const first = await reconcileAndCloseExpiredOrders({
+          provider,
+          limit: 5,
+          providerQueryBudget: 1,
+          providerTimeoutMs: 100
+        });
+        const repeated = await reconcileAndCloseExpiredOrders({
+          provider,
+          limit: 5,
+          providerQueryBudget: 1,
+          providerTimeoutMs: 100
+        });
+        expect(queryCalls).toBe(1);
+        expect(first.summary).toMatchObject({
+          scannedCount: 1,
+          providerConfirmedPaidCount: 0,
+          deferredCount: 0,
+          terminalCount: 1,
+          hasMore: false,
+          scheduledRecoveryCount: 0,
+          deferredByReason: {
+            paymentVerificationFailed: 0
+          },
+          closedRecovery: {
+            terminalCount: 1,
+            terminalByReason: {
+              paymentAfterExpiry:
+                anomalyCase.kind === "PAYMENT_AFTER_EXPIRY" ? 1 : 0,
+              paymentVerificationFailed:
+                anomalyCase.kind === "PAYMENT_VERIFICATION_FAILED" ? 1 : 0
+            }
+          }
+        });
+        expect(repeated.summary).toMatchObject({
+          scannedCount: 0,
+          providerConfirmedPaidCount: 0,
+          deferredCount: 0,
+          hasMore: false,
+          scheduledRecoveryCount: 0
+        });
+        const persisted = await query<{
+          order_status: string;
+          attempt_status: string;
+          reconciliation_state: string;
+          reconciliation_last_result: string;
+          kind: string;
+          anomalies: string;
+          transactions: string;
+          entitlements: string;
+        }>(
+          `SELECT
+             o.status AS order_status,
+             pa.status AS attempt_status,
+             pa.reconciliation_state,
+             pa.reconciliation_last_result,
+             anomaly.kind,
+             (SELECT count(*)::text
+                FROM payment_anomalies
+               WHERE order_id = o.id) AS anomalies,
+             (SELECT count(*)::text
+                FROM payment_transactions
+               WHERE order_id = o.id) AS transactions,
+             (SELECT count(*)::text
+                FROM entitlements
+               WHERE source_id = o.id) AS entitlements
+           FROM orders o
+           JOIN payment_attempts pa ON pa.id = $2
+           JOIN payment_anomalies anomaly
+             ON anomaly.payment_attempt_id = pa.id
+           WHERE o.id = $1`,
+          [order.id, attempt.rows[0].id]
+        );
+        expect(persisted.rows[0]).toMatchObject({
+          order_status: "CLOSED",
+          attempt_status: "CLOSED",
+          reconciliation_state: "TERMINAL",
+          reconciliation_last_result: anomalyCase.kind,
+          kind: anomalyCase.kind,
+          anomalies: "1",
+          transactions: "0",
+          entitlements: "0"
+        });
+      }
+    } finally {
+      await cleanupEntitlementTestUsers(userIds);
+    }
+  });
+
+  it("records a second verified payment after completion once without granting twice", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const order = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `duplicate-payment-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      const firstAttempt = await query<{ id: string }>(
+        `INSERT INTO payment_attempts(order_id, channel, status)
+         VALUES ($1, 'fake', 'PENDING')
+         RETURNING id`,
+        [order.id]
+      );
+      const firstVerified = {
+        orderNo: order.orderNo,
+        channel: "fake" as const,
+        channelTransactionId: `first-paid-${randomUUID()}`,
+        amountFen: order.amountFen,
+        currency: "CNY" as const,
+        paidAt: new Date().toISOString(),
+        raw: { source: "first-payment" }
+      };
+      const completed = await markOrderPaid({
+        orderId: order.id,
+        paymentAttemptId: firstAttempt.rows[0].id,
+        verified: firstVerified
+      });
+      await expect(
+        markOrderPaid({
+          orderId: order.id,
+          paymentAttemptId: firstAttempt.rows[0].id,
+          verified: firstVerified
+        })
+      ).resolves.toEqual(completed);
+      const secondAttempt = await query<{ id: string }>(
+        `INSERT INTO payment_attempts(order_id, channel, status)
+         VALUES ($1, 'alipay_wap', 'PENDING')
+         RETURNING id`,
+        [order.id]
+      );
+      const rawSecret = `DUPLICATE_RAW_${randomUUID()}`;
+      const duplicateVerified = {
+        orderNo: order.orderNo,
+        channel: "alipay_wap" as const,
+        channelTransactionId: `second-paid-${randomUUID()}`,
+        amountFen: order.amountFen,
+        currency: "CNY" as const,
+        paidAt: new Date().toISOString(),
+        raw: { secret: rawSecret }
+      };
+      const duplicates = await Promise.allSettled([
+        markOrderPaid({
+          orderId: order.id,
+          paymentAttemptId: secondAttempt.rows[0].id,
+          verified: duplicateVerified
+        }),
+        markOrderPaid({
+          orderId: order.id,
+          paymentAttemptId: secondAttempt.rows[0].id,
+          verified: duplicateVerified
+        })
+      ]);
+      expect(
+        duplicates.every(
+          (result) =>
+            result.status === "rejected" &&
+            result.reason.code === "PAYMENT_VERIFICATION_FAILED"
+        )
+      ).toBe(true);
+      const persisted = await query<{
+        order_status: string;
+        second_status: string;
+        second_state: string;
+        second_result: string;
+        kind: string;
+        anomaly_status: string;
+        anomalies: string;
+        transactions: string;
+        entitlements: string;
+        serialized: string;
+      }>(
+        `SELECT
+           o.status AS order_status,
+           second.status AS second_status,
+           second.reconciliation_state AS second_state,
+           second.reconciliation_last_result AS second_result,
+           anomaly.kind,
+           anomaly.status AS anomaly_status,
+           (SELECT count(*)::text
+              FROM payment_anomalies
+             WHERE order_id = o.id) AS anomalies,
+           (SELECT count(*)::text
+              FROM payment_transactions
+             WHERE order_id = o.id) AS transactions,
+           (SELECT count(*)::text
+              FROM entitlements
+             WHERE source_id = o.id) AS entitlements,
+           row_to_json(anomaly)::text AS serialized
+         FROM orders o
+         JOIN payment_attempts second ON second.id = $2
+         JOIN payment_anomalies anomaly
+           ON anomaly.payment_attempt_id = second.id
+         WHERE o.id = $1`,
+        [order.id, secondAttempt.rows[0].id]
+      );
+      expect(persisted.rows[0]).toMatchObject({
+        order_status: "COMPLETED",
+        second_status: "CLOSED",
+        second_state: "TERMINAL",
+        second_result: "DUPLICATE_PAYMENT",
+        kind: "DUPLICATE_PAYMENT",
+        anomaly_status: "PENDING_REVIEW",
+        anomalies: "1",
+        transactions: "1",
+        entitlements: "1"
+      });
+      expect(persisted.rows[0].serialized).not.toContain(rawSecret);
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("terminalizes every other active and scheduled attempt after successful payment", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const order = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `paid-attempt-cleanup-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      const attempts = await query<{
+        id: string;
+        marker: string;
+      }>(
+        `INSERT INTO payment_attempts(
+           order_id,
+           channel,
+           status,
+           request_snapshot,
+           reconciliation_state,
+           reconciliation_next_at,
+           reconciliation_deadline_at,
+           reconciliation_last_result
+         )
+         VALUES
+           ($1, 'fake', 'PENDING', '{"marker":"selected"}', 'NONE', NULL, NULL, NULL),
+           ($1, 'fake', 'CREATED', '{"marker":"ordinary-fake"}', 'NONE', NULL, NULL, NULL),
+           ($1, 'alipay_wap', 'FAILED', '{"marker":"ordinary-alipay"}', 'NONE', NULL, NULL, NULL),
+           ($1, 'wechat_h5', 'CLOSED', '{"marker":"scheduled-wechat"}', 'REQUIRED', now(), now() + interval '1 hour', 'LOCAL_CLOSE_PENDING_FINAL_QUERY')
+         RETURNING id, request_snapshot->>'marker' AS marker`,
+        [order.id]
+      );
+      const selected = attempts.rows.find(
+        (attempt) => attempt.marker === "selected"
+      )!;
+      await expect(
+        markOrderPaid({
+          orderId: order.id,
+          paymentAttemptId: selected.id,
+          verified: {
+            orderNo: order.orderNo,
+            channel: "fake",
+            channelTransactionId: `cleanup-paid-${randomUUID()}`,
+            amountFen: order.amountFen,
+            currency: "CNY",
+            paidAt: new Date().toISOString(),
+            raw: { source: "attempt-cleanup" }
+          }
+        })
+      ).resolves.toMatchObject({ status: "COMPLETED" });
+      const states = await query<{
+        marker: string;
+        status: string;
+        reconciliation_state: string;
+        reconciliation_last_result: string;
+        reconciliation_next_at: Date | null;
+        reconciliation_deadline_at: Date | null;
+      }>(
+        `SELECT
+           request_snapshot->>'marker' AS marker,
+           status,
+           reconciliation_state,
+           reconciliation_last_result,
+           reconciliation_next_at,
+           reconciliation_deadline_at
+         FROM payment_attempts
+         WHERE order_id = $1
+           AND id <> $2
+         ORDER BY marker`,
+        [order.id, selected.id]
+      );
+      expect(states.rows).toEqual([
+        {
+          marker: "ordinary-alipay",
+          status: "CLOSED",
+          reconciliation_state: "TERMINAL",
+          reconciliation_last_result:
+            "ORDER_COMPLETED_BY_OTHER_ATTEMPT",
+          reconciliation_next_at: null,
+          reconciliation_deadline_at: null
+        },
+        {
+          marker: "ordinary-fake",
+          status: "CLOSED",
+          reconciliation_state: "TERMINAL",
+          reconciliation_last_result:
+            "ORDER_COMPLETED_BY_OTHER_ATTEMPT",
+          reconciliation_next_at: null,
+          reconciliation_deadline_at: null
+        },
+        {
+          marker: "scheduled-wechat",
+          status: "CLOSED",
+          reconciliation_state: "TERMINAL",
+          reconciliation_last_result:
+            "ORDER_COMPLETED_BY_OTHER_ATTEMPT",
+          reconciliation_next_at: null,
+          reconciliation_deadline_at: null
+        }
+      ]);
     } finally {
       if (userId) await cleanupEntitlementTestUsers([userId]);
     }
@@ -4455,6 +5510,8 @@ describe("atomic commerce orders and payments", () => {
         transactions: string;
         entitlements: string;
         completed: string;
+        anomalies: string;
+        closed: string;
       }>(
         `SELECT
            (SELECT count(*)::text
@@ -4466,13 +5523,23 @@ describe("atomic commerce orders and payments", () => {
            (SELECT count(*)::text
               FROM orders
              WHERE id = ANY($2::uuid[])
-               AND status = 'COMPLETED') AS completed`,
+               AND status = 'COMPLETED') AS completed,
+           (SELECT count(*)::text
+              FROM payment_anomalies
+             WHERE provider_channel = 'fake'
+               AND channel_transaction_id = $1) AS anomalies,
+           (SELECT count(*)::text
+              FROM orders
+             WHERE id = ANY($2::uuid[])
+               AND status = 'CLOSED') AS closed`,
         [channelTransactionId, [first.order.id, second.order.id]]
       );
       expect(persisted.rows[0]).toEqual({
         transactions: "1",
         entitlements: "1",
-        completed: "1"
+        completed: "1",
+        anomalies: "1",
+        closed: "1"
       });
     } finally {
       await cleanupEntitlementTestUsers(userIds);
@@ -4603,6 +5670,7 @@ describe("atomic commerce orders and payments", () => {
     async () => {
       let userId: string | undefined;
       try {
+        await query("VACUUM (ANALYZE) orders, payment_attempts");
         userId = await createEntitlementTestUser(true);
         await query(
           `WITH generated_orders AS (
@@ -4712,6 +5780,7 @@ describe("atomic commerce orders and payments", () => {
           /"Actual Loops":50000|"Actual Loops":50010/
         );
 
+        await closePool();
         await query(
           `SELECT
              pg_stat_reset_single_table_counters(
@@ -5068,17 +6137,24 @@ describe("atomic commerce orders and payments", () => {
         scannedCount: 2,
         closedCount: 1,
         providerConfirmedPaidCount: 0,
-        deferredCount: 1,
-        terminalCount: 0,
+        deferredCount: 0,
+        terminalCount: 1,
         hasMore: true,
         scheduledRecoveryCount: 1,
         deferredByReason: {
           providerQueryError: 0,
-          paymentVerificationFailed: 1,
+          paymentVerificationFailed: 0,
           closeCapacityExceeded: 0,
           unsafeOrChangedState: 0
         },
-        closedRecovery: emptyClosedRecoverySummary()
+        closedRecovery: {
+          ...emptyClosedRecoverySummary(),
+          terminalCount: 1,
+          terminalByReason: {
+            ...emptyClosedRecoverySummary().terminalByReason,
+            paymentVerificationFailed: 1
+          }
+        }
       });
       expect(queryCallsByRun).toEqual([
         [
@@ -5147,8 +6223,8 @@ describe("atomic commerce orders and payments", () => {
             invalidVerified.order.id,
             {
               id: invalidVerified.order.id,
-              status: "PAYMENT_FAILED",
-              error_code: "RECONCILIATION_VERIFICATION_FAILED",
+              status: "CLOSED",
+              error_code: "PAYMENT_REVIEW_REQUIRED",
               transactions: "0",
               entitlements: "0"
             }
@@ -5992,7 +7068,8 @@ describe("atomic commerce orders and payments", () => {
       expect(admin.body).toMatchObject({ paymentMode: "disabled" });
       expect(admin.body.counts).toEqual({
         openOrders: expect.stringMatching(/^\d+$/),
-        pendingAttempts: expect.stringMatching(/^\d+$/)
+        pendingAttempts: expect.stringMatching(/^\d+$/),
+        pendingPaymentAnomalies: expect.stringMatching(/^\d+$/)
       });
 
       const expiredOrder = await createOrder({

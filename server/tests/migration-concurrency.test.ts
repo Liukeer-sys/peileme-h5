@@ -745,6 +745,7 @@ describe("migration concurrency", () => {
               "orders",
               "order_items",
               "payment_attempts",
+              "payment_anomalies",
               "payment_transactions",
               "entitlements",
               "entitlement_usages",
@@ -753,7 +754,7 @@ describe("migration concurrency", () => {
               "invoice_requests"
             ]]
           );
-          expect(tables.rows[0].count).toBe("12");
+          expect(tables.rows[0].count).toBe("13");
         } finally {
           await verify.end();
         }
