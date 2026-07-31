@@ -27,6 +27,10 @@ import {
 } from "./modules/policy/routes.js";
 import { type PolicyOutput } from "./modules/policy/types.js";
 import {
+  listUserHistory,
+  type AiHistorySource
+} from "./modules/history/service.js";
+import {
   ACCESS_GRANT_MODULES,
   clearRefreshCookie,
   consumeOtp,
@@ -45,6 +49,7 @@ import {
   verifyCsrfRequest,
   verifyCodeLogin,
   verifyPasswordLogin,
+  withOtpTransaction,
   type OtpPurpose
 } from "./services.js";
 import {
@@ -202,6 +207,7 @@ export const createApp = (
     policyCalculate?: (input: unknown) => PolicyOutput;
     paymentProvider?: PaymentProvider;
     aiProviders?: readonly AiProvider[];
+    aiHistorySource?: AiHistorySource;
   } = {}
 ) => {
   const config = getConfig();
@@ -373,7 +379,7 @@ export const createApp = (
         password: passwordSchema
       })
       .parse(request.body);
-    const normalized = await withTransaction(async (client) => {
+    const normalized = await withOtpTransaction(async (client) => {
       const target = await consumeOtp(client, body.target, "reset_password", body.code);
       const passwordHash = await bcrypt.hash(body.password, 12);
       const result = await client.query<{ id: string }>(
@@ -521,6 +527,61 @@ export const createApp = (
       [request.authUser!.id, ACCESS_GRANT_MODULES]
     );
     response.json({ grants: result.rows });
+  });
+
+  const historyQuerySchema = z
+    .object({
+      page: z.coerce.number().int().min(1).default(1),
+      pageSize: z.coerce.number().int().min(1).max(100).default(20)
+    })
+    .strict();
+
+  app.get("/api/me/history", requireAuth, async (request, response) => {
+    const params = historyQuerySchema.parse(request.query);
+    const history = await listUserHistory({
+      userId: request.authUser!.id,
+      channel: request.productChannel!,
+      page: params.page,
+      pageSize: params.pageSize,
+      aiHistorySource: options.aiHistorySource
+    });
+    response.json({ channel: request.productChannel, ...history });
+  });
+
+  app.get("/api/account/history", requireAuth, async (request, response) => {
+    const params = historyQuerySchema.parse(request.query);
+    const channel = request.productChannel!;
+    const history = await listUserHistory({
+      userId: request.authUser!.id,
+      channel,
+      page: params.page,
+      pageSize: params.pageSize,
+      aiHistorySource: options.aiHistorySource,
+      includePolicy: channel === "main"
+    });
+    response.set("deprecation", "true");
+    response.json({
+      items: history.items.map((item) => ({
+        ...item,
+        sourceId: item.id,
+        source:
+          item.kind === "order"
+            ? "order"
+            : item.kind === "policy_assessment"
+              ? "policy_calculation"
+              : item.kind === "document_analysis"
+                ? "upload"
+                : "ai_task",
+        productChannel: channel
+      })),
+      pagination: history.pagination,
+      sourceStatus: {
+        policy_calculations: channel === "main" ? "available" : "not_applicable",
+        orders: "available",
+        uploads: channel === "ai" ? "available" : "not_applicable",
+        ai_tasks: options.aiHistorySource ? "available" : "not_registered"
+      }
+    });
   });
 
   const assessmentBodySchema = z.object({

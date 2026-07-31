@@ -62,27 +62,33 @@ export const sendOtp = async (
       channel === "email" ? "邮箱验证码渠道尚未配置" : "短信验证码渠道尚未配置"
     );
   }
-  const recent = await query<{ count: string }>(
-    `SELECT count(*)::text AS count
-      FROM otp_codes
-      WHERE target = $1
-        AND purpose = $2
-        AND created_at > now() - interval '1 minute'`,
-    [target, purpose]
-  );
-  if (Number(recent.rows[0]?.count || 0) > 0) {
-    throw new ApiError(429, "OTP_TOO_FREQUENT", "验证码发送过于频繁，请稍后再试");
-  }
   const code = createOtpCode();
   const codeHash = hashOtpCode(target, purpose, code);
-  const inserted = await query<{ id: string }>(
-    `INSERT INTO otp_codes
-       (channel, target, purpose, code_hash, requester_ip, expires_at)
-     VALUES ($1, $2, $3, $4, $5, now() + ($6 || ' minutes')::interval)
-     RETURNING id`,
-    [channel, target, purpose, codeHash, requesterIp || null, getConfig().OTP_TTL_MINUTES]
-  );
-  const id = inserted.rows[0].id;
+  const id = await withTransaction(async (client) => {
+    await client.query(
+      "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+      [`${target.length}:${target}:${purpose}`]
+    );
+    const recent = await client.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+        FROM otp_codes
+        WHERE target = $1
+          AND purpose = $2
+          AND created_at > now() - interval '1 minute'`,
+      [target, purpose]
+    );
+    if (Number(recent.rows[0]?.count || 0) > 0) {
+      throw new ApiError(429, "OTP_TOO_FREQUENT", "验证码发送过于频繁，请稍后再试");
+    }
+    const inserted = await client.query<{ id: string }>(
+      `INSERT INTO otp_codes
+         (channel, target, purpose, code_hash, requester_ip, expires_at)
+       VALUES ($1, $2, $3, $4, $5, now() + ($6 || ' minutes')::interval)
+       RETURNING id`,
+      [channel, target, purpose, codeHash, requesterIp || null, getConfig().OTP_TTL_MINUTES]
+    );
+    return inserted.rows[0].id;
+  });
   try {
     const delivery = await deliverOtp(channel, target, code);
     await query(
@@ -142,7 +148,16 @@ export const consumeOtp = async (
   }
   const valid = hashOtpCode(target, purpose, code) === otp.code_hash;
   if (!valid) {
-    await client.query("UPDATE otp_codes SET attempts = attempts + 1 WHERE id = $1", [otp.id]);
+    const updated = await client.query<{ attempts: number; max_attempts: number }>(
+      `UPDATE otp_codes
+          SET attempts = attempts + 1
+        WHERE id = $1
+        RETURNING attempts, max_attempts`,
+      [otp.id]
+    );
+    if (updated.rows[0].attempts >= updated.rows[0].max_attempts) {
+      throw new ApiError(429, "OTP_ATTEMPTS_EXCEEDED", "验证码尝试次数过多");
+    }
     throw new ApiError(400, "OTP_INVALID_OR_EXPIRED", "验证码错误或已过期");
   }
   await client.query(
@@ -150,6 +165,27 @@ export const consumeOtp = async (
     [otp.id]
   );
   return { channel, target };
+};
+
+const persistsOtpAttempt = (error: unknown): error is ApiError =>
+  error instanceof ApiError &&
+  ["OTP_INVALID_OR_EXPIRED", "OTP_ATTEMPTS_EXCEEDED"].includes(error.code);
+
+export const withOtpTransaction = async <T>(
+  callback: (client: pg.PoolClient) => Promise<T>
+): Promise<T> => {
+  const outcome = await withTransaction(async (client) => {
+    try {
+      return { ok: true as const, value: await callback(client) };
+    } catch (error) {
+      if (persistsOtpAttempt(error)) {
+        return { ok: false as const, error };
+      }
+      throw error;
+    }
+  });
+  if (!outcome.ok) throw outcome.error;
+  return outcome.value;
 };
 
 type InviteRecord = {
@@ -599,7 +635,7 @@ export const registerUser = async (input: {
   displayName?: string;
   inviteCode?: string;
 }) =>
-  withTransaction(async (client) => {
+  withOtpTransaction(async (client) => {
     const verified = await consumeOtp(client, input.target, "register", input.code);
     if (getConfig().REGISTRATION_REQUIRE_INVITE && !input.inviteCode) {
       throw new ApiError(400, "INVITE_REQUIRED", "注册需要邀请码");
@@ -686,7 +722,7 @@ export const verifyPasswordLogin = async (identifier: string, password: string) 
 };
 
 export const verifyCodeLogin = async (identifier: string, code: string) =>
-  withTransaction(async (client) => {
+  withOtpTransaction(async (client) => {
     const verified = await consumeOtp(client, identifier, "login", code);
     const result = await client.query<{
       id: string;
