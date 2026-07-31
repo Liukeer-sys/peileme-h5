@@ -84,4 +84,74 @@ describe("payment evidence full-content digest", () => {
       }
     );
   });
+
+  it("includes non-index array string data keys", () => {
+    const makeEvidence = (meta: string) => {
+      const items = Array.from({ length: 51 }, (_, index) => index);
+      Object.defineProperty(items, "meta", {
+        value: meta,
+        enumerable: true
+      });
+      return items;
+    };
+    expectDistinctStableHashes(makeEvidence("A"), makeEvidence("B"));
+  });
+
+  it("includes non-index array symbol data keys", () => {
+    const metaKey = Symbol.for("payment-evidence-meta");
+    const makeEvidence = (meta: string) => {
+      const items = Array.from({ length: 51 }, (_, index) => index);
+      Object.defineProperty(items, metaKey, {
+        value: meta,
+        enumerable: true
+      });
+      return items;
+    };
+    expectDistinctStableHashes(makeEvidence("A"), makeEvidence("B"));
+  });
+
+  it("includes Date own data keys after its intrinsic value", () => {
+    const makeEvidence = (meta: string) => {
+      const date = new Date("2026-08-01T00:00:00.000Z");
+      Object.defineProperty(date, "meta", {
+        value: meta,
+        enumerable: true
+      });
+      return { oversized: "x".repeat(5_000), date };
+    };
+    expectDistinctStableHashes(makeEvidence("A"), makeEvidence("B"));
+  });
+
+  it("includes typed view extra own data keys after its bytes", () => {
+    const makeEvidence = (meta: string) => {
+      const bytes = new Uint8Array([1, 2, 3]);
+      Object.defineProperty(bytes, "meta", {
+        value: meta,
+        enumerable: true
+      });
+      return { oversized: "x".repeat(5_000), bytes };
+    };
+    expectDistinctStableHashes(makeEvidence("A"), makeEvidence("B"));
+  });
+
+  it("includes ArrayBuffer extra own data keys after its bytes", () => {
+    const makeEvidence = (meta: string) => {
+      const bytes = new ArrayBuffer(3);
+      new Uint8Array(bytes).set([1, 2, 3]);
+      Object.defineProperty(bytes, "meta", {
+        value: meta,
+        enumerable: true
+      });
+      return { oversized: "x".repeat(5_000), bytes };
+    };
+    expectDistinctStableHashes(makeEvidence("A"), makeEvidence("B"));
+  });
+
+  it("stably hashes revoked proxies without throwing", () => {
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+
+    const first = hashOf(proxy);
+    expect(hashOf(proxy)).toBe(first);
+  });
 });

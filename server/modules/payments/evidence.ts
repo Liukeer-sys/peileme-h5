@@ -19,9 +19,17 @@ const hashEvidence = (input: unknown) => {
   let nextObjectId = 0;
 
   type HashBytes = string | Uint8Array;
+  type OwnPropertyMode = "all" | "array-extras" | "typed-array-extras";
   type HashTask =
     | { kind: "value"; value: unknown }
-    | { kind: "token"; tag: string; data?: HashBytes };
+    | { kind: "token"; tag: string; data?: HashBytes }
+    | {
+        kind: "own-properties";
+        value: object;
+        objectId: number;
+        mode: OwnPropertyMode;
+        indexedLength: number;
+      };
 
   const writeToken = (tag: string, data: HashBytes = "") => {
     const tagBytes = Buffer.byteLength(tag, "utf8");
@@ -41,12 +49,105 @@ const hashEvidence = (input: unknown) => {
     data
   });
   const valueTask = (value: unknown): HashTask => ({ kind: "value", value });
+  const ownPropertiesTask = (
+    value: object,
+    objectId: number,
+    mode: OwnPropertyMode = "all",
+    indexedLength = 0
+  ): HashTask => ({
+    kind: "own-properties",
+    value,
+    objectId,
+    mode,
+    indexedLength
+  });
   const tasks: HashTask[] = [valueTask(input)];
+
+  const isProcessedIndexKey = (key: PropertyKey, indexedLength: number) => {
+    if (typeof key !== "string") return false;
+    const index = Number(key);
+    return (
+      Number.isInteger(index) &&
+      index >= 0 &&
+      index < indexedLength &&
+      String(index) === key
+    );
+  };
+
+  const enqueueOwnProperties = (
+    value: object,
+    objectId: number,
+    mode: OwnPropertyMode,
+    indexedLength: number
+  ) => {
+    let ownKeys: PropertyKey[];
+    try {
+      ownKeys = Reflect.ownKeys(value);
+    } catch {
+      writeToken("unreadable-object", String(objectId));
+      return;
+    }
+    const sortedKeys = ownKeys
+      .filter((key) => {
+        if (mode === "array-extras" && key === "length") return false;
+        if (mode === "all") return true;
+        return !isProcessedIndexKey(key, indexedLength);
+      })
+      .map((key, ordinal) => ({
+        key,
+        ordinal,
+        label:
+          typeof key === "symbol"
+            ? `symbol:${Symbol.keyFor(key) ?? ""}:${key.description ?? ""}`
+            : `string:${String(key)}`
+      }))
+      .sort(
+        (left, right) =>
+          (left.label < right.label ? -1 : left.label > right.label ? 1 : 0) ||
+          left.ordinal - right.ordinal
+      );
+    writeToken("own-properties-start", `${objectId}:${sortedKeys.length}`);
+    tasks.push(token("own-properties-end"));
+    for (let index = sortedKeys.length - 1; index >= 0; index -= 1) {
+      const { key, label } = sortedKeys[index];
+      let descriptor: PropertyDescriptor | undefined;
+      try {
+        descriptor = Object.getOwnPropertyDescriptor(value, key);
+      } catch {
+        tasks.push(token("property-unreadable", label));
+        continue;
+      }
+      if (!descriptor) {
+        tasks.push(token("property-missing", label));
+        continue;
+      }
+      if ("value" in descriptor) {
+        tasks.push(valueTask(descriptor.value));
+        tasks.push(token("property-key", label));
+      } else {
+        tasks.push(
+          token(
+            "property-accessor",
+            `${label}:get=${Boolean(descriptor.get)}:set=${Boolean(descriptor.set)}`
+          )
+        );
+      }
+    }
+  };
 
   while (tasks.length > 0) {
     const task = tasks.pop()!;
     if (task.kind === "token") {
       writeToken(task.tag, task.data);
+      continue;
+    }
+    if (task.kind === "own-properties") {
+      enqueueOwnProperties(
+        task.value,
+        task.objectId,
+        task.mode,
+        task.indexedLength
+      );
       continue;
     }
     const value = task.value;
@@ -100,39 +201,103 @@ const hashEvidence = (input: unknown) => {
     nextObjectId += 1;
     seen.set(value, objectId);
 
-    if (value instanceof Date) {
-      const time = value.getTime();
-      writeToken(
-        "date",
-        Number.isNaN(time) ? "[Invalid Date]" : value.toISOString()
-      );
+    let isDate: boolean;
+    let isBinaryView: boolean;
+    let isArrayBuffer: boolean;
+    let isArray: boolean;
+    try {
+      isDate = value instanceof Date;
+      isBinaryView = ArrayBuffer.isView(value);
+      isArrayBuffer = value instanceof ArrayBuffer;
+      isArray = Array.isArray(value);
+    } catch {
+      writeToken("unreadable-object", String(objectId));
       continue;
     }
-    if (ArrayBuffer.isView(value)) {
+
+    if (isDate) {
+      const dateValue = value as Date;
+      try {
+        const time = dateValue.getTime();
+        writeToken(
+          "date",
+          Number.isNaN(time) ? "[Invalid Date]" : dateValue.toISOString()
+        );
+      } catch {
+        writeToken("unreadable-object", String(objectId));
+        continue;
+      }
+      tasks.push(ownPropertiesTask(value, objectId));
+      continue;
+    }
+    if (isBinaryView) {
+      const binaryView = value as ArrayBufferView;
       let viewName = "ArrayBufferView";
       try {
         viewName = Object.prototype.toString.call(value);
       } catch {
         viewName = "[Unreadable ArrayBufferView]";
       }
-      writeToken("binary-view-type", viewName);
-      writeToken(
-        "binary-view-bytes",
-        new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+      let indexedLength = 0;
+      try {
+        writeToken("binary-view-type", viewName);
+        writeToken(
+          "binary-view-bytes",
+          new Uint8Array(
+            binaryView.buffer,
+            binaryView.byteOffset,
+            binaryView.byteLength
+          )
+        );
+        if (!(binaryView instanceof DataView)) {
+          indexedLength = (binaryView as unknown as { length: number }).length;
+        }
+      } catch {
+        writeToken("unreadable-object", String(objectId));
+        continue;
+      }
+      tasks.push(
+        ownPropertiesTask(
+          value,
+          objectId,
+          indexedLength > 0 ? "typed-array-extras" : "all",
+          indexedLength
+        )
       );
       continue;
     }
-    if (value instanceof ArrayBuffer) {
-      writeToken("array-buffer", new Uint8Array(value));
+    if (isArrayBuffer) {
+      const arrayBufferValue = value as ArrayBuffer;
+      try {
+        writeToken("array-buffer", new Uint8Array(arrayBufferValue));
+      } catch {
+        writeToken("unreadable-object", String(objectId));
+        continue;
+      }
+      tasks.push(ownPropertiesTask(value, objectId));
       continue;
     }
-    if (Array.isArray(value)) {
-      writeToken("array-start", `${objectId}:${value.length}`);
+    if (isArray) {
+      const arrayValue = value as unknown[];
+      let arrayLength: number;
+      try {
+        arrayLength = arrayValue.length;
+      } catch {
+        writeToken("unreadable-object", String(objectId));
+        continue;
+      }
+      writeToken("array-start", `${objectId}:${arrayLength}`);
+      tasks.push(
+        ownPropertiesTask(value, objectId, "array-extras", arrayLength)
+      );
       tasks.push(token("array-end"));
-      for (let index = value.length - 1; index >= 0; index -= 1) {
+      for (let index = arrayLength - 1; index >= 0; index -= 1) {
         let descriptor: PropertyDescriptor | undefined;
         try {
-          descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+          descriptor = Object.getOwnPropertyDescriptor(
+            arrayValue,
+            String(index)
+          );
         } catch {
           tasks.push(token("array-item-unreadable", String(index)));
           continue;
@@ -155,55 +320,8 @@ const hashEvidence = (input: unknown) => {
       }
       continue;
     }
-
-    let ownKeys: PropertyKey[];
-    try {
-      ownKeys = Reflect.ownKeys(value);
-    } catch {
-      writeToken("unreadable-object", String(objectId));
-      continue;
-    }
-    const sortedKeys = ownKeys
-      .map((key, ordinal) => ({
-        key,
-        ordinal,
-        label:
-          typeof key === "symbol"
-            ? `symbol:${Symbol.keyFor(key) ?? ""}:${key.description ?? ""}`
-            : `string:${String(key)}`
-      }))
-      .sort(
-        (left, right) =>
-          (left.label < right.label ? -1 : left.label > right.label ? 1 : 0) ||
-          left.ordinal - right.ordinal
-      );
-    writeToken("object-start", `${objectId}:${sortedKeys.length}`);
-    tasks.push(token("object-end"));
-    for (let index = sortedKeys.length - 1; index >= 0; index -= 1) {
-      const { key, label } = sortedKeys[index];
-      let descriptor: PropertyDescriptor | undefined;
-      try {
-        descriptor = Object.getOwnPropertyDescriptor(value, key);
-      } catch {
-        tasks.push(token("property-unreadable", label));
-        continue;
-      }
-      if (!descriptor) {
-        tasks.push(token("property-missing", label));
-        continue;
-      }
-      if ("value" in descriptor) {
-        tasks.push(valueTask(descriptor.value));
-        tasks.push(token("property-key", label));
-      } else {
-        tasks.push(
-          token(
-            "property-accessor",
-            `${label}:get=${Boolean(descriptor.get)}:set=${Boolean(descriptor.set)}`
-          )
-        );
-      }
-    }
+    writeToken("object", String(objectId));
+    tasks.push(ownPropertiesTask(value, objectId));
   }
   return hash.digest("hex");
 };
@@ -247,20 +365,54 @@ export const sanitizePaymentEvidence = (input: unknown): unknown => {
 
     if (seen.has(value)) return "[Circular]";
     seen.add(value);
-    if (value instanceof Date) return value.toISOString();
-    if (ArrayBuffer.isView(value)) return `[Binary ${value.byteLength} bytes]`;
-    if (Array.isArray(value)) {
-      if (value.length > MAX_ARRAY_ITEMS) {
+    let isDate: boolean;
+    let isBinaryView: boolean;
+    let isArray: boolean;
+    try {
+      isDate = value instanceof Date;
+      isBinaryView = ArrayBuffer.isView(value);
+      isArray = Array.isArray(value);
+    } catch {
+      limitExceeded = true;
+      return "[Unreadable Object]";
+    }
+    if (isDate) {
+      const dateValue = value as Date;
+      try {
+        return dateValue.toISOString();
+      } catch {
         limitExceeded = true;
-        return null;
+        return "[Unreadable Date]";
       }
-      return value.map((item) => visit(item, depth + 1));
+    }
+    if (isBinaryView) {
+      const binaryView = value as ArrayBufferView;
+      try {
+        return `[Binary ${binaryView.byteLength} bytes]`;
+      } catch {
+        limitExceeded = true;
+        return "[Unreadable Binary]";
+      }
+    }
+    if (isArray) {
+      const arrayValue = value as unknown[];
+      try {
+        if (arrayValue.length > MAX_ARRAY_ITEMS) {
+          limitExceeded = true;
+          return null;
+        }
+        return arrayValue.map((item) => visit(item, depth + 1));
+      } catch {
+        limitExceeded = true;
+        return "[Unreadable Array]";
+      }
     }
 
     let keys: string[];
     try {
       keys = Object.keys(value);
     } catch {
+      limitExceeded = true;
       return "[Unreadable Object]";
     }
     if (keys.length > MAX_OBJECT_KEYS) {
