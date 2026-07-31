@@ -5,9 +5,11 @@ import {
   openSync,
   readFileSync
 } from "node:fs";
+import { TextDecoder } from "node:util";
 
 const paymentSecretMaximumBytes = 256 * 1024;
 const envSecretReferencePattern = /^env:([A-Z_][A-Z0-9_]*)$/;
+const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
 export type PaymentSecretSource = {
   name: string;
@@ -29,10 +31,26 @@ const removeOneLineEnding = (value: string) =>
 const validateSecretValue = (name: string, value: string) => {
   const normalized = removeOneLineEnding(value);
   if (!normalized.length) throw secretError(name, "is missing or empty");
+  if (normalized.includes("\0")) {
+    throw secretError(name, "must not contain NUL control characters");
+  }
   if (Buffer.byteLength(normalized, "utf8") > paymentSecretMaximumBytes) {
     throw secretError(name, "exceeds the maximum allowed size");
   }
   return normalized;
+};
+
+const validateSecretBytes = (name: string, value: Buffer) => {
+  if (value.byteLength > paymentSecretMaximumBytes + 2) {
+    throw secretError(name, "secret file exceeds the maximum allowed size");
+  }
+  let decoded: string;
+  try {
+    decoded = utf8Decoder.decode(value);
+  } catch {
+    throw secretError(name, "must contain valid UTF-8 text");
+  }
+  return validateSecretValue(name, decoded);
 };
 
 const loadSecretFile = (name: string, file: string) => {
@@ -40,7 +58,9 @@ const loadSecretFile = (name: string, file: string) => {
   try {
     descriptor = openSync(
       file,
-      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)
+      constants.O_RDONLY |
+        constants.O_NONBLOCK |
+        (constants.O_NOFOLLOW ?? 0)
     );
     const status = fstatSync(descriptor);
     if (!status.isFile()) {
@@ -52,10 +72,7 @@ const loadSecretFile = (name: string, file: string) => {
     if ((status.mode & 0o222) !== 0) {
       throw secretError(name, "secret file must be read-only");
     }
-    if (status.size > paymentSecretMaximumBytes + 2) {
-      throw secretError(name, "secret file exceeds the maximum allowed size");
-    }
-    return validateSecretValue(name, readFileSync(descriptor, "utf8"));
+    return validateSecretBytes(name, readFileSync(descriptor));
   } catch (error) {
     if (error instanceof Error && error.message.startsWith(`${name} `)) {
       throw error;

@@ -1,6 +1,6 @@
 # T4.2 支付配置与 Provider 契约验收证据
 
-验收日期：2026-07-31
+验收日期：2026-08-01
 
 ## 范围
 
@@ -60,12 +60,25 @@ exit 0
 
 项目级单进程全量在并行 T4.1 新 RED 写入共享工作树后停止：新增最大稀疏数组用例触发约 4 GB 堆 OOM，且 commerce 的新增敏感别名 RED 尚待 T4.1 修复。该运行不用于判定 T4.2；T4.1 稳定后应以独占分片重跑项目全量。
 
+T4.1 稳定后，纳入配置测试并仅排除两个尚未实现的渠道适配器 RED，
+项目级单进程回归为 30 files / 722 tests 全部通过。
+
+独立安全复审新增 8 条 RED：FIFO 阻塞、非法 UTF-8、NUL、非 ASCII
+APIv3 key、可变配置缓存、商户 ID 空白、registry 工厂非原子调用和残缺
+provider runtime contract。修复后的配置与 Host 聚焦回归为 6 files / 136
+tests 全部通过，其中配置/secret/registry 为 26/26。
+
 ## 自审结论
 
 - `fake` 配置在 test 与 production 均 fail-fast；
 - `live` 空渠道、缺失凭证、缺失/不可读/可写 secret 文件、非 HTTPS 通知源、非 32 字节微信 APIv3 key 均 fail-fast；
-- secret 文件以 `O_NOFOLLOW` 打开并校验为只读普通文件，错误不包含 secret 值；
+- secret 文件以 `O_NOFOLLOW | O_NONBLOCK` 打开并校验为只读普通文件，
+  FIFO/设备/软链接均快速拒绝；原始字节执行有界读取、严格 UTF-8 与 NUL
+  校验，错误不包含 secret 值；
 - `env:` 引用只把环境变量名保留在配置对象中，secret 值不进入配置序列化；
-- registry 仅返回已配置真实渠道的展示信息和 provider 实例，不保存或列出配置/密钥；
+- 微信 APIv3 key 必须为 32 字节可打印 ASCII，商户标识不得包含首尾空白；
+- 规范化配置和渠道数组递归冻结，验证后不能注入未校验渠道；
+- registry 在调用任何工厂前预检全部依赖，并校验 provider 的 channel 与
+  create/query/refund runtime contract；仅在全部成功后发布冻结的渠道元数据；
 - registry/config 构造测试将全局 `fetch` 设为失败哨兵，网络调用计数为 0；
 - `RealPaymentChannel` 明确限定微信 H5 与支付宝 WAP，现有 `PaymentChannel`/`FakePaymentProvider` 继续支持历史数据与旧测试读取。

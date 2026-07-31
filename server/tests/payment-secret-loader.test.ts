@@ -1,6 +1,8 @@
+import { execFileSync, spawnSync } from "node:child_process";
 import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { loadPaymentSecret } from "../modules/payments/secret-loader.js";
 
@@ -70,6 +72,75 @@ describe("payment secret loader", () => {
       expect(() =>
         loadPaymentSecret({ name: "TEST_PAYMENT_SECRET", file: link })
       ).toThrow(/regular file/i);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a FIFO promptly instead of blocking while opening it", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "peileme-secret-"));
+    const fifo = path.join(directory, "secret-fifo");
+    try {
+      execFileSync("mkfifo", [fifo]);
+      const moduleUrl = pathToFileURL(
+        path.resolve("server/modules/payments/secret-loader.ts")
+      ).href;
+      const script = `
+        import { loadPaymentSecret } from ${JSON.stringify(moduleUrl)};
+        try {
+          loadPaymentSecret({ name: "TEST_PAYMENT_SECRET", file: ${JSON.stringify(fifo)} });
+          process.exitCode = 2;
+        } catch (error) {
+          console.error(String(error));
+        }
+      `;
+      const result = spawnSync(
+        path.resolve("node_modules/.bin/tsx"),
+        ["-e", script],
+        { encoding: "utf8", timeout: 1_000 }
+      );
+
+      expect((result.error as NodeJS.ErrnoException | undefined)?.code)
+        .not.toBe("ETIMEDOUT");
+      expect(result.status).toBe(0);
+      expect(result.stderr).toMatch(/regular file/i);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects malformed UTF-8 file bytes without echoing them", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "peileme-secret-"));
+    const file = path.join(directory, "invalid-utf8");
+    try {
+      await writeFile(file, Buffer.from([0xff, 0xfe, 0xfd]), { mode: 0o400 });
+      await chmod(file, 0o400);
+      expect(() =>
+        loadPaymentSecret({ name: "TEST_PAYMENT_SECRET", file })
+      ).toThrow(/valid UTF-8/i);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects NUL in file and env secret values", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "peileme-secret-"));
+    const file = path.join(directory, "nul-secret");
+    try {
+      await writeFile(file, Buffer.from("before\0after", "utf8"), {
+        mode: 0o400
+      });
+      await chmod(file, 0o400);
+      expect(() =>
+        loadPaymentSecret({ name: "FILE_PAYMENT_SECRET", file })
+      ).toThrow(/NUL|control/i);
+      expect(() =>
+        loadPaymentSecret({
+          name: "ENV_PAYMENT_SECRET",
+          secretRef: "env:PAYMENT_SECRET_VALUE",
+          environment: { PAYMENT_SECRET_VALUE: "before\0after" }
+        })
+      ).toThrow(/NUL|control/i);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

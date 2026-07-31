@@ -23,6 +23,34 @@ const providerLabels: Readonly<Record<RealPaymentChannel, string>> = {
 };
 
 const unavailable = () => new Error("PAYMENT_PROVIDER_UNAVAILABLE");
+const providerMethodNames = [
+  "createPayment",
+  "queryPayment",
+  "refund"
+] as const;
+
+const factoryForChannel = (
+  channel: RealPaymentChannel,
+  dependencies: PaymentProviderRegistryDependencies
+) =>
+  channel === "wechat_h5"
+    ? dependencies.wechatFactory
+    : dependencies.alipayFactory;
+
+const assertProviderContract = (
+  channel: RealPaymentChannel,
+  provider: RealPaymentProvider | undefined
+) => {
+  if (
+    !provider ||
+    provider.channel !== channel ||
+    providerMethodNames.some(
+      (methodName) => typeof provider[methodName] !== "function"
+    )
+  ) {
+    throw new Error(`${channel} provider does not satisfy the runtime contract`);
+  }
+};
 
 export const createPaymentProviderRegistry = (
   config: PaymentRegistryConfig,
@@ -37,29 +65,33 @@ export const createPaymentProviderRegistry = (
     if (!config.PAYMENT_PROVIDERS.length) {
       throw new Error("PAYMENT_PROVIDERS must configure at least one provider");
     }
-    for (const channel of config.PAYMENT_PROVIDERS) {
-      if (!isRealPaymentChannel(channel) || providers.has(channel)) {
+    const channels = [...config.PAYMENT_PROVIDERS];
+    const seenChannels = new Set<RealPaymentChannel>();
+    for (const channel of channels) {
+      if (!isRealPaymentChannel(channel) || seenChannels.has(channel)) {
         throw new Error(`PAYMENT_PROVIDERS contains invalid channel ${channel}`);
       }
-      const factory =
-        channel === "wechat_h5"
-          ? dependencies.wechatFactory
-          : dependencies.alipayFactory;
+      const factory = factoryForChannel(channel, dependencies);
       if (!factory) {
         throw new Error(`${channel} provider factory is not configured`);
       }
+      seenChannels.add(channel);
+    }
+    for (const channel of channels) {
+      const factory = factoryForChannel(channel, dependencies)!;
       const provider = factory();
-      if (!provider || provider.channel !== channel) {
-        throw new Error(`${channel} provider factory is not configured`);
-      }
+      assertProviderContract(channel, provider);
       providers.set(channel, provider);
     }
   }
 
-  const listAvailable = () =>
+  const availableProviders = Object.freeze(
     [...providers.keys()].map((channel) =>
       Object.freeze({ channel, label: providerLabels[channel] })
-    );
+    )
+  );
+
+  const listAvailable = () => availableProviders;
 
   return Object.freeze({
     listAvailable,

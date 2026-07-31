@@ -100,6 +100,25 @@ const validWechatEnvironment = async (directory: string) => ({
   )
 });
 
+const completeProvider = (channel: "wechat_h5" | "alipay_wap") => ({
+  channel,
+  async createPayment() {
+    throw new Error("not invoked");
+  },
+  async queryPayment() {
+    throw new Error("not invoked");
+  },
+  async closePayment() {
+    throw new Error("not invoked");
+  },
+  async refundPayment() {
+    throw new Error("not invoked");
+  },
+  async refund() {
+    throw new Error("not invoked");
+  }
+});
+
 describe("Task 4 payment configuration and registry contract (RED)", () => {
   it.each(["test", "production"])(
     "rejects PAYMENT_MODE=fake in %s",
@@ -219,6 +238,66 @@ describe("Task 4 payment configuration and registry contract (RED)", () => {
     }
   });
 
+  it("requires a canonical printable ASCII WeChat APIv3 key", async () => {
+    const secretDirectory = await mkdtemp(
+      path.join(tmpdir(), "peileme-payment-config-")
+    );
+    try {
+      const environment = await validWechatEnvironment(secretDirectory);
+      await chmod(environment.WECHAT_PAY_API_V3_KEY_FILE, 0o600);
+      await writeFile(
+        environment.WECHAT_PAY_API_V3_KEY_FILE,
+        `${"é".repeat(16)}\n`,
+        "utf8"
+      );
+      await chmod(environment.WECHAT_PAY_API_V3_KEY_FILE, 0o400);
+      await withEnvironment(environment, () => {
+        expect(() => getConfig()).toThrow(
+          /WECHAT_PAY_API_V3_KEY.*(?:ASCII|32 bytes)/i
+        );
+      });
+    } finally {
+      await rm(secretDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("deep-freezes cached payment configuration", async () => {
+    const secretDirectory = await mkdtemp(
+      path.join(tmpdir(), "peileme-payment-config-")
+    );
+    try {
+      const environment = await validWechatEnvironment(secretDirectory);
+      await withEnvironment(environment, () => {
+        const config = getConfig();
+        expect(Object.isFrozen(config)).toBe(true);
+        expect(Object.isFrozen(config.PAYMENT_PROVIDERS)).toBe(true);
+        expect(() =>
+          (config.PAYMENT_PROVIDERS as string[]).push("alipay_wap")
+        ).toThrow(TypeError);
+        expect(getConfig().PAYMENT_PROVIDERS).toEqual(["wechat_h5"]);
+      });
+    } finally {
+      await rm(secretDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects merchant identifiers with surrounding whitespace", async () => {
+    const secretDirectory = await mkdtemp(
+      path.join(tmpdir(), "peileme-payment-config-")
+    );
+    try {
+      const environment = await validWechatEnvironment(secretDirectory);
+      environment.WECHAT_PAY_APP_ID = " wx-production-app-id";
+      await withEnvironment(environment, () => {
+        expect(() => getConfig()).toThrow(
+          /WECHAT_PAY_APP_ID.*(?:canonical|whitespace)/i
+        );
+      });
+    } finally {
+      await rm(secretDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("accepts named env secret references without returning secret values", async () => {
     const secretDirectory = await mkdtemp(
       path.join(tmpdir(), "peileme-payment-config-")
@@ -295,8 +374,8 @@ describe("Task 4 payment configuration and registry contract (RED)", () => {
     const registryModule = await import(
       /* @vite-ignore */ moduleUrl
     );
-    const wechat = { channel: "wechat_h5" as const };
-    const alipay = { channel: "alipay_wap" as const };
+    const wechat = completeProvider("wechat_h5");
+    const alipay = completeProvider("alipay_wap");
     const registry = registryModule.createPaymentProviderRegistry(
       {
         PAYMENT_MODE: "live",
@@ -337,6 +416,49 @@ describe("Task 4 payment configuration and registry contract (RED)", () => {
     ).toThrow(/wechat_h5.*(?:factory|configured|available)/i);
   });
 
+  it("preflights every configured factory before invoking any factory", async () => {
+    const moduleUrl = pathToFileURL(
+      path.resolve("server/modules/payments/registry.ts")
+    ).href;
+    const registryModule = await import(/* @vite-ignore */ moduleUrl);
+    let wechatFactoryCalls = 0;
+
+    expect(() =>
+      registryModule.createPaymentProviderRegistry(
+        {
+          PAYMENT_MODE: "live",
+          PAYMENT_PROVIDERS: ["wechat_h5", "alipay_wap"]
+        },
+        {
+          wechatFactory: () => {
+            wechatFactoryCalls += 1;
+            return completeProvider("wechat_h5");
+          }
+        }
+      )
+    ).toThrow(/alipay_wap.*factory/i);
+    expect(wechatFactoryCalls).toBe(0);
+  });
+
+  it("rejects provider instances with an incomplete runtime contract", async () => {
+    const moduleUrl = pathToFileURL(
+      path.resolve("server/modules/payments/registry.ts")
+    ).href;
+    const registryModule = await import(/* @vite-ignore */ moduleUrl);
+
+    expect(() =>
+      registryModule.createPaymentProviderRegistry(
+        {
+          PAYMENT_MODE: "live",
+          PAYMENT_PROVIDERS: ["wechat_h5"]
+        },
+        {
+          wechatFactory: () => ({ channel: "wechat_h5" })
+        }
+      )
+    ).toThrow(/wechat_h5.*(?:contract|method|provider)/i);
+  });
+
   it("does not perform network I/O while validating or constructing providers", async () => {
     const secretDirectory = await mkdtemp(
       path.join(tmpdir(), "peileme-payment-config-")
@@ -356,7 +478,7 @@ describe("Task 4 payment configuration and registry contract (RED)", () => {
             path.resolve("server/modules/payments/registry.ts")
           ).href
         );
-        const provider = { channel: "wechat_h5" as const };
+        const provider = completeProvider("wechat_h5");
         const registry = registryModule.createPaymentProviderRegistry(config, {
           wechatFactory: () => provider
         });

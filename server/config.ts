@@ -186,9 +186,26 @@ const requirePaymentValue = (
     | "ALIPAY_APP_ID"
     | "ALIPAY_SELLER_ID"
 ) => {
-  const value = config[name]?.trim();
+  const rawValue = config[name];
+  const value = rawValue?.trim();
   if (!value) throw new Error(`${name} must be configured in live mode`);
+  if (value !== rawValue) {
+    throw new Error(`${name} must not contain surrounding whitespace`);
+  }
   return value;
+};
+
+const deepFreezeConfig = <Value>(value: Value): Value => {
+  if (typeof value !== "object" || value === null || Object.isFrozen(value)) {
+    return value;
+  }
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor && "value" in descriptor) {
+      deepFreezeConfig(descriptor.value);
+    }
+  }
+  return Object.freeze(value);
 };
 
 const validatePaymentSecret = (
@@ -243,8 +260,10 @@ const validateLivePaymentConfig = (config: AppConfig) => {
         config.WECHAT_PAY_API_V3_KEY_FILE,
         config.WECHAT_PAY_API_V3_KEY_SECRET_REF
       );
-      if (Buffer.byteLength(apiV3Key, "utf8") !== 32) {
-        throw new Error("WECHAT_PAY_API_V3_KEY must contain exactly 32 bytes");
+      if (!/^[\x21-\x7e]{32}$/.test(apiV3Key)) {
+        throw new Error(
+          "WECHAT_PAY_API_V3_KEY must contain exactly 32 bytes of printable ASCII"
+        );
       }
       validatePaymentSecret(
         config,
@@ -331,7 +350,7 @@ export const getConfig = () => {
     if (parsedConfig.PAYMENT_MODE === "live") {
       validateLivePaymentConfig(parsedConfig);
     }
-    cachedConfig = parsedConfig;
+    cachedConfig = deepFreezeConfig(parsedConfig);
   }
   return cachedConfig;
 };
