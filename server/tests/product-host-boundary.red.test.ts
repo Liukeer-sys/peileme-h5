@@ -103,8 +103,8 @@ vi.mock("../security.js", async (importOriginal) => {
   };
 });
 
-const fakeProvider = {
-  channel: "fake" as const,
+const wechatProvider = {
+  channel: "wechat_h5" as const,
   async createPayment() {
     throw new Error("mocked startPayment must intercept provider calls");
   },
@@ -559,13 +559,13 @@ describe("B2 product host/API boundary contract", () => {
     "passes the derived %s payment scope through the complete start path",
     async (host, channel) => {
       const response = await request(
-        createApp({ paymentProvider: fakeProvider })
+        createApp({ paymentProvider: wechatProvider })
       )
         .post(
           "/api/commerce/orders/00000000-0000-4000-8000-000000000000/pay"
         )
         .set("host", host)
-        .send({ channel: "fake" });
+        .send({ channel: "wechat_h5" });
 
       expect(response.status).toBe(200);
       expect(commerceMocks.getOwnedOrder).toHaveBeenCalledWith(

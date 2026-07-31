@@ -333,7 +333,7 @@ describe("migration concurrency", () => {
   );
 
   it(
-    "backfills only the latest legacy CLOSED attempt per order and channel for bounded recovery",
+    "terminalizes legacy fake attempts and recovers only the eligible real owner",
     async () => {
       const baseUrl = new URL(process.env.DATABASE_URL!);
       const databaseName =
@@ -541,37 +541,26 @@ describe("migration concurrency", () => {
             },
             {
               channel: "fake",
-              reconciliation_state: "NONE"
+              reconciliation_state: "TERMINAL"
             },
             {
               channel: "fake",
-              reconciliation_state: "REQUIRED"
+              reconciliation_state: "TERMINAL"
             }
           ]);
-          await expect(
-            verify.query(
-              `UPDATE payment_attempts
-               SET reconciliation_state = 'RETRY_SCHEDULED',
-                   reconciliation_next_at = now(),
-                   reconciliation_deadline_at = now() + interval '1 hour',
-                   reconciliation_last_result = 'QUERY_ERROR'
-               WHERE order_id = $1
-                 AND channel = 'fake'
-                 AND reconciliation_state = 'NONE'`,
-              [orderId]
-            )
-          ).rejects.toMatchObject({
-            constraint:
-              "payment_attempts_one_scheduled_reconciliation_per_channel"
-          });
+          await verify.query("BEGIN");
+          await verify.query(
+            "SET LOCAL peileme.payment_write_contract = 'identity_v1'"
+          );
           await verify.query(
             `UPDATE payment_attempts
              SET reconciliation_next_at = now() - interval '1 second'
              WHERE order_id = $1
-               AND channel = 'fake'
+               AND channel = 'alipay_wap'
                AND reconciliation_state = 'REQUIRED'`,
             [orderId]
           );
+          await verify.query("COMMIT");
         } finally {
           await verify.end();
         }
@@ -588,14 +577,14 @@ describe("migration concurrency", () => {
         resetConfigForTests();
         const recovered = await reconcileAndCloseExpiredOrders({
           provider: {
-            channel: "fake",
+            channel: "alipay_wap",
             async createPayment() {
               throw new Error("upgrade probe must not create");
             },
             async queryPayment(queriedOrderNo: string) {
               return {
-                orderNo: queriedOrderNo,
-                channel: "fake",
+                providerOrderNo: queriedOrderNo,
+                channel: "alipay_wap",
                 channelTransactionId: `legacy-paid-${randomUUID()}`,
                 amountFen,
                 currency: "CNY",
@@ -732,7 +721,8 @@ describe("migration concurrency", () => {
             { version: "007_policy_rule_regressions.sql" },
             { version: "008_commerce.sql" },
             { version: "009_payment_reconciliation.sql" },
-            { version: "010_order_channel_lookup.sql" }
+            { version: "010_order_channel_lookup.sql" },
+            { version: "011_real_payments.sql" }
           ]);
           const tables = await verify.query<{ count: string }>(
             `SELECT count(*)::text AS count

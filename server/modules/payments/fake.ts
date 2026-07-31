@@ -35,7 +35,7 @@ export class FakePaymentProvider implements PaymentProvider {
 
   async createPayment(input: CreatePaymentInput): Promise<CreatedPayment> {
     const nonce = crypto.randomBytes(24).toString("base64url");
-    const payload = `${input.attemptId}.${input.orderNo}.${nonce}`;
+    const payload = `${input.attemptId}.${input.providerOrderNo}.${nonce}`;
     const token = `${nonce}.${this.sign(payload)}`;
     this.pending.set(token, {
       input,
@@ -44,7 +44,7 @@ export class FakePaymentProvider implements PaymentProvider {
     return {
       prepayId: `fake-prepay-${input.attemptId}`,
       launchUrl:
-        `/api/test-payments/${encodeURIComponent(input.orderNo)}/complete` +
+        `/api/test-payments/${encodeURIComponent(input.providerOrderNo)}/complete` +
         `?token=${encodeURIComponent(token)}`,
       response: {
         provider: "fake",
@@ -63,13 +63,13 @@ export class FakePaymentProvider implements PaymentProvider {
     }
     const [nonce, signature, extra] = token.split(".");
     const expected = this.sign(
-      `${pending.input.attemptId}.${pending.input.orderNo}.${nonce}`
+      `${pending.input.attemptId}.${pending.input.providerOrderNo}.${nonce}`
     );
     const signatureBytes = Buffer.from(signature || "");
     const expectedBytes = Buffer.from(expected);
     if (
       extra !== undefined ||
-      pending.input.orderNo !== orderNo ||
+      pending.input.providerOrderNo !== orderNo ||
       signatureBytes.length !== expectedBytes.length ||
       !crypto.timingSafeEqual(signatureBytes, expectedBytes)
     ) {
@@ -77,7 +77,7 @@ export class FakePaymentProvider implements PaymentProvider {
     }
 
     const verified: VerifiedPayment = {
-      orderNo: pending.input.orderNo,
+      providerOrderNo: pending.input.providerOrderNo,
       channel: "fake",
       channelTransactionId: pending.transactionId,
       amountFen: pending.input.amountFen,
@@ -100,7 +100,7 @@ export class FakePaymentProvider implements PaymentProvider {
     this.processing.delete(token);
     this.pending.delete(token);
     this.used.add(token);
-    this.completed.set(verified.orderNo, verified);
+    this.completed.set(verified.providerOrderNo, verified);
   }
 
   rollbackCompletion(token: string) {
@@ -121,7 +121,7 @@ export class FakePaymentProvider implements PaymentProvider {
   }
 
   async refund(input: {
-    orderNo: string;
+    providerOrderNo: string;
     refundNo: string;
     amountFen: string;
     totalFen: string;
@@ -131,7 +131,7 @@ export class FakePaymentProvider implements PaymentProvider {
       channelRefundId: `fake-refund-${input.refundNo}`,
       raw: {
         provider: "fake",
-        orderNo: input.orderNo,
+        providerOrderNo: input.providerOrderNo,
         amountFen: input.amountFen
       }
     };

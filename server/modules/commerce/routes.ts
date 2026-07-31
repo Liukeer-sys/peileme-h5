@@ -24,9 +24,6 @@ import {
   CommerceError,
   type CommerceErrorCode
 } from "./types.js";
-import {
-  FakePaymentProvider
-} from "../payments/fake.js";
 import type { PaymentProvider } from "../payments/provider.js";
 import type { ProductChannel } from "../../product-host.js";
 
@@ -47,6 +44,7 @@ const commerceStatuses: Partial<
   ORDER_NUMBER_GENERATION_FAILED: { status: 503, message: "订单号生成失败，请重试" },
   PAYMENT_PROVIDER_FAILED: { status: 503, message: "支付渠道暂时不可用" },
   PAYMENT_INITIALIZING: { status: 409, message: "支付正在初始化，请稍后重试" },
+  PAYMENT_CHANNEL_LOCKED: { status: 409, message: "已有支付渠道正在处理，请稍后重试" },
   PAYMENT_VERIFICATION_FAILED: { status: 400, message: "支付结果校验失败" },
   PAYMENT_TOKEN_INVALID: { status: 404, message: "测试支付凭证无效" },
   PAYMENT_TOKEN_USED: { status: 409, message: "测试支付凭证已使用" },
@@ -79,7 +77,7 @@ const orderBodySchema = z
   .strict();
 const paymentBodySchema = z
   .object({
-    channel: z.literal("fake")
+    channel: z.enum(["wechat_h5", "alipay_wap"])
   })
   .strict();
 const invoiceBodySchema = z
@@ -178,11 +176,7 @@ export const createCommerceRouters = (
   provider?: PaymentProvider
 ) => {
   const config = getConfig();
-  const paymentProvider =
-    provider ??
-    (config.PAYMENT_MODE === "fake"
-      ? new FakePaymentProvider(config.NODE_ENV)
-      : undefined);
+  const paymentProvider = provider;
   const router = Router();
   const testRouter = Router();
   const adminRouter = Router();
@@ -232,8 +226,8 @@ export const createCommerceRouters = (
           orderId,
           productChannel
         );
-        paymentBodySchema.parse(request.body);
-        if (!paymentProvider || paymentProvider.channel !== "fake") {
+        const payment = paymentBodySchema.parse(request.body);
+        if (!paymentProvider || paymentProvider.channel !== payment.channel) {
           throw new CommerceError("PAYMENT_PROVIDER_FAILED");
         }
         const returnOrigin =
@@ -424,54 +418,7 @@ export const createCommerceRouters = (
     }
   );
 
-  if (config.NODE_ENV === "test" && paymentProvider instanceof FakePaymentProvider) {
-    testRouter.post(
-      "/:orderNo/complete",
-      async (request, response, next) => {
-        let token: string | undefined;
-        let completionStarted = false;
-        try {
-          z.object({}).strict().parse(request.body);
-          const orderNo = z.string().trim().min(1).max(80).parse(
-            request.params.orderNo
-          );
-          token = z.string().min(20).max(300).parse(
-            request.query.token
-          );
-          const verified = paymentProvider.beginCompletion(orderNo, token);
-          completionStarted = true;
-          const attemptId = z.string().uuid().parse(
-            verified.raw.attemptId
-          );
-          const order = await queryOrderId(orderNo);
-          const completed = await markOrderPaid({
-            orderId: order,
-            paymentAttemptId: attemptId,
-            verified
-          });
-          paymentProvider.commitCompletion(token);
-          completionStarted = false;
-          response.json(completed);
-        } catch (error) {
-          if (completionStarted && token) {
-            paymentProvider.rollbackCompletion(token);
-          }
-          next(commerceApiError(error));
-        }
-      }
-    );
-  }
-
   return { router, testRouter, adminRouter };
-};
-
-const queryOrderId = async (orderNo: string) => {
-  const result = await query<{ id: string }>(
-    "SELECT id FROM orders WHERE order_no = $1",
-    [orderNo]
-  );
-  if (!result.rows[0]) throw new CommerceError("ORDER_NOT_FOUND");
-  return result.rows[0].id;
 };
 
 export { closeExpiredOrders };

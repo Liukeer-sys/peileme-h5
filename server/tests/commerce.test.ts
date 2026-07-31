@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import request from "supertest";
 import { createApp } from "../app.js";
 import { resetConfigForTests } from "../config.js";
-import { closePool, getPool, query } from "../db.js";
+import { closePool, getPool, query, withTransaction } from "../db.js";
 import { runMigrations } from "../migrate.js";
 import {
   getActiveCatalog,
@@ -29,6 +29,11 @@ import {
 } from "../modules/commerce/orders.js";
 import { seedPolicyFoundation } from "../modules/policy/seed.js";
 import { signAccessToken } from "../security.js";
+import {
+  insertIdentityAwarePaymentAttempt,
+  paymentWriteQuery,
+  ScriptedRealPaymentProvider
+} from "./helpers/identity-payment.js";
 
 type CatalogRow = {
   sku: string;
@@ -137,7 +142,8 @@ const insertPolicyDraft = async (
 
 const createFailedPaymentOrder = async (
   userId: string,
-  marker: string
+  marker: string,
+  channel: "wechat_h5" | "alipay_wap" = "wechat_h5"
 ) => {
   const order = await createOrder({
     userId,
@@ -146,17 +152,20 @@ const createFailedPaymentOrder = async (
     idempotencyKey: `${marker}-${randomUUID()}`,
     businessDraftId: await insertPolicyDraft(userId)
   });
-  const attempt = await query<{ id: string }>(
-    `INSERT INTO payment_attempts(order_id, channel, status)
-     VALUES ($1, 'fake', 'FAILED')
-     RETURNING id`,
-    [order.id]
-  );
+  const attempt = await insertIdentityAwarePaymentAttempt({
+    orderId: order.id,
+    channel,
+    status: "CREATE_UNKNOWN"
+  });
   await query(
-    "UPDATE orders SET status = 'PAYMENT_FAILED' WHERE id = $1",
+    "UPDATE orders SET status = 'PAYING' WHERE id = $1",
     [order.id]
   );
-  return { order, attemptId: attempt.rows[0].id };
+  return {
+    order,
+    attemptId: attempt.id,
+    providerOrderNo: attempt.providerOrderNo
+  };
 };
 
 const createScheduledClosedPaymentOrder = async (
@@ -164,7 +173,7 @@ const createScheduledClosedPaymentOrder = async (
   marker: string
 ) => {
   const failed = await createFailedPaymentOrder(userId, marker);
-  await query(
+  await paymentWriteQuery(
     `UPDATE orders
      SET status = 'CLOSED',
          created_at = now() - interval '3 minutes',
@@ -174,7 +183,7 @@ const createScheduledClosedPaymentOrder = async (
      WHERE id = $1`,
     [failed.order.id]
   );
-  await query(
+  await paymentWriteQuery(
     `UPDATE payment_attempts
      SET status = 'CLOSED',
          reconciliation_state = 'REQUIRED',
@@ -639,13 +648,12 @@ describe("commerce catalog foundation", () => {
       );
       orderIds = orders.rows.map((row) => row.id);
       const [orderA, orderB] = orderIds;
-      const attempt = await query<{ id: string }>(
-        `INSERT INTO payment_attempts(order_id, channel, status)
-         VALUES ($1, 'fake', 'CREATED')
-         RETURNING id`,
-        [orderA]
-      );
-      attemptId = attempt.rows[0].id;
+      const attempt = await insertIdentityAwarePaymentAttempt({
+        orderId: orderA,
+        channel: "wechat_h5",
+        status: "CREATED"
+      });
+      attemptId = attempt.id;
       const entitlement = await query<{ id: string }>(
         `INSERT INTO entitlements(
            user_id,
@@ -675,7 +683,7 @@ describe("commerce catalog foundation", () => {
              status,
              verified_payload
            )
-           VALUES ($1, $2, 'fake', $3, 990, 'CNY', 'SUCCESS', '{}')`,
+           VALUES ($1, $2, 'wechat_h5', $3, 990, 'CNY', 'SUCCESS', '{}')`,
           [orderB, attemptId, `quality-${marker}`]
         )
       ).rejects.toMatchObject({
@@ -736,9 +744,6 @@ describe("commerce catalog foundation", () => {
       if (entitlementId) {
         await query("DELETE FROM entitlements WHERE id = $1", [entitlementId]);
       }
-      if (attemptId) {
-        await query("DELETE FROM payment_attempts WHERE id = $1", [attemptId]);
-      }
       if (orderIds.length > 0) {
         await query("DELETE FROM orders WHERE id = ANY($1::uuid[])", [
           orderIds
@@ -781,13 +786,12 @@ describe("commerce catalog foundation", () => {
         [`QUALITY-CHANNEL-${marker}`, userId, `quality-channel-${marker}`]
       );
       orderId = order.rows[0].id;
-      const attempt = await query<{ id: string }>(
-        `INSERT INTO payment_attempts(order_id, channel, status)
-         VALUES ($1, 'alipay_wap', 'CREATED')
-         RETURNING id`,
-        [orderId]
-      );
-      attemptId = attempt.rows[0].id;
+      const attempt = await insertIdentityAwarePaymentAttempt({
+        orderId,
+        channel: "alipay_wap",
+        status: "CREATED"
+      });
+      attemptId = attempt.id;
 
       await expect(
         query(
@@ -813,9 +817,6 @@ describe("commerce catalog foundation", () => {
         "DELETE FROM payment_transactions WHERE channel_transaction_id = $1",
         [`quality-channel-${marker}`]
       );
-      if (attemptId) {
-        await query("DELETE FROM payment_attempts WHERE id = $1", [attemptId]);
-      }
       if (orderId) {
         await query("DELETE FROM orders WHERE id = $1", [orderId]);
       }
@@ -1105,26 +1106,13 @@ describe("commerce catalog foundation", () => {
         idempotencyKey: `reconciliation-constraint-${randomUUID()}`,
         businessDraftId: await insertPolicyDraft(userId)
       });
+      const attempt = await insertIdentityAwarePaymentAttempt({
+        orderId: order.id,
+        channel: "wechat_h5",
+        status: "CLOSED"
+      });
       await expect(
-        query(
-          `INSERT INTO payment_attempts(
-             order_id,
-             channel,
-             status,
-             reconciliation_state
-           )
-           VALUES ($1, 'fake', 'CLOSED', 'REQUIRED')`,
-          [order.id]
-        )
-      ).rejects.toMatchObject({ code: "23514" });
-      const attempt = await query<{ id: string }>(
-        `INSERT INTO payment_attempts(order_id, channel, status)
-         VALUES ($1, 'fake', 'CLOSED')
-         RETURNING id`,
-        [order.id]
-      );
-      await expect(
-        query(
+        paymentWriteQuery(
           `UPDATE payment_attempts
            SET reconciliation_state = 'REQUIRED',
                reconciliation_next_at = now() + interval '2 hours',
@@ -1132,11 +1120,11 @@ describe("commerce catalog foundation", () => {
                reconciliation_last_result =
                  'LOCAL_CLOSE_PENDING_FINAL_QUERY'
            WHERE id = $1`,
-          [attempt.rows[0].id]
+          [attempt.id]
         )
       ).rejects.toMatchObject({ code: "23514" });
       await expect(
-        query(
+        paymentWriteQuery(
           `UPDATE payment_attempts
            SET status = 'PENDING',
                reconciliation_state = 'REQUIRED',
@@ -1145,23 +1133,23 @@ describe("commerce catalog foundation", () => {
                reconciliation_last_result =
                  'LOCAL_CLOSE_PENDING_FINAL_QUERY'
            WHERE id = $1`,
-          [attempt.rows[0].id]
+          [attempt.id]
         )
       ).rejects.toMatchObject({ code: "23514" });
       await expect(
-        query(
+        paymentWriteQuery(
           `UPDATE payment_attempts
            SET reconciliation_next_at = now()
            WHERE id = $1`,
-          [attempt.rows[0].id]
+          [attempt.id]
         )
       ).rejects.toMatchObject({ code: "23514" });
       await expect(
-        query(
+        paymentWriteQuery(
           `UPDATE payment_attempts
            SET reconciliation_last_result = 'UNRECOGNIZED_RESULT'
            WHERE id = $1`,
-          [attempt.rows[0].id]
+          [attempt.id]
         )
       ).rejects.toMatchObject({ code: "23514" });
     } finally {
@@ -2136,7 +2124,7 @@ describe("atomic commerce orders and payments", () => {
       let createPaymentCalls = 0;
       let queryPaymentCalls = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           createPaymentCalls += 1;
           throw new Error("cross-channel provider call");
@@ -2504,15 +2492,14 @@ describe("atomic commerce orders and payments", () => {
         idempotencyKey: `paid-${randomUUID()}`,
         businessDraftId
       });
-      const attempt = await query<{ id: string }>(
-        `INSERT INTO payment_attempts(order_id, channel, status)
-         VALUES ($1, 'fake', 'PENDING')
-         RETURNING id`,
-        [order.id]
-      );
+      const attempt = await insertIdentityAwarePaymentAttempt({
+        orderId: order.id,
+        channel: "wechat_h5",
+        status: "PENDING"
+      });
       const verified = {
-        orderNo: order.orderNo,
-        channel: "fake" as const,
+        providerOrderNo: attempt.providerOrderNo,
+        channel: "wechat_h5" as const,
         channelTransactionId: `fake-${randomUUID()}`,
         amountFen: order.amountFen,
         currency: "CNY" as const,
@@ -2522,13 +2509,13 @@ describe("atomic commerce orders and payments", () => {
 
       const completed = await markOrderPaid({
         orderId: order.id,
-        paymentAttemptId: attempt.rows[0].id,
+        paymentAttemptId: attempt.id,
         verified
       });
       await expect(
         markOrderPaid({
           orderId: order.id,
-          paymentAttemptId: attempt.rows[0].id,
+          paymentAttemptId: attempt.id,
           verified
         })
       ).resolves.toEqual(completed);
@@ -2546,7 +2533,7 @@ describe("atomic commerce orders and payments", () => {
              AS entitlements,
            (SELECT status FROM orders WHERE id = $1) AS order_status,
            (SELECT status FROM payment_attempts WHERE id = $2) AS attempt_status`,
-        [order.id, attempt.rows[0].id]
+        [order.id, attempt.id]
       );
       expect(persisted.rows[0]).toEqual({
         transactions: "1",
@@ -2571,12 +2558,11 @@ describe("atomic commerce orders and payments", () => {
         idempotencyKey: `late-provider-payment-${randomUUID()}`,
         businessDraftId: await insertPolicyDraft(userId)
       });
-      const attempt = await query<{ id: string }>(
-        `INSERT INTO payment_attempts(order_id, channel, status)
-         VALUES ($1, 'fake', 'PENDING')
-         RETURNING id`,
-        [order.id]
-      );
+      const attempt = await insertIdentityAwarePaymentAttempt({
+        orderId: order.id,
+        channel: "wechat_h5",
+        status: "PENDING"
+      });
       await query(
         `UPDATE orders
          SET status = 'PAYING',
@@ -2586,8 +2572,8 @@ describe("atomic commerce orders and payments", () => {
         [order.id]
       );
       const baseVerified = {
-        orderNo: order.orderNo,
-        channel: "fake" as const,
+        providerOrderNo: attempt.providerOrderNo,
+        channel: "wechat_h5" as const,
         channelTransactionId: `late-${randomUUID()}`,
         amountFen: order.amountFen,
         currency: "CNY" as const,
@@ -2596,7 +2582,7 @@ describe("atomic commerce orders and payments", () => {
       await expect(
         markOrderPaid({
           orderId: order.id,
-          paymentAttemptId: attempt.rows[0].id,
+          paymentAttemptId: attempt.id,
           verified: {
             ...baseVerified,
             paidAt: new Date().toISOString()
@@ -2622,7 +2608,7 @@ describe("atomic commerce orders and payments", () => {
              AS transactions,
            (SELECT count(*)::text FROM entitlements WHERE source_id = $1)
              AS entitlements`,
-        [order.id, attempt.rows[0].id]
+        [order.id, attempt.id]
       );
       expect(rejected.rows[0]).toEqual({
         order_status: "CLOSED",
@@ -2635,7 +2621,7 @@ describe("atomic commerce orders and payments", () => {
       await expect(
         markOrderPaid({
           orderId: order.id,
-          paymentAttemptId: attempt.rows[0].id,
+          paymentAttemptId: attempt.id,
           verified: {
             ...baseVerified,
             paidAt: new Date(Date.now() - 120_000).toISOString()
@@ -2661,23 +2647,26 @@ describe("atomic commerce orders and payments", () => {
           idempotencyKey: `${marker}-${randomUUID()}`,
           businessDraftId: await insertPolicyDraft(userId)
         });
-        const attempt = await query<{ id: string }>(
-          `INSERT INTO payment_attempts(order_id, channel, status)
-           VALUES ($1, 'fake', 'PENDING')
-           RETURNING id`,
-          [order.id]
-        );
+        const attempt = await insertIdentityAwarePaymentAttempt({
+          orderId: order.id,
+          channel: "wechat_h5",
+          status: "PENDING"
+        });
         await query(
           "UPDATE orders SET status = 'PAYING' WHERE id = $1",
           [order.id]
         );
-        return { order, attemptId: attempt.rows[0].id };
+        return {
+          order,
+          attemptId: attempt.id,
+          providerOrderNo: attempt.providerOrderNo
+        };
       };
       const legal = await makeOrder("identity-legal");
       const foreign = await makeOrder("identity-foreign");
       const base = {
-        orderNo: legal.order.orderNo,
-        channel: "fake" as const,
+        providerOrderNo: legal.providerOrderNo,
+        channel: "wechat_h5" as const,
         channelTransactionId: `identity-${randomUUID()}`,
         amountFen: legal.order.amountFen,
         currency: "CNY" as const,
@@ -2690,7 +2679,7 @@ describe("atomic commerce orders and payments", () => {
           paymentAttemptId: legal.attemptId,
           verified: {
             ...base,
-            orderNo: foreign.order.orderNo,
+            providerOrderNo: foreign.providerOrderNo,
             channelTransactionId: `wrong-order-${randomUUID()}`
           }
         }),
@@ -2786,7 +2775,7 @@ describe("atomic commerce orders and payments", () => {
     }
   });
 
-  it("persists one sanitized mismatch anomaly and schedules only the latest other channel", async () => {
+  it("persists one sanitized mismatch anomaly for the canonical provider identity", async () => {
     await seedPolicyFoundation();
     let userId: string | undefined;
     try {
@@ -2798,33 +2787,28 @@ describe("atomic commerce orders and payments", () => {
         idempotencyKey: `mismatch-anomaly-${randomUUID()}`,
         businessDraftId: await insertPolicyDraft(userId)
       });
-      const attempts = await query<{
-        id: string;
-        channel: string;
-        marker: string;
-      }>(
-        `INSERT INTO payment_attempts(
-           order_id,
-           channel,
-           status,
-           request_snapshot,
-           created_at,
-           updated_at
-         )
-         VALUES
-           ($1, 'fake', 'CREATED', '{"marker":"old-fake"}', now() - interval '4 minutes', now() - interval '4 minutes'),
-           ($1, 'fake', 'PENDING', '{"marker":"selected"}', now() - interval '1 minute', now() - interval '1 minute'),
-           ($1, 'alipay_wap', 'CREATED', '{"marker":"old-alipay"}', now() - interval '3 minutes', now() - interval '3 minutes'),
-           ($1, 'alipay_wap', 'PENDING', '{"marker":"latest-alipay"}', now() - interval '2 minutes', now() - interval '2 minutes')
-         RETURNING id, channel, request_snapshot->>'marker' AS marker`,
-        [order.id]
-      );
-      const selected = attempts.rows.find(
-        (attempt) => attempt.marker === "selected"
-      )!;
-      const latestAlipay = attempts.rows.find(
-        (attempt) => attempt.marker === "latest-alipay"
-      )!;
+      await insertIdentityAwarePaymentAttempt({
+        orderId: order.id,
+        channel: "wechat_h5",
+        status: "CLOSED",
+        providerOrderNo: `WXOLD${randomUUID().replaceAll("-", "").slice(0, 24)}`,
+        requestSnapshot: { marker: "old-wechat" },
+        createdAt: new Date(Date.now() - 4 * 60_000)
+      });
+      await insertIdentityAwarePaymentAttempt({
+        orderId: order.id,
+        channel: "alipay_wap",
+        status: "CLOSED",
+        requestSnapshot: { marker: "old-alipay" },
+        createdAt: new Date(Date.now() - 3 * 60_000)
+      });
+      const selected = await insertIdentityAwarePaymentAttempt({
+        orderId: order.id,
+        channel: "wechat_h5",
+        status: "PENDING",
+        requestSnapshot: { marker: "selected" },
+        createdAt: new Date(Date.now() - 60_000)
+      });
       await query(
         "UPDATE orders SET status = 'PAYING' WHERE id = $1",
         [order.id]
@@ -2833,8 +2817,8 @@ describe("atomic commerce orders and payments", () => {
       const longTransactionId =
         `mismatch-\n${"x".repeat(220)}-${randomUUID()}`;
       const verified = {
-        orderNo: order.orderNo,
-        channel: "fake" as const,
+        providerOrderNo: selected.providerOrderNo,
+        channel: "wechat_h5" as const,
         channelTransactionId: longTransactionId,
         amountFen: (BigInt(order.amountFen) + 1n).toString(),
         currency: "CNY" as const,
@@ -2909,9 +2893,9 @@ describe("atomic commerce orders and payments", () => {
         order_status: "CLOSED",
         kind: "PAYMENT_VERIFICATION_FAILED",
         anomaly_status: "PENDING_REVIEW",
-        attempt_channel: "fake",
-        provider_channel: "fake",
-        provider_order_no: order.orderNo,
+        attempt_channel: "wechat_h5",
+        provider_channel: "wechat_h5",
+        provider_order_no: selected.providerOrderNo,
         amount_fen: verified.amountFen,
         currency: "CNY",
         paid_at: expect.any(Date),
@@ -2950,13 +2934,6 @@ describe("atomic commerce orders and payments", () => {
       );
       expect(attemptStates.rows).toEqual([
         {
-          marker: "latest-alipay",
-          status: "CLOSED",
-          reconciliation_state: "REQUIRED",
-          reconciliation_last_result: "LOCAL_CLOSE_PENDING_FINAL_QUERY",
-          scheduled: true
-        },
-        {
           marker: "old-alipay",
           status: "CLOSED",
           reconciliation_state: "NONE",
@@ -2964,7 +2941,7 @@ describe("atomic commerce orders and payments", () => {
           scheduled: false
         },
         {
-          marker: "old-fake",
+          marker: "old-wechat",
           status: "CLOSED",
           reconciliation_state: "NONE",
           reconciliation_last_result: null,
@@ -2978,43 +2955,6 @@ describe("atomic commerce orders and payments", () => {
           scheduled: false
         }
       ]);
-      await query(
-        `UPDATE payment_attempts
-         SET reconciliation_next_at = now() - interval '1 second'
-         WHERE id = $1`,
-        [latestAlipay.id]
-      );
-      let alipayQueries = 0;
-      const recovered = await reconcileAndCloseExpiredOrders({
-        provider: {
-          channel: "alipay_wap",
-          async createPayment() {
-            throw new Error("must not create");
-          },
-          async queryPayment() {
-            alipayQueries += 1;
-            return null;
-          },
-          async refund() {
-            return { channelRefundId: "unused", raw: {} };
-          }
-        },
-        limit: 5,
-        providerQueryBudget: 5,
-        providerTimeoutMs: 100
-      });
-      expect(alipayQueries).toBe(1);
-      expect(recovered.summary).toMatchObject({
-        scannedCount: 1,
-        scheduledRecoveryCount: 1,
-        closedRecovery: {
-          retryScheduledCount: 1,
-          retryByReason: {
-            noPayment: 1,
-            queryError: 0
-          }
-        }
-      });
       const conflictingOrder = await createOrder({
         userId,
         sku: "POLICY_CALC",
@@ -3022,12 +2962,11 @@ describe("atomic commerce orders and payments", () => {
         idempotencyKey: `mismatch-owner-conflict-${randomUUID()}`,
         businessDraftId: await insertPolicyDraft(userId)
       });
-      const conflictingAttempt = await query<{ id: string }>(
-        `INSERT INTO payment_attempts(order_id, channel, status)
-         VALUES ($1, 'fake', 'PENDING')
-         RETURNING id`,
-        [conflictingOrder.id]
-      );
+      const conflictingAttempt = await insertIdentityAwarePaymentAttempt({
+        orderId: conflictingOrder.id,
+        channel: "wechat_h5",
+        status: "PENDING"
+      });
       await query(
         "UPDATE orders SET status = 'PAYING' WHERE id = $1",
         [conflictingOrder.id]
@@ -3035,10 +2974,10 @@ describe("atomic commerce orders and payments", () => {
       await expect(
         markOrderPaid({
           orderId: conflictingOrder.id,
-          paymentAttemptId: conflictingAttempt.rows[0].id,
+          paymentAttemptId: conflictingAttempt.id,
           verified: {
             ...verified,
-            orderNo: conflictingOrder.orderNo,
+            providerOrderNo: conflictingAttempt.providerOrderNo,
             amountFen: (
               BigInt(conflictingOrder.amountFen) + 1n
             ).toString()
@@ -3061,7 +3000,7 @@ describe("atomic commerce orders and payments", () => {
              WHERE order_id = o.id) AS anomalies,
            (SELECT count(*)::text
               FROM payment_anomalies
-             WHERE provider_channel = 'fake'
+             WHERE provider_channel = 'wechat_h5'
                AND channel_transaction_id = $3)
              AS provider_transaction_anomalies
          FROM orders o
@@ -3069,7 +3008,7 @@ describe("atomic commerce orders and payments", () => {
          WHERE o.id = $1`,
         [
           conflictingOrder.id,
-          conflictingAttempt.rows[0].id,
+          conflictingAttempt.id,
           persisted.rows[0].channel_transaction_id
         ]
       );
@@ -3096,12 +3035,11 @@ describe("atomic commerce orders and payments", () => {
         idempotencyKey: `start-late-anomaly-${randomUUID()}`,
         businessDraftId: await insertPolicyDraft(userId)
       });
-      const attempt = await query<{ id: string }>(
-        `INSERT INTO payment_attempts(order_id, channel, status)
-         VALUES ($1, 'fake', 'PENDING')
-         RETURNING id`,
-        [order.id]
-      );
+      const attempt = await insertIdentityAwarePaymentAttempt({
+        orderId: order.id,
+        channel: "wechat_h5",
+        status: "PENDING"
+      });
       await query(
         `UPDATE orders
          SET status = 'PAYING',
@@ -3112,15 +3050,15 @@ describe("atomic commerce orders and payments", () => {
       );
       let queryCalls = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           throw new Error("must not create");
         },
         async queryPayment(orderNo: string) {
           queryCalls += 1;
           return {
-            orderNo,
-            channel: "fake" as const,
+            providerOrderNo: orderNo,
+            channel: "wechat_h5" as const,
             channelTransactionId: `start-late-${randomUUID()}`,
             amountFen: order.amountFen,
             currency: "CNY" as const,
@@ -3183,7 +3121,7 @@ describe("atomic commerce orders and payments", () => {
          JOIN payment_anomalies anomaly
            ON anomaly.payment_attempt_id = pa.id
          WHERE o.id = $1`,
-        [order.id, attempt.rows[0].id]
+        [order.id, attempt.id]
       );
       expect(persisted.rows[0]).toMatchObject({
         order_status: "CLOSED",
@@ -3230,12 +3168,11 @@ describe("atomic commerce orders and payments", () => {
           idempotencyKey: `${anomalyCase.marker}-${randomUUID()}`,
           businessDraftId: await insertPolicyDraft(userId)
         });
-        const attempt = await query<{ id: string }>(
-          `INSERT INTO payment_attempts(order_id, channel, status)
-           VALUES ($1, 'fake', 'PENDING')
-           RETURNING id`,
-          [order.id]
-        );
+        const attempt = await insertIdentityAwarePaymentAttempt({
+          orderId: order.id,
+          channel: "wechat_h5",
+          status: "PENDING"
+        });
         await query(
           `UPDATE orders
            SET status = 'PAYING',
@@ -3246,15 +3183,15 @@ describe("atomic commerce orders and payments", () => {
         );
         let queryCalls = 0;
         const provider = {
-          channel: "fake" as const,
+          channel: "wechat_h5" as const,
           async createPayment() {
             throw new Error("must not create");
           },
           async queryPayment(orderNo: string) {
             queryCalls += 1;
             return {
-              orderNo,
-              channel: "fake" as const,
+              providerOrderNo: orderNo,
+              channel: "wechat_h5" as const,
               channelTransactionId:
                 `${anomalyCase.marker}-${randomUUID()}`,
               amountFen: (
@@ -3342,7 +3279,7 @@ describe("atomic commerce orders and payments", () => {
            JOIN payment_anomalies anomaly
              ON anomaly.payment_attempt_id = pa.id
            WHERE o.id = $1`,
-          [order.id, attempt.rows[0].id]
+          [order.id, attempt.id]
         );
         expect(persisted.rows[0]).toMatchObject({
           order_status: "CLOSED",
@@ -3372,15 +3309,14 @@ describe("atomic commerce orders and payments", () => {
         idempotencyKey: `duplicate-payment-${randomUUID()}`,
         businessDraftId: await insertPolicyDraft(userId)
       });
-      const firstAttempt = await query<{ id: string }>(
-        `INSERT INTO payment_attempts(order_id, channel, status)
-         VALUES ($1, 'fake', 'PENDING')
-         RETURNING id`,
-        [order.id]
-      );
+      const firstAttempt = await insertIdentityAwarePaymentAttempt({
+        orderId: order.id,
+        channel: "wechat_h5",
+        status: "PENDING"
+      });
       const firstVerified = {
-        orderNo: order.orderNo,
-        channel: "fake" as const,
+        providerOrderNo: firstAttempt.providerOrderNo,
+        channel: "wechat_h5" as const,
         channelTransactionId: `first-paid-${randomUUID()}`,
         amountFen: order.amountFen,
         currency: "CNY" as const,
@@ -3389,25 +3325,24 @@ describe("atomic commerce orders and payments", () => {
       };
       const completed = await markOrderPaid({
         orderId: order.id,
-        paymentAttemptId: firstAttempt.rows[0].id,
+        paymentAttemptId: firstAttempt.id,
         verified: firstVerified
       });
       await expect(
         markOrderPaid({
           orderId: order.id,
-          paymentAttemptId: firstAttempt.rows[0].id,
+          paymentAttemptId: firstAttempt.id,
           verified: firstVerified
         })
       ).resolves.toEqual(completed);
-      const secondAttempt = await query<{ id: string }>(
-        `INSERT INTO payment_attempts(order_id, channel, status)
-         VALUES ($1, 'alipay_wap', 'PENDING')
-         RETURNING id`,
-        [order.id]
-      );
+      const secondAttempt = await insertIdentityAwarePaymentAttempt({
+        orderId: order.id,
+        channel: "alipay_wap",
+        status: "PENDING"
+      });
       const rawSecret = `DUPLICATE_RAW_${randomUUID()}`;
       const duplicateVerified = {
-        orderNo: order.orderNo,
+        providerOrderNo: secondAttempt.providerOrderNo,
         channel: "alipay_wap" as const,
         channelTransactionId: `second-paid-${randomUUID()}`,
         amountFen: order.amountFen,
@@ -3418,12 +3353,12 @@ describe("atomic commerce orders and payments", () => {
       const duplicates = await Promise.allSettled([
         markOrderPaid({
           orderId: order.id,
-          paymentAttemptId: secondAttempt.rows[0].id,
+          paymentAttemptId: secondAttempt.id,
           verified: duplicateVerified
         }),
         markOrderPaid({
           orderId: order.id,
-          paymentAttemptId: secondAttempt.rows[0].id,
+          paymentAttemptId: secondAttempt.id,
           verified: duplicateVerified
         })
       ]);
@@ -3468,7 +3403,7 @@ describe("atomic commerce orders and payments", () => {
          JOIN payment_anomalies anomaly
            ON anomaly.payment_attempt_id = second.id
          WHERE o.id = $1`,
-        [order.id, secondAttempt.rows[0].id]
+        [order.id, secondAttempt.id]
       );
       expect(persisted.rows[0]).toMatchObject({
         order_status: "COMPLETED",
@@ -3487,7 +3422,7 @@ describe("atomic commerce orders and payments", () => {
     }
   });
 
-  it("terminalizes every other active and scheduled attempt after successful payment", async () => {
+  it("terminalizes every other unresolved or scheduled attempt after successful payment", async () => {
     await seedPolicyFoundation();
     let userId: string | undefined;
     try {
@@ -3499,38 +3434,36 @@ describe("atomic commerce orders and payments", () => {
         idempotencyKey: `paid-attempt-cleanup-${randomUUID()}`,
         businessDraftId: await insertPolicyDraft(userId)
       });
-      const attempts = await query<{
-        id: string;
-        marker: string;
-      }>(
-        `INSERT INTO payment_attempts(
-           order_id,
-           channel,
-           status,
-           request_snapshot,
-           reconciliation_state,
-           reconciliation_next_at,
-           reconciliation_deadline_at,
-           reconciliation_last_result
-         )
-         VALUES
-           ($1, 'fake', 'PENDING', '{"marker":"selected"}', 'NONE', NULL, NULL, NULL),
-           ($1, 'fake', 'CREATED', '{"marker":"ordinary-fake"}', 'NONE', NULL, NULL, NULL),
-           ($1, 'alipay_wap', 'FAILED', '{"marker":"ordinary-alipay"}', 'NONE', NULL, NULL, NULL),
-           ($1, 'wechat_h5', 'CLOSED', '{"marker":"scheduled-wechat"}', 'REQUIRED', now(), now() + interval '1 hour', 'LOCAL_CLOSE_PENDING_FINAL_QUERY')
-         RETURNING id, request_snapshot->>'marker' AS marker`,
-        [order.id]
-      );
-      const selected = attempts.rows.find(
-        (attempt) => attempt.marker === "selected"
-      )!;
+      const ordinaryAlipay = await insertIdentityAwarePaymentAttempt({
+        orderId: order.id,
+        channel: "alipay_wap",
+        status: "FAILED",
+        requestSnapshot: { marker: "ordinary-alipay" }
+      });
+      const scheduledWechat = await insertIdentityAwarePaymentAttempt({
+        orderId: order.id,
+        channel: "wechat_h5",
+        status: "CLOSED",
+        providerOrderNo: `WXSCH${randomUUID().replaceAll("-", "").slice(0, 24)}`,
+        requestSnapshot: { marker: "scheduled-wechat" },
+        reconciliationState: "REQUIRED",
+        reconciliationNextAt: new Date(),
+        reconciliationDeadlineAt: new Date(Date.now() + 60 * 60_000),
+        reconciliationLastResult: "LOCAL_CLOSE_PENDING_FINAL_QUERY"
+      });
+      const selected = await insertIdentityAwarePaymentAttempt({
+        orderId: order.id,
+        channel: "wechat_h5",
+        status: "PENDING",
+        requestSnapshot: { marker: "selected" }
+      });
       await expect(
         markOrderPaid({
           orderId: order.id,
           paymentAttemptId: selected.id,
           verified: {
-            orderNo: order.orderNo,
-            channel: "fake",
+            providerOrderNo: selected.providerOrderNo,
+            channel: "wechat_h5",
             channelTransactionId: `cleanup-paid-${randomUUID()}`,
             amountFen: order.amountFen,
             currency: "CNY",
@@ -3571,15 +3504,6 @@ describe("atomic commerce orders and payments", () => {
           reconciliation_deadline_at: null
         },
         {
-          marker: "ordinary-fake",
-          status: "CLOSED",
-          reconciliation_state: "TERMINAL",
-          reconciliation_last_result:
-            "ORDER_COMPLETED_BY_OTHER_ATTEMPT",
-          reconciliation_next_at: null,
-          reconciliation_deadline_at: null
-        },
-        {
           marker: "scheduled-wechat",
           status: "CLOSED",
           reconciliation_state: "TERMINAL",
@@ -3589,6 +3513,8 @@ describe("atomic commerce orders and payments", () => {
           reconciliation_deadline_at: null
         }
       ]);
+      expect(ordinaryAlipay.id).toBeTruthy();
+      expect(scheduledWechat.id).toBeTruthy();
     } finally {
       if (userId) await cleanupEntitlementTestUsers([userId]);
     }
@@ -3606,12 +3532,11 @@ describe("atomic commerce orders and payments", () => {
         idempotencyKey: `fulfillment-recovery-${randomUUID()}`,
         businessDraftId: await insertPolicyDraft(userId)
       });
-      const attempt = await query<{ id: string }>(
-        `INSERT INTO payment_attempts(order_id, channel, status)
-         VALUES ($1, 'fake', 'SUCCEEDED')
-         RETURNING id`,
-        [order.id]
-      );
+      const attempt = await insertIdentityAwarePaymentAttempt({
+        orderId: order.id,
+        channel: "wechat_h5",
+        status: "SUCCEEDED"
+      });
       await query(
         "UPDATE orders SET status = 'PAID', paid_at = now() WHERE id = $1",
         [order.id]
@@ -3631,10 +3556,10 @@ describe("atomic commerce orders and payments", () => {
            verified_payload,
            paid_at
          )
-         VALUES ($1, $2, 'fake', $3, $4, 'CNY', 'SUCCESS', '{}', now())`,
+         VALUES ($1, $2, 'wechat_h5', $3, $4, 'CNY', 'SUCCESS', '{}', now())`,
         [
           order.id,
-          attempt.rows[0].id,
+          attempt.id,
           `fulfill-${randomUUID()}`,
           order.amountFen
         ]
@@ -3723,7 +3648,7 @@ describe("atomic commerce orders and payments", () => {
         returnUrl: "http://peileme.test/return",
         notifyUrl: "http://peileme.test/notify",
         provider: {
-          channel: "fake",
+          channel: "wechat_h5",
           async createPayment(input) {
             signalProviderEntered();
             await providerRelease;
@@ -3768,7 +3693,7 @@ describe("atomic commerce orders and payments", () => {
     }
   });
 
-  it("retries a provider failure with the same recoverable attempt", async () => {
+  it("keeps a provider-create failure locked and queries the same provider identity", async () => {
     await seedPolicyFoundation();
     let userId: string | undefined;
     try {
@@ -3781,20 +3706,23 @@ describe("atomic commerce orders and payments", () => {
         businessDraftId: await insertPolicyDraft(userId)
       });
       const seenAttempts: string[] = [];
+      const createdProviderOrderNos: string[] = [];
+      const queriedProviderOrderNos: string[] = [];
       let calls = 0;
       const provider = {
-        channel: "fake" as const,
-        async createPayment(input: { attemptId: string; orderNo: string }) {
+        channel: "wechat_h5" as const,
+        async createPayment(input: {
+          attemptId: string;
+          orderNo: string;
+          providerOrderNo: string;
+        }) {
           seenAttempts.push(input.attemptId);
+          createdProviderOrderNos.push(input.providerOrderNo);
           calls += 1;
-          if (calls === 1) throw new Error("provider sentinel secret");
-          return {
-            prepayId: `retry-${input.attemptId}`,
-            launchUrl: `/retry/${input.orderNo}`,
-            response: {}
-          };
+          throw new Error("provider sentinel secret");
         },
-        async queryPayment() {
+        async queryPayment(providerOrderNo: string) {
+          queriedProviderOrderNos.push(providerOrderNo);
           return null;
         },
         async refund() {
@@ -3816,28 +3744,30 @@ describe("atomic commerce orders and payments", () => {
         code: "PAYMENT_PROVIDER_FAILED",
         message: "PAYMENT_PROVIDER_FAILED"
       });
-      const retried = await start();
-      expect(seenAttempts).toEqual([
-        retried.paymentAttemptId,
-        retried.paymentAttemptId
-      ]);
+      await expect(start()).rejects.toMatchObject({
+        code: "PAYMENT_INITIALIZING"
+      });
+      expect(seenAttempts).toHaveLength(1);
+      expect(queriedProviderOrderNos).toEqual(createdProviderOrderNos);
       const attempts = await query<{
         count: string;
-        error_message: string | null;
+        provider_order_no: string;
         status: string;
       }>(
         `SELECT
            count(*)::text AS count,
-           max(error_message) AS error_message,
+           max(identity.provider_order_no) AS provider_order_no,
            max(status) AS status
-         FROM payment_attempts
-         WHERE order_id = $1`,
+         FROM payment_attempts attempt
+         JOIN provider_payment_orders identity
+           ON identity.id = attempt.provider_payment_order_id
+         WHERE attempt.order_id = $1`,
         [order.id]
       );
       expect(attempts.rows[0]).toEqual({
         count: "1",
-        error_message: null,
-        status: "REDIRECT_READY"
+        provider_order_no: createdProviderOrderNos[0],
+        status: "CREATE_UNKNOWN"
       });
     } finally {
       if (userId) await cleanupEntitlementTestUsers([userId]);
@@ -3856,12 +3786,11 @@ describe("atomic commerce orders and payments", () => {
         idempotencyKey: `expired-paying-recovery-${randomUUID()}`,
         businessDraftId: await insertPolicyDraft(userId)
       });
-      const attempt = await query<{ id: string }>(
-        `INSERT INTO payment_attempts(order_id, channel, status)
-         VALUES ($1, 'fake', 'PENDING')
-         RETURNING id`,
-        [order.id]
-      );
+      const attempt = await insertIdentityAwarePaymentAttempt({
+        orderId: order.id,
+        channel: "wechat_h5",
+        status: "PENDING"
+      });
       await query(
         `UPDATE orders
          SET status = 'PAYING',
@@ -3873,7 +3802,7 @@ describe("atomic commerce orders and payments", () => {
       let createCalls = 0;
       let queryCalls = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           createCalls += 1;
           throw new Error("must not create");
@@ -3881,8 +3810,8 @@ describe("atomic commerce orders and payments", () => {
         async queryPayment(orderNo: string) {
           queryCalls += 1;
           return {
-            orderNo,
-            channel: "fake" as const,
+            providerOrderNo: orderNo,
+            channel: "wechat_h5" as const,
             channelTransactionId: `expired-paying-${randomUUID()}`,
             amountFen: order.amountFen,
             currency: "CNY" as const,
@@ -3908,7 +3837,7 @@ describe("atomic commerce orders and payments", () => {
         })
       ).resolves.toMatchObject({
         status: "COMPLETED",
-        paymentAttemptId: attempt.rows[0].id,
+        paymentAttemptId: attempt.id,
         launchUrl: "http://peileme.test/return"
       });
       expect({ createCalls, queryCalls }).toEqual({
@@ -3933,7 +3862,7 @@ describe("atomic commerce orders and payments", () => {
          FROM orders o
          JOIN payment_attempts pa ON pa.id = $2
          WHERE o.id = $1`,
-        [order.id, attempt.rows[0].id]
+        [order.id, attempt.id]
       );
       expect(persisted.rows[0]).toEqual({
         status: "COMPLETED",
@@ -3960,12 +3889,11 @@ describe("atomic commerce orders and payments", () => {
         idempotencyKey: `paying-recovery-boundary-${randomUUID()}`,
         businessDraftId: await insertPolicyDraft(ownerId)
       });
-      const attempt = await query<{ id: string }>(
-        `INSERT INTO payment_attempts(order_id, channel, status)
-         VALUES ($1, 'fake', 'PENDING')
-         RETURNING id`,
-        [order.id]
-      );
+      const attempt = await insertIdentityAwarePaymentAttempt({
+        orderId: order.id,
+        channel: "wechat_h5",
+        status: "PENDING"
+      });
       await query(
         `UPDATE orders
          SET status = 'PAYING',
@@ -3978,7 +3906,7 @@ describe("atomic commerce orders and payments", () => {
       let createCalls = 0;
       let timedOutSignal: AbortSignal | undefined;
       const fakeProvider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           createCalls += 1;
           throw new Error("must not create");
@@ -4046,7 +3974,7 @@ describe("atomic commerce orders and payments", () => {
          FROM orders o
          JOIN payment_attempts pa ON pa.id = $2
          WHERE o.id = $1`,
-        [order.id, attempt.rows[0].id]
+        [order.id, attempt.id]
       );
       expect(afterTimeout.rows[0]).toEqual({
         order_status: "PAYING",
@@ -4078,9 +4006,9 @@ describe("atomic commerce orders and payments", () => {
           notifyUrl: "http://peileme.test/notify",
           providerTimeoutMs: 100
         })
-      ).rejects.toMatchObject({ code: "ORDER_EXPIRED" });
+      ).rejects.toMatchObject({ code: "PAYMENT_CHANNEL_LOCKED" });
       expect(wrongChannelQueries).toBe(0);
-      const closed = await query<{
+      const locked = await query<{
         order_status: string;
         attempt_status: string;
         reconciliation_state: string;
@@ -4092,19 +4020,19 @@ describe("atomic commerce orders and payments", () => {
          FROM orders o
          JOIN payment_attempts pa ON pa.id = $2
          WHERE o.id = $1`,
-        [order.id, attempt.rows[0].id]
+        [order.id, attempt.id]
       );
-      expect(closed.rows[0]).toEqual({
-        order_status: "CLOSED",
-        attempt_status: "CLOSED",
-        reconciliation_state: "REQUIRED"
+      expect(locked.rows[0]).toEqual({
+        order_status: "PAYING",
+        attempt_status: "PENDING",
+        reconciliation_state: "NONE"
       });
     } finally {
       await cleanupEntitlementTestUsers(userIds);
     }
   });
 
-  it("commits expiry closure before returning ORDER_EXPIRED", async () => {
+  it("keeps an expired uncertain payment locked after an inconclusive query", async () => {
     await seedPolicyFoundation();
     let userId: string | undefined;
     try {
@@ -4116,12 +4044,11 @@ describe("atomic commerce orders and payments", () => {
         idempotencyKey: `expired-start-${randomUUID()}`,
         businessDraftId: await insertPolicyDraft(userId)
       });
-      const attempt = await query<{ id: string }>(
-        `INSERT INTO payment_attempts(order_id, channel, status)
-         VALUES ($1, 'fake', 'PENDING')
-         RETURNING id`,
-        [order.id]
-      );
+      const attempt = await insertIdentityAwarePaymentAttempt({
+        orderId: order.id,
+        channel: "wechat_h5",
+        status: "PENDING"
+      });
       await query(
         `UPDATE orders
          SET status = 'PAYING',
@@ -4132,7 +4059,7 @@ describe("atomic commerce orders and payments", () => {
       );
       let createCalls = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           createCalls += 1;
           throw new Error("must not create");
@@ -4156,7 +4083,9 @@ describe("atomic commerce orders and payments", () => {
           providerTimeoutMs: 100
         });
 
-      await expect(start()).rejects.toMatchObject({ code: "ORDER_EXPIRED" });
+      await expect(start()).rejects.toMatchObject({
+        code: "PAYMENT_CHANNEL_LOCKED"
+      });
       const first = await query<{
         status: string;
         closed_at: Date | null;
@@ -4180,16 +4109,16 @@ describe("atomic commerce orders and payments", () => {
         [order.id]
       );
       expect(first.rows[0]).toMatchObject({
-        status: "CLOSED",
-        closed_at: expect.any(Date),
-        attempt_status: "CLOSED",
-        reconciliation_state: "REQUIRED",
+        status: "PAYING",
+        closed_at: null,
+        attempt_status: "PENDING",
+        reconciliation_state: "NONE",
         reconciliation_attempt_count: 0,
-        reconciliation_next_at: expect.any(Date),
-        reconciliation_deadline_at: expect.any(Date)
+        reconciliation_next_at: null,
+        reconciliation_deadline_at: null
       });
       await expect(start()).rejects.toMatchObject({
-        code: "ORDER_STATE_CONFLICT"
+        code: "PAYMENT_CHANNEL_LOCKED"
       });
       expect(createCalls).toBe(0);
     } finally {
@@ -4197,7 +4126,7 @@ describe("atomic commerce orders and payments", () => {
     }
   });
 
-  it("recovers a locally closed order when the bounded background query later confirms payment", async () => {
+  it("keeps an expired uncertain attempt locked until the background query confirms payment", async () => {
     await seedPolicyFoundation();
     let userId: string | undefined;
     try {
@@ -4209,12 +4138,11 @@ describe("atomic commerce orders and payments", () => {
         idempotencyKey: `closed-late-recovery-${randomUUID()}`,
         businessDraftId: await insertPolicyDraft(userId)
       });
-      const attempt = await query<{ id: string }>(
-        `INSERT INTO payment_attempts(order_id, channel, status)
-         VALUES ($1, 'fake', 'PENDING')
-         RETURNING id`,
-        [order.id]
-      );
+      const attempt = await insertIdentityAwarePaymentAttempt({
+        orderId: order.id,
+        channel: "wechat_h5",
+        status: "PENDING"
+      });
       await query(
         `UPDATE orders
          SET status = 'PAYING',
@@ -4225,7 +4153,7 @@ describe("atomic commerce orders and payments", () => {
       );
       let queryCalls = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           throw new Error("must not create");
         },
@@ -4233,8 +4161,8 @@ describe("atomic commerce orders and payments", () => {
           queryCalls += 1;
           if (queryCalls === 1) return null;
           return {
-            orderNo,
-            channel: "fake" as const,
+            providerOrderNo: orderNo,
+            channel: "wechat_h5" as const,
             channelTransactionId: `closed-late-${randomUUID()}`,
             amountFen: order.amountFen,
             currency: "CNY" as const,
@@ -4258,8 +4186,8 @@ describe("atomic commerce orders and payments", () => {
           notifyUrl: "http://peileme.test/notify",
           providerTimeoutMs: 100
         })
-      ).rejects.toMatchObject({ code: "ORDER_EXPIRED" });
-      const locallyClosed = await query<{
+      ).rejects.toMatchObject({ code: "PAYMENT_CHANNEL_LOCKED" });
+      const stillLocked = await query<{
         order_status: string;
         attempt_status: string;
         reconciliation_state: string;
@@ -4279,23 +4207,17 @@ describe("atomic commerce orders and payments", () => {
          FROM orders o
          JOIN payment_attempts pa ON pa.id = $2
          WHERE o.id = $1`,
-        [order.id, attempt.rows[0].id]
+        [order.id, attempt.id]
       );
-      expect(locallyClosed.rows[0]).toMatchObject({
-        order_status: "CLOSED",
-        attempt_status: "CLOSED",
-        reconciliation_state: "REQUIRED",
+      expect(stillLocked.rows[0]).toMatchObject({
+        order_status: "PAYING",
+        attempt_status: "PENDING",
+        reconciliation_state: "NONE",
         reconciliation_attempt_count: 0,
-        reconciliation_next_at: expect.any(Date),
-        reconciliation_deadline_at: expect.any(Date),
-        reconciliation_last_result: "LOCAL_CLOSE_PENDING_FINAL_QUERY"
+        reconciliation_next_at: null,
+        reconciliation_deadline_at: null,
+        reconciliation_last_result: null
       });
-      await query(
-        `UPDATE payment_attempts
-         SET reconciliation_next_at = now() - interval '1 second'
-         WHERE id = $1`,
-        [attempt.rows[0].id]
-      );
 
       const reconciliation = await reconcileAndCloseExpiredOrders({
         provider,
@@ -4320,8 +4242,8 @@ describe("atomic commerce orders and payments", () => {
           unsafeOrChangedState: 0
         },
         closedRecovery: {
-          scannedCount: 1,
-          recoveredCount: 1,
+          scannedCount: 0,
+          recoveredCount: 0,
           retryScheduledCount: 0,
           terminalCount: 0,
           changedStateCount: 0,
@@ -4361,13 +4283,13 @@ describe("atomic commerce orders and payments", () => {
          FROM orders o
          JOIN payment_attempts pa ON pa.id = $2
          WHERE o.id = $1`,
-        [order.id, attempt.rows[0].id]
+        [order.id, attempt.id]
       );
       expect(persisted.rows[0]).toEqual({
         order_status: "COMPLETED",
         attempt_status: "SUCCEEDED",
         reconciliation_state: "RECOVERED",
-        reconciliation_attempt_count: 1,
+        reconciliation_attempt_count: 0,
         reconciliation_next_at: null,
         transactions: "1",
         entitlements: "1"
@@ -4387,8 +4309,8 @@ describe("atomic commerce orders and payments", () => {
         "closed-paid-audit-rollback"
       );
       const verified = {
-        orderNo: closed.order.orderNo,
-        channel: "fake" as const,
+        providerOrderNo: closed.providerOrderNo,
+        channel: "wechat_h5" as const,
         channelTransactionId: `closed-paid-audit-${randomUUID()}`,
         amountFen: closed.order.amountFen,
         currency: "CNY" as const,
@@ -4405,7 +4327,7 @@ describe("atomic commerce orders and payments", () => {
       });
       let queryCalls = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           throw new Error("must not create");
         },
@@ -4509,7 +4431,7 @@ describe("atomic commerce orders and payments", () => {
         anomalies: "0"
       });
 
-      await query(
+      await paymentWriteQuery(
         `UPDATE payment_attempts
          SET reconciliation_next_at = now() - interval '1 second'
          WHERE id = $1`,
@@ -4609,8 +4531,8 @@ describe("atomic commerce orders and payments", () => {
         [closed.order.id]
       );
       const verified = {
-        orderNo: closed.order.orderNo,
-        channel: "fake" as const,
+        providerOrderNo: closed.providerOrderNo,
+        channel: "wechat_h5" as const,
         channelTransactionId:
           `closed-invalid-entitlement-${randomUUID()}`,
         amountFen: closed.order.amountFen,
@@ -4622,7 +4544,7 @@ describe("atomic commerce orders and payments", () => {
         `commerce.reconcile.invalid-entitlement.${randomUUID()}`;
       const result = await reconcileAndCloseExpiredOrders({
         provider: {
-          channel: "fake",
+          channel: "wechat_h5",
           async createPayment() {
             throw new Error("must not create");
           },
@@ -4746,7 +4668,7 @@ describe("atomic commerce orders and payments", () => {
         userId,
         "closed-null-audit-rollback"
       );
-      await query(
+      await paymentWriteQuery(
         `UPDATE payment_attempts
          SET reconciliation_no_payment_count = 4
          WHERE id = $1`,
@@ -4754,7 +4676,7 @@ describe("atomic commerce orders and payments", () => {
       );
       let queryCalls = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           throw new Error("must not create");
         },
@@ -4838,7 +4760,7 @@ describe("atomic commerce orders and payments", () => {
          WHERE id = $1`,
         [open.order.id]
       );
-      await query(
+      await paymentWriteQuery(
         `UPDATE payment_attempts
          SET status = 'PENDING',
              reconciliation_state = 'NONE',
@@ -4850,7 +4772,7 @@ describe("atomic commerce orders and payments", () => {
       );
       let queryCalls = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           throw new Error("must not create");
         },
@@ -4947,7 +4869,7 @@ describe("atomic commerce orders and payments", () => {
          WHERE id = $1`,
         [open.order.id]
       );
-      await query(
+      await paymentWriteQuery(
         `UPDATE payment_attempts
          SET status = 'PENDING',
              reconciliation_state = 'NONE',
@@ -4958,8 +4880,8 @@ describe("atomic commerce orders and payments", () => {
         [open.attemptId]
       );
       const verified = {
-        orderNo: open.order.orderNo,
-        channel: "fake" as const,
+        providerOrderNo: open.providerOrderNo,
+        channel: "wechat_h5" as const,
         channelTransactionId:
           `open-query-error-callback-${randomUUID()}`,
         amountFen: open.order.amountFen,
@@ -4976,7 +4898,7 @@ describe("atomic commerce orders and payments", () => {
         reportProviderQuery = resolve;
       });
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           throw new Error("must not create");
         },
@@ -5072,7 +4994,7 @@ describe("atomic commerce orders and payments", () => {
          WHERE id = $1`,
         [open.order.id]
       );
-      await query(
+      await paymentWriteQuery(
         `UPDATE payment_attempts
          SET status = 'PENDING',
              reconciliation_state = 'NONE',
@@ -5081,14 +5003,14 @@ describe("atomic commerce orders and payments", () => {
         [open.attemptId]
       );
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           throw new Error("must not create");
         },
         async queryPayment(orderNo: string) {
           return {
-            orderNo,
-            channel: "fake" as const,
+            providerOrderNo: orderNo,
+            channel: "wechat_h5" as const,
             channelTransactionId: `open-late-audit-${randomUUID()}`,
             amountFen: open.order.amountFen,
             currency: "CNY" as const,
@@ -5166,8 +5088,8 @@ describe("atomic commerce orders and payments", () => {
         "closed-stale-paid-generation"
       );
       const staleVerified = {
-        orderNo: closed.order.orderNo,
-        channel: "fake" as const,
+        providerOrderNo: closed.providerOrderNo,
+        channel: "wechat_h5" as const,
         channelTransactionId: `closed-stale-paid-${randomUUID()}`,
         amountFen: closed.order.amountFen,
         currency: "CNY" as const,
@@ -5184,7 +5106,7 @@ describe("atomic commerce orders and payments", () => {
       });
       let queryCalls = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           throw new Error("must not create");
         },
@@ -5217,7 +5139,7 @@ describe("atomic commerce orders and payments", () => {
         providerTimeoutMs: 1_000
       });
       await firstQueryStarted;
-      await query(
+      await paymentWriteQuery(
         `UPDATE payment_attempts
          SET reconciliation_next_at = now() - interval '1 second'
          WHERE id = $1`,
@@ -5298,8 +5220,8 @@ describe("atomic commerce orders and payments", () => {
         "closed-newer-paid-generation"
       );
       const verified = {
-        orderNo: closed.order.orderNo,
-        channel: "fake" as const,
+        providerOrderNo: closed.providerOrderNo,
+        channel: "wechat_h5" as const,
         channelTransactionId: `closed-newer-paid-${randomUUID()}`,
         amountFen: closed.order.amountFen,
         currency: "CNY" as const,
@@ -5316,7 +5238,7 @@ describe("atomic commerce orders and payments", () => {
       });
       let queryCalls = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           throw new Error("must not create");
         },
@@ -5340,7 +5262,7 @@ describe("atomic commerce orders and payments", () => {
         providerTimeoutMs: 1_000
       });
       await firstQueryStarted;
-      await query(
+      await paymentWriteQuery(
         `UPDATE payment_attempts
          SET reconciliation_next_at = now() - interval '1 second'
          WHERE id = $1`,
@@ -5407,7 +5329,7 @@ describe("atomic commerce orders and payments", () => {
       );
       let queryCalls = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           throw new Error("must not create");
         },
@@ -5421,7 +5343,7 @@ describe("atomic commerce orders and payments", () => {
       };
       const summaries = [];
       for (let attempt = 1; attempt <= 5; attempt += 1) {
-        await query(
+        await paymentWriteQuery(
           `UPDATE payment_attempts
            SET reconciliation_next_at = now() - interval '1 second'
            WHERE id = $1`,
@@ -5543,7 +5465,7 @@ describe("atomic commerce orders and payments", () => {
       );
       let queryCalls = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           throw new Error("must not create");
         },
@@ -5553,8 +5475,8 @@ describe("atomic commerce orders and payments", () => {
             throw new Error("temporary provider query failure");
           }
           return {
-            orderNo,
-            channel: "fake" as const,
+            providerOrderNo: orderNo,
+            channel: "wechat_h5" as const,
             channelTransactionId: `closed-query-retry-${randomUUID()}`,
             amountFen: closed.order.amountFen,
             currency: "CNY" as const,
@@ -5633,7 +5555,7 @@ describe("atomic commerce orders and payments", () => {
       });
       expect(queryCalls).toBe(1);
 
-      await query(
+      await paymentWriteQuery(
         `UPDATE payment_attempts
          SET reconciliation_next_at = now() - interval '1 second'
          WHERE id = $1`,
@@ -5701,7 +5623,7 @@ describe("atomic commerce orders and payments", () => {
       );
       let queryCalls = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           throw new Error("must not create");
         },
@@ -5715,7 +5637,7 @@ describe("atomic commerce orders and payments", () => {
       };
 
       for (let attempt = 1; attempt <= 6; attempt += 1) {
-        await query(
+        await paymentWriteQuery(
           `UPDATE payment_attempts
            SET reconciliation_next_at = now() - interval '1 second'
            WHERE id = $1`,
@@ -5764,7 +5686,7 @@ describe("atomic commerce orders and payments", () => {
         reconciliation_query_error_count: 6
       });
 
-      await query(
+      await paymentWriteQuery(
         `UPDATE payment_attempts
          SET reconciliation_next_at = now() - interval '2 seconds',
              reconciliation_deadline_at = now() - interval '1 second'
@@ -5820,15 +5742,15 @@ describe("atomic commerce orders and payments", () => {
       );
       let queryCalls = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           throw new Error("must not create");
         },
         async queryPayment(orderNo: string) {
           queryCalls += 1;
           return {
-            orderNo,
-            channel: "fake" as const,
+            providerOrderNo: orderNo,
+            channel: "wechat_h5" as const,
             channelTransactionId: `closed-after-expiry-${randomUUID()}`,
             amountFen: closed.order.amountFen,
             currency: "CNY" as const,
@@ -5909,8 +5831,8 @@ describe("atomic commerce orders and payments", () => {
         "closed-callback-race"
       );
       const verified = {
-        orderNo: closed.order.orderNo,
-        channel: "fake" as const,
+        providerOrderNo: closed.providerOrderNo,
+        channel: "wechat_h5" as const,
         channelTransactionId: `closed-callback-${randomUUID()}`,
         amountFen: closed.order.amountFen,
         currency: "CNY" as const,
@@ -5927,7 +5849,7 @@ describe("atomic commerce orders and payments", () => {
       });
       let queryCalls = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           throw new Error("must not create");
         },
@@ -6023,50 +5945,38 @@ describe("atomic commerce orders and payments", () => {
            WHERE id = $1`,
           [order.id]
         );
-        const attempts = await query<{ id: string; channel: string }>(
-          `INSERT INTO payment_attempts(
-             order_id,
-             channel,
-             status,
-             reconciliation_state,
-             reconciliation_next_at,
-             reconciliation_deadline_at,
-             reconciliation_last_result,
-             created_at,
-             updated_at
-           )
-           VALUES
-             (
-               $1,
-               'wechat_h5',
-               'CLOSED',
-               'REQUIRED',
-               now() - interval '1 second',
-               now() + interval '24 hours',
-               'LOCAL_CLOSE_PENDING_FINAL_QUERY',
-               now() - interval '2 minutes',
-               now() - interval '2 minutes'
-             ),
-             (
-               $1,
-               'alipay_wap',
-               'CLOSED',
-               'REQUIRED',
-               now() - interval '1 second',
-               now() + interval '24 hours',
-               'LOCAL_CLOSE_PENDING_FINAL_QUERY',
-               now() - interval '1 minute',
-               now() - interval '1 minute'
-             )
-           RETURNING id, channel`,
-          [order.id]
-        );
+        const wechatAttempt = await insertIdentityAwarePaymentAttempt({
+          orderId: order.id,
+          channel: "wechat_h5",
+          status: "CLOSED",
+          reconciliationState: "REQUIRED",
+          reconciliationNextAt: new Date(Date.now() - 1_000),
+          reconciliationDeadlineAt: new Date(Date.now() + 24 * 60 * 60_000),
+          reconciliationLastResult: "LOCAL_CLOSE_PENDING_FINAL_QUERY",
+          createdAt: new Date(Date.now() - 2 * 60_000)
+        });
+        const alipayAttempt = await insertIdentityAwarePaymentAttempt({
+          orderId: order.id,
+          channel: "alipay_wap",
+          status: "CLOSED",
+          reconciliationState: "REQUIRED",
+          reconciliationNextAt: new Date(Date.now() - 1_000),
+          reconciliationDeadlineAt: new Date(Date.now() + 24 * 60 * 60_000),
+          reconciliationLastResult: "LOCAL_CLOSE_PENDING_FINAL_QUERY",
+          createdAt: new Date(Date.now() - 60_000)
+        });
         return {
           order,
           attemptByChannel: new Map(
-            attempts.rows.map((attempt) => [
+            [wechatAttempt, alipayAttempt].map((attempt) => [
               attempt.channel,
               attempt.id
+            ])
+          ),
+          providerOrderNoByChannel: new Map(
+            [wechatAttempt, alipayAttempt].map((attempt) => [
+              attempt.channel,
+              attempt.providerOrderNo
             ])
           )
         };
@@ -6085,9 +5995,11 @@ describe("atomic commerce orders and payments", () => {
         },
         async queryPayment(orderNo: string) {
           wechatCalls.push(orderNo);
-          if (orderNo === terminal.order.orderNo) return null;
+          if (
+            orderNo === terminal.providerOrderNoByChannel.get("wechat_h5")
+          ) return null;
           return {
-            orderNo,
+            providerOrderNo: orderNo,
             channel: "wechat_h5" as const,
             channelTransactionId: `wechat-recovered-${randomUUID()}`,
             amountFen: recovered.order.amountFen,
@@ -6107,7 +6019,10 @@ describe("atomic commerce orders and payments", () => {
         providerTimeoutMs: 100
       });
       expect(wechatCalls.sort()).toEqual(
-        [recovered.order.orderNo, terminal.order.orderNo].sort()
+        [
+          recovered.providerOrderNoByChannel.get("wechat_h5"),
+          terminal.providerOrderNoByChannel.get("wechat_h5")
+        ].sort()
       );
       expect(wechat.summary).toMatchObject({
         scannedCount: 2,
@@ -6130,9 +6045,11 @@ describe("atomic commerce orders and payments", () => {
         },
         async queryPayment(orderNo: string) {
           alipayCalls += 1;
-          expect(orderNo).toBe(terminal.order.orderNo);
+          expect(orderNo).toBe(
+            terminal.providerOrderNoByChannel.get("alipay_wap")
+          );
           return {
-            orderNo,
+            providerOrderNo: orderNo,
             channel: "alipay_wap" as const,
             channelTransactionId: `alipay-terminal-${randomUUID()}`,
             amountFen: terminal.order.amountFen,
@@ -6223,17 +6140,21 @@ describe("atomic commerce orders and payments", () => {
         businessDraftId: await insertPolicyDraft(userId)
       });
       const seenAttempts: string[] = [];
+      const createdProviderOrderNos: string[] = [];
+      const queriedProviderOrderNos: string[] = [];
       let timedOutSignal: AbortSignal | undefined;
       let queryCalls = 0;
       let calls = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment(input: {
           attemptId: string;
           orderNo: string;
+          providerOrderNo: string;
           signal: AbortSignal;
         }) {
           seenAttempts.push(input.attemptId);
+          createdProviderOrderNos.push(input.providerOrderNo);
           calls += 1;
           if (calls === 1) {
             timedOutSignal = input.signal;
@@ -6251,9 +6172,10 @@ describe("atomic commerce orders and payments", () => {
             response: {}
           };
         },
-        async queryPayment(_orderNo: string, signal: AbortSignal) {
+        async queryPayment(providerOrderNo: string, signal: AbortSignal) {
           expect(signal.aborted).toBe(false);
           queryCalls += 1;
+          queriedProviderOrderNos.push(providerOrderNo);
           return null;
         },
         async refund() {
@@ -6289,23 +6211,14 @@ describe("atomic commerce orders and payments", () => {
       );
       expect(timedOutAttempt.rows[0]).toEqual({
         error_code: "PAYMENT_PROVIDER_TIMEOUT",
-        status: "FAILED"
+        status: "CREATE_UNKNOWN"
       });
       await expect(start()).rejects.toMatchObject({
         code: "PAYMENT_INITIALIZING"
       });
       expect({ calls, queryCalls }).toEqual({ calls: 1, queryCalls: 1 });
-      await query(
-        `UPDATE payment_attempts
-         SET updated_at = now() - interval '121 seconds'
-         WHERE order_id = $1`,
-        [order.id]
-      );
-      const retried = await start();
-      expect(seenAttempts).toEqual([
-        retried.paymentAttemptId,
-        retried.paymentAttemptId
-      ]);
+      expect(seenAttempts).toHaveLength(1);
+      expect(queriedProviderOrderNos).toEqual(createdProviderOrderNos);
     } finally {
       if (userId) await cleanupEntitlementTestUsers([userId]);
     }
@@ -6323,7 +6236,7 @@ describe("atomic commerce orders and payments", () => {
       let createCalls = 0;
       let queryCalls = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           createCalls += 1;
           throw new Error("must not create");
@@ -6331,8 +6244,8 @@ describe("atomic commerce orders and payments", () => {
         async queryPayment(orderNo: string) {
           queryCalls += 1;
           return {
-            orderNo,
-            channel: "fake" as const,
+            providerOrderNo: orderNo,
+            channel: "wechat_h5" as const,
             channelTransactionId: `query-paid-${randomUUID()}`,
             amountFen: failed.order.amountFen,
             currency: "CNY" as const,
@@ -6388,7 +6301,7 @@ describe("atomic commerce orders and payments", () => {
     }
   });
 
-  it("reuses the failed attempt when provider query reports no payment", async () => {
+  it("keeps the uncertain attempt locked when provider query reports no payment", async () => {
     await seedPolicyFoundation();
     let userId: string | undefined;
     try {
@@ -6400,7 +6313,7 @@ describe("atomic commerce orders and payments", () => {
       let createCalls = 0;
       let queryCalls = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment(input: {
           attemptId: string;
           orderNo: string;
@@ -6420,29 +6333,32 @@ describe("atomic commerce orders and payments", () => {
           return { channelRefundId: "unused", raw: {} };
         }
       };
-      const retried = await startPayment({
-        userId,
-        orderId: failed.order.id,
-        productChannel: failed.order.channel,
-        provider,
-        clientIp: "127.0.0.1",
-        returnUrl: "http://peileme.test/return",
-        notifyUrl: "http://peileme.test/notify",
-        providerTimeoutMs: 100
-      });
-      expect(retried).toMatchObject({
-        status: "PAYING",
-        paymentAttemptId: failed.attemptId
-      });
+      await expect(
+        startPayment({
+          userId,
+          orderId: failed.order.id,
+          productChannel: failed.order.channel,
+          provider,
+          clientIp: "127.0.0.1",
+          returnUrl: "http://peileme.test/return",
+          notifyUrl: "http://peileme.test/notify",
+          providerTimeoutMs: 100
+        })
+      ).rejects.toMatchObject({ code: "PAYMENT_INITIALIZING" });
       expect({ createCalls, queryCalls }).toEqual({
-        createCalls: 1,
+        createCalls: 0,
         queryCalls: 1
       });
-      const attempts = await query<{ count: string }>(
-        "SELECT count(*)::text AS count FROM payment_attempts WHERE order_id = $1",
+      const attempts = await query<{ count: string; status: string }>(
+        `SELECT count(*)::text AS count, max(status) AS status
+           FROM payment_attempts
+          WHERE order_id = $1`,
         [failed.order.id]
       );
-      expect(attempts.rows[0].count).toBe("1");
+      expect(attempts.rows[0]).toEqual({
+        count: "1",
+        status: "CREATE_UNKNOWN"
+      });
     } finally {
       if (userId) await cleanupEntitlementTestUsers([userId]);
     }
@@ -6459,7 +6375,7 @@ describe("atomic commerce orders and payments", () => {
       );
       let createCalls = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           createCalls += 1;
           throw new Error("must not create");
@@ -6502,7 +6418,7 @@ describe("atomic commerce orders and payments", () => {
         [failed.order.id]
       );
       expect(persisted.rows[0]).toEqual({
-        status: "PAYMENT_FAILED",
+        status: "PAYING",
         attempts: "1",
         transactions: "0"
       });
@@ -6529,16 +6445,20 @@ describe("atomic commerce orders and payments", () => {
          WHERE id = ANY($1::uuid[])`,
         [[paid.order.id, unpaid.order.id, errored.order.id]]
       );
-      await query(
+      await paymentWriteQuery(
         `UPDATE payment_attempts
-         SET status = 'CLOSED'
+         SET status = 'CLOSED',
+             reconciliation_state = 'REQUIRED',
+             reconciliation_next_at = now() - interval '1 second',
+             reconciliation_deadline_at = now() + interval '24 hours',
+             reconciliation_last_result = 'LOCAL_CLOSE_PENDING_FINAL_QUERY'
          WHERE order_id = ANY($1::uuid[])`,
         [[paid.order.id, unpaid.order.id, errored.order.id]]
       );
       let mode: "paid" | "null" | "error" = "paid";
       let createCalls = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           createCalls += 1;
           throw new Error("must not create");
@@ -6550,8 +6470,8 @@ describe("atomic commerce orders and payments", () => {
           }
           if (mode === "null") return null;
           return {
-            orderNo,
-            channel: "fake" as const,
+            providerOrderNo: orderNo,
+            channel: "wechat_h5" as const,
             channelTransactionId: `closed-paid-${randomUUID()}`,
             amountFen: paid.order.amountFen,
             currency: "CNY" as const,
@@ -6581,7 +6501,7 @@ describe("atomic commerce orders and payments", () => {
       });
       mode = "null";
       await expect(start(unpaid.order.id)).rejects.toMatchObject({
-        code: "ORDER_STATE_CONFLICT"
+        code: "PAYMENT_CHANNEL_LOCKED"
       });
       mode = "error";
       await expect(start(errored.order.id)).rejects.toMatchObject({
@@ -6665,26 +6585,29 @@ describe("atomic commerce orders and payments", () => {
           idempotencyKey: `transaction-owner-${randomUUID()}`,
           businessDraftId
         });
-        const attempt = await query<{ id: string }>(
-          `INSERT INTO payment_attempts(order_id, channel, status)
-           VALUES ($1, 'fake', 'PENDING')
-           RETURNING id`,
-          [order.id]
-        );
-        return { order, attemptId: attempt.rows[0].id };
+        const attempt = await insertIdentityAwarePaymentAttempt({
+          orderId: order.id,
+          channel: "wechat_h5",
+          status: "PENDING"
+        });
+        return {
+          order,
+          attemptId: attempt.id,
+          providerOrderNo: attempt.providerOrderNo
+        };
       };
       const [first, second] = await Promise.all([
         makePayableOrder(),
         makePayableOrder()
       ]);
       const channelTransactionId = `shared-${randomUUID()}`;
-      const settle = ({ order, attemptId }: typeof first) =>
+      const settle = ({ order, attemptId, providerOrderNo }: typeof first) =>
         markOrderPaid({
           orderId: order.id,
           paymentAttemptId: attemptId,
           verified: {
-            orderNo: order.orderNo,
-            channel: "fake",
+            providerOrderNo,
+            channel: "wechat_h5",
             channelTransactionId,
             amountFen: order.amountFen,
             currency: "CNY",
@@ -6726,7 +6649,7 @@ describe("atomic commerce orders and payments", () => {
                AND status = 'COMPLETED') AS completed,
            (SELECT count(*)::text
               FROM payment_anomalies
-             WHERE provider_channel = 'fake'
+             WHERE provider_channel = 'wechat_h5'
                AND channel_transaction_id = $1) AS anomalies,
            (SELECT count(*)::text
               FROM orders
@@ -6758,12 +6681,11 @@ describe("atomic commerce orders and payments", () => {
         idempotencyKey: `expiry-race-${randomUUID()}`,
         businessDraftId: await insertPolicyDraft(userId)
       });
-      const attempt = await query<{ id: string }>(
-        `INSERT INTO payment_attempts(order_id, channel, status)
-         VALUES ($1, 'fake', 'PENDING')
-         RETURNING id`,
-        [order.id]
-      );
+      const attempt = await insertIdentityAwarePaymentAttempt({
+        orderId: order.id,
+        channel: "wechat_h5",
+        status: "PENDING"
+      });
       await query(
         `UPDATE orders
             SET status = 'PAYING',
@@ -6774,10 +6696,10 @@ describe("atomic commerce orders and payments", () => {
       );
       const payment = markOrderPaid({
         orderId: order.id,
-        paymentAttemptId: attempt.rows[0].id,
+        paymentAttemptId: attempt.id,
         verified: {
-          orderNo: order.orderNo,
-          channel: "fake",
+          providerOrderNo: attempt.providerOrderNo,
+          channel: "wechat_h5",
           channelTransactionId: `expiry-${randomUUID()}`,
           amountFen: order.amountFen,
           currency: "CNY",
@@ -6786,7 +6708,7 @@ describe("atomic commerce orders and payments", () => {
         }
       });
       const cleanupProvider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           throw new Error("cleanup must not create");
         },
@@ -6872,8 +6794,23 @@ describe("atomic commerce orders and payments", () => {
       try {
         await query("VACUUM (ANALYZE) orders, payment_attempts");
         userId = await createEntitlementTestUser(true);
-        await query(
-          `WITH generated_orders AS (
+        await withTransaction(async (client) => {
+          // The migration contract suite exercises these deferred guards row
+          // by row. This query-plan fixture validates the same owner invariant
+          // once, set-wise, so 50k PL/pgSQL callbacks do not dominate runtime.
+          await client.query(
+            `ALTER TABLE provider_payment_orders
+             DISABLE TRIGGER provider_payment_owner_guard_trigger`
+          );
+          await client.query(
+            `ALTER TABLE payment_attempts
+             DISABLE TRIGGER payment_attempt_provider_owner_guard_trigger`
+          );
+          await client.query(
+            "SET LOCAL peileme.payment_write_contract = 'identity_v1'"
+          );
+          await client.query(
+            `WITH generated_orders AS (
              INSERT INTO orders(
                order_no,
                user_id,
@@ -6901,43 +6838,118 @@ describe("atomic commerce orders and payments", () => {
                now() - interval '30 minutes'
              FROM generate_series(1, 50010) value
              RETURNING id, order_no
+           ), prepared_attempts AS (
+             SELECT
+               id AS order_id,
+               order_no,
+               gen_random_uuid() AS identity_id,
+               gen_random_uuid() AS attempt_id
+             FROM generated_orders
+           ), inserted_identities AS (
+             INSERT INTO provider_payment_orders(
+               id,
+               order_id,
+               channel,
+               provider_order_no,
+               origin,
+               allocated_at,
+               canonical_attempt_id,
+               manual_review_required
+             )
+             SELECT
+               identity_id,
+               order_id,
+               'wechat_h5',
+               order_no,
+               'legacy_order_no',
+               now(),
+               attempt_id,
+               false
+             FROM prepared_attempts
+             RETURNING id
            )
            INSERT INTO payment_attempts(
+             id,
              order_id,
              channel,
              status,
+             provider_payment_order_id,
+             provider_identity_role,
+             provider_operation_eligible,
+             request_snapshot,
              reconciliation_state,
              reconciliation_next_at,
              reconciliation_deadline_at,
              reconciliation_last_result
            )
            SELECT
-             id,
-             'fake',
+             prepared.attempt_id,
+             prepared.order_id,
+             'wechat_h5',
              'CLOSED',
+             prepared.identity_id,
+             'canonical_owner',
+             true,
+             jsonb_build_object('providerOrderNo', prepared.order_no),
              CASE
-               WHEN order_no > 'PLMPLAN00050000'
+               WHEN prepared.order_no > 'PLMPLAN00050000'
                  THEN 'REQUIRED'
                ELSE 'NONE'
              END,
              CASE
-               WHEN order_no > 'PLMPLAN00050000'
+               WHEN prepared.order_no > 'PLMPLAN00050000'
                  THEN now() - interval '1 second'
                ELSE NULL
              END,
              CASE
-               WHEN order_no > 'PLMPLAN00050000'
+               WHEN prepared.order_no > 'PLMPLAN00050000'
                  THEN now() + interval '24 hours'
                ELSE NULL
              END,
              CASE
-               WHEN order_no > 'PLMPLAN00050000'
+               WHEN prepared.order_no > 'PLMPLAN00050000'
                  THEN 'LOCAL_CLOSE_PENDING_FINAL_QUERY'
                ELSE NULL
              END
-           FROM generated_orders`,
-          [userId]
-        );
+           FROM prepared_attempts prepared
+           JOIN inserted_identities identity
+             ON identity.id = prepared.identity_id`,
+            [userId]
+          );
+          const invariant = await client.query<{ invalid_count: string }>(
+            `SELECT count(*)::text AS invalid_count
+             FROM provider_payment_orders identity
+             LEFT JOIN payment_attempts attempt
+               ON attempt.id = identity.canonical_attempt_id
+             WHERE identity.order_id IN (
+               SELECT id
+               FROM orders
+               WHERE user_id = $1
+                 AND idempotency_key LIKE 'reconciliation-plan-%'
+             )
+               AND (
+                 attempt.id IS NULL
+                 OR attempt.order_id <> identity.order_id
+                 OR attempt.channel <> identity.channel
+                 OR attempt.provider_payment_order_id <> identity.id
+                 OR attempt.provider_identity_role <> 'canonical_owner'
+                 OR NOT attempt.provider_operation_eligible
+                 OR attempt.request_snapshot ->> 'providerOrderNo'
+                      IS DISTINCT FROM identity.provider_order_no
+               )`,
+            [userId]
+          );
+          expect(invariant.rows[0]?.invalid_count).toBe("0");
+          await client.query("SET CONSTRAINTS ALL IMMEDIATE");
+          await client.query(
+            `ALTER TABLE payment_attempts
+             ENABLE TRIGGER payment_attempt_provider_owner_guard_trigger`
+          );
+          await client.query(
+            `ALTER TABLE provider_payment_orders
+             ENABLE TRIGGER provider_payment_owner_guard_trigger`
+          );
+        });
         await query("ANALYZE orders, payment_attempts");
         const explained = await query<{ "QUERY PLAN": unknown }>(
           `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
@@ -6949,7 +6961,7 @@ describe("atomic commerce orders and payments", () => {
                pa.reconciliation_next_at,
                pa.reconciliation_deadline_at
              FROM payment_attempts pa
-             WHERE pa.channel = 'fake'
+             WHERE pa.channel = 'wechat_h5'
                AND pa.reconciliation_state IN (
                  'REQUIRED',
                  'RETRY_SCHEDULED'
@@ -6993,7 +7005,7 @@ describe("atomic commerce orders and payments", () => {
         let queryCalls = 0;
         const reconciliation = await reconcileAndCloseExpiredOrders({
           provider: {
-            channel: "fake",
+            channel: "wechat_h5",
             async createPayment() {
               throw new Error("plan probe must not create");
             },
@@ -7049,21 +7061,18 @@ describe("atomic commerce orders and payments", () => {
         ).toBe(true);
       } finally {
         if (userId) {
-          await query(
-            `DELETE FROM payment_attempts
-             WHERE order_id IN (
-               SELECT id
-               FROM orders
-               WHERE user_id = $1
-             )`,
-            [userId]
-          );
-          await query("DELETE FROM orders WHERE user_id = $1", [userId]);
-          await query("DELETE FROM users WHERE id = $1", [userId]);
+          await withTransaction(async (client) => {
+            // This file runs in Vitest's single fork against its dedicated
+            // database. Cascading row deletes across the 50k circular
+            // identity fixtures spend minutes in deferred FK checks, while a
+            // transactional truncate keeps the boundary test deterministic.
+            await client.query("TRUNCATE TABLE orders CASCADE");
+            await client.query("DELETE FROM users WHERE id = $1", [userId]);
+          });
         }
       }
     },
-    30_000
+    240_000
   );
 
   it("queries attempted expired orders before safe close and defers errors", async () => {
@@ -7095,11 +7104,8 @@ describe("atomic commerce orders and payments", () => {
       );
       const noProvider = await createFailedPaymentOrder(
         userId,
-        "cleanup-no-provider"
-      );
-      await query(
-        "UPDATE payment_attempts SET channel = 'wechat_h5' WHERE id = $1",
-        [noProvider.attemptId]
+        "cleanup-no-provider",
+        "alipay_wap"
       );
       const created = await createOrder({
         userId,
@@ -7126,7 +7132,7 @@ describe("atomic commerce orders and payments", () => {
       let activeQueries = 0;
       let maxActiveQueries = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           throw new Error("cleanup must not create");
         },
@@ -7137,13 +7143,13 @@ describe("atomic commerce orders and payments", () => {
           maxActiveQueries = Math.max(maxActiveQueries, activeQueries);
           try {
             await new Promise((resolve) => setTimeout(resolve, 20));
-            if (orderNo === errored.order.orderNo) {
+            if (orderNo === errored.providerOrderNo) {
               throw new Error("cleanup query secret");
             }
-            if (orderNo === unpaid.order.orderNo) return null;
+            if (orderNo === unpaid.providerOrderNo) return null;
             return {
-              orderNo,
-              channel: "fake" as const,
+              providerOrderNo: orderNo,
+              channel: "wechat_h5" as const,
               channelTransactionId: `cleanup-paid-${randomUUID()}`,
               amountFen: paid.order.amountFen,
               currency: "CNY" as const,
@@ -7170,9 +7176,9 @@ describe("atomic commerce orders and payments", () => {
       );
       expect(queryCalls.sort()).toEqual(
         [
-          paid.order.orderNo,
-          unpaid.order.orderNo,
-          errored.order.orderNo
+          paid.providerOrderNo,
+          unpaid.providerOrderNo,
+          errored.providerOrderNo
         ].sort()
       );
       expect(maxActiveQueries).toBeGreaterThan(1);
@@ -7190,8 +7196,8 @@ describe("atomic commerce orders and payments", () => {
         new Map([
           [paid.order.id, "COMPLETED"],
           [unpaid.order.id, "CLOSED"],
-          [errored.order.id, "PAYMENT_FAILED"],
-          [noProvider.order.id, "PAYMENT_FAILED"],
+          [errored.order.id, "PAYING"],
+          [noProvider.order.id, "PAYING"],
           [created.id, "CLOSED"]
         ])
       );
@@ -7242,7 +7248,7 @@ describe("atomic commerce orders and payments", () => {
          WHERE id = ANY($1::uuid[])`,
         [allIds]
       );
-      await query(
+      await paymentWriteQuery(
         `UPDATE payment_attempts
          SET updated_at = CASE
            WHEN id = $2 THEN now() - interval '8 minutes'
@@ -7266,7 +7272,7 @@ describe("atomic commerce orders and payments", () => {
       const queryCallsByRun: string[][] = [[], []];
       let currentRun = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           throw new Error("cleanup must not create");
         },
@@ -7274,15 +7280,15 @@ describe("atomic commerce orders and payments", () => {
           expect(signal.aborted).toBe(false);
           queryCallsByRun[currentRun].push(orderNo);
           if (
-            orderNo === firstQueryError.order.orderNo ||
-            orderNo === secondQueryError.order.orderNo
+            orderNo === firstQueryError.providerOrderNo ||
+            orderNo === secondQueryError.providerOrderNo
           ) {
             throw new Error("persistent provider query failure");
           }
-          if (orderNo === invalidVerified.order.orderNo) {
+          if (orderNo === invalidVerified.providerOrderNo) {
             return {
-              orderNo,
-              channel: "fake" as const,
+              providerOrderNo: orderNo,
+              channel: "wechat_h5" as const,
               channelTransactionId: `invalid-${randomUUID()}`,
               amountFen: (
                 BigInt(invalidVerified.order.amountFen) + 1n
@@ -7351,12 +7357,12 @@ describe("atomic commerce orders and payments", () => {
       });
       expect(queryCallsByRun).toEqual([
         [
-          firstQueryError.order.orderNo,
-          secondQueryError.order.orderNo
+          firstQueryError.providerOrderNo,
+          secondQueryError.providerOrderNo
         ],
         [
-          invalidVerified.order.orderNo,
-          unpaid.order.orderNo
+          invalidVerified.providerOrderNo,
+          unpaid.providerOrderNo
         ]
       ]);
       expect(queryCallsByRun.every((calls) => calls.length <= 2)).toBe(
@@ -7396,7 +7402,7 @@ describe("atomic commerce orders and payments", () => {
             firstQueryError.order.id,
             {
               id: firstQueryError.order.id,
-              status: "PAYMENT_FAILED",
+              status: "PAYING",
               error_code: "RECONCILIATION_QUERY_FAILED",
               transactions: "0",
               entitlements: "0"
@@ -7406,7 +7412,7 @@ describe("atomic commerce orders and payments", () => {
             secondQueryError.order.id,
             {
               id: secondQueryError.order.id,
-              status: "PAYMENT_FAILED",
+              status: "PAYING",
               error_code: "RECONCILIATION_QUERY_FAILED",
               transactions: "0",
               entitlements: "0"
@@ -7473,8 +7479,8 @@ describe("atomic commerce orders and payments", () => {
         [[noAttempt.id, open.order.id]]
       );
       const verified = {
-        orderNo: open.order.orderNo,
-        channel: "fake" as const,
+        providerOrderNo: open.providerOrderNo,
+        channel: "wechat_h5" as const,
         channelTransactionId: `capacity-race-${randomUUID()}`,
         amountFen: open.order.amountFen,
         currency: "CNY" as const,
@@ -7490,7 +7496,7 @@ describe("atomic commerce orders and payments", () => {
         reportProviderQuery = resolve;
       });
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           throw new Error("must not create");
         },
@@ -7581,7 +7587,7 @@ describe("atomic commerce orders and payments", () => {
          WHERE id = ANY($1::uuid[])`,
         [orderIds]
       );
-      await query(
+      await paymentWriteQuery(
         `UPDATE payment_attempts
          SET updated_at = CASE
            WHEN id = $2 THEN now() - interval '8 minutes'
@@ -7594,7 +7600,7 @@ describe("atomic commerce orders and payments", () => {
       const queryCallsByRun: string[][] = [[], [], []];
       let currentRun = 0;
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           throw new Error("cleanup must not create");
         },
@@ -7760,7 +7766,7 @@ describe("atomic commerce orders and payments", () => {
       );
       const queryCalls: string[] = [];
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           throw new Error("cleanup must not create");
         },
@@ -7768,8 +7774,8 @@ describe("atomic commerce orders and payments", () => {
           expect(signal.aborted).toBe(false);
           queryCalls.push(orderNo);
           return {
-            orderNo,
-            channel: "fake" as const,
+            providerOrderNo: orderNo,
+            channel: "wechat_h5" as const,
             channelTransactionId: `paid-backlog-${randomUUID()}`,
             amountFen: paid.order.amountFen,
             currency: "CNY" as const,
@@ -7789,7 +7795,7 @@ describe("atomic commerce orders and payments", () => {
         providerTimeoutMs: 100
       });
 
-      expect(queryCalls).toEqual([paid.order.orderNo]);
+      expect(queryCalls).toEqual([paid.providerOrderNo]);
       expect(reconciliation.closedOrderIds).toEqual([firstCreated.id]);
       expect(reconciliation.summary).toEqual({
         scannedCount: 2,
@@ -7875,15 +7881,18 @@ describe("atomic commerce orders and payments", () => {
           idempotencyKey: `${marker}-${randomUUID()}`,
           businessDraftId: await insertPolicyDraft(userId!)
         });
-        const attempt = await query<{ id: string }>(
-          `INSERT INTO payment_attempts(
-             order_id, channel, status, launch_url
-           )
-           VALUES ($1, 'fake', 'REDIRECT_READY', '/pending')
-           RETURNING id`,
-          [order.id]
-        );
-        return { order, attemptId: attempt.rows[0].id };
+        const attempt = await insertIdentityAwarePaymentAttempt({
+          orderId: order.id,
+          channel: "wechat_h5",
+          status: "REDIRECT_READY",
+          launchUrl: "/pending",
+          launchExpiresAt: new Date(Date.now() + 5 * 60_000)
+        });
+        return {
+          order,
+          attemptId: attempt.id,
+          providerOrderNo: attempt.providerOrderNo
+        };
       };
       const paid = await makeOrderWithAttempt("paid-expiry");
       const pending = await makeOrderWithAttempt("pending-expiry");
@@ -7892,8 +7901,8 @@ describe("atomic commerce orders and payments", () => {
         orderId: paid.order.id,
         paymentAttemptId: paid.attemptId,
         verified: {
-          orderNo: paid.order.orderNo,
-          channel: "fake",
+          providerOrderNo: paid.providerOrderNo,
+          channel: "wechat_h5",
           channelTransactionId: `paid-expiry-${randomUUID()}`,
           amountFen: paid.order.amountFen,
           currency: "CNY",
@@ -7917,7 +7926,7 @@ describe("atomic commerce orders and payments", () => {
           failed.order.id
         ]
       );
-      await query(
+      await paymentWriteQuery(
         "UPDATE payment_attempts SET status = 'FAILED' WHERE id = $1",
         [failed.attemptId]
       );
@@ -7929,7 +7938,7 @@ describe("atomic commerce orders and payments", () => {
         code: "INVALID_COMMERCE_INPUT"
       });
       const cleanupProvider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment() {
           throw new Error("cleanup must not create");
         },
@@ -8069,7 +8078,7 @@ describe("atomic commerce orders and payments", () => {
       ]);
       const seen = new Map<string, string>();
       const provider = {
-        channel: "fake" as const,
+        channel: "wechat_h5" as const,
         async createPayment(input: {
           attemptId: string;
           orderNo: string;
@@ -8100,7 +8109,7 @@ describe("atomic commerce orders and payments", () => {
               : "ai.peileme.art"
           )
           .set("authorization", `Bearer ${token}`)
-          .send({ channel: "fake" })
+          .send({ channel: "wechat_h5" })
           .expect(200);
       }
       expect(seen.get(orders[0].orderNo)).toBe(
@@ -8131,13 +8140,10 @@ describe("atomic commerce orders and payments", () => {
     }
   });
 
-  it("runs the owned fake checkout through real HTTP and persisted fulfillment", async () => {
+  it("runs an owned real-channel checkout through HTTP and persisted fulfillment", async () => {
     await seedPolicyFoundation();
-    const previousPaymentMode = process.env.PAYMENT_MODE;
     const userIds: string[] = [];
     try {
-      process.env.PAYMENT_MODE = "fake";
-      resetConfigForTests();
       const userId = await createEntitlementTestUser(true);
       userIds.push(userId);
       const otherUserId = await createEntitlementTestUser(true);
@@ -8159,7 +8165,8 @@ describe("atomic commerce orders and payments", () => {
       const token = await tokenFor(userId);
       const otherToken = await tokenFor(otherUserId);
       const businessDraftId = await insertPolicyDraft(userId);
-      const app = createApp();
+      const provider = new ScriptedRealPaymentProvider("wechat_h5");
+      const app = createApp({ paymentProvider: provider });
 
       const mainCatalog = await request(app)
         .get("/api/commerce/catalog?channel=main")
@@ -8220,30 +8227,55 @@ describe("atomic commerce orders and payments", () => {
       const firstPay = await request(app)
         .post(`/api/commerce/orders/${order.body.id}/pay`)
         .set("authorization", `Bearer ${token}`)
-        .send({ channel: "fake" })
+        .send({ channel: "wechat_h5" })
         .expect(200);
       const repeatedPay = await request(app)
         .post(`/api/commerce/orders/${order.body.id}/pay`)
         .set("authorization", `Bearer ${token}`)
-        .send({ channel: "fake" })
+        .send({ channel: "wechat_h5" })
         .expect(200);
       expect(repeatedPay.body.launchUrl).toBe(firstPay.body.launchUrl);
-
-      const launch = new URL(firstPay.body.launchUrl, "http://peileme.test");
+      expect(new URL(firstPay.body.launchUrl).hostname).toBe("payments.test");
+      expect(provider.createInputs).toHaveLength(1);
+      const attempt = await query<{
+        id: string;
+        provider_order_no: string;
+      }>(
+        `SELECT pa.id, identity.provider_order_no
+         FROM payment_attempts pa
+         JOIN provider_payment_orders identity
+           ON identity.id = pa.provider_payment_order_id
+         WHERE pa.order_id = $1
+           AND pa.provider_identity_role = 'canonical_owner'`,
+        [order.body.id]
+      );
+      expect(attempt.rows).toHaveLength(1);
       await request(app)
-        .post(`${launch.pathname}${launch.search}`)
-        .send({ amountFen: "1" })
-        .expect(400);
+        .post(`/api/test-payments/${attempt.rows[0].id}/complete`)
+        .send({})
+        .expect(404);
       await query(
         `UPDATE order_items
          SET entitlement_policy = '{"grantCount":"invalid"}'::jsonb
          WHERE order_id = $1`,
         [order.body.id]
       );
-      await request(app)
-        .post(`${launch.pathname}${launch.search}`)
-        .send({})
-        .expect(500);
+      const verified = {
+        providerOrderNo: attempt.rows[0].provider_order_no,
+        channel: "wechat_h5" as const,
+        channelTransactionId: `http-real-${randomUUID()}`,
+        amountFen: order.body.amountFen,
+        currency: "CNY" as const,
+        paidAt: new Date().toISOString(),
+        raw: { source: "scripted-real-provider" }
+      };
+      await expect(
+        markOrderPaid({
+          orderId: order.body.id,
+          paymentAttemptId: attempt.rows[0].id,
+          verified
+        })
+      ).rejects.toMatchObject({ code: "INVALID_ENTITLEMENT_POLICY" });
       const afterFailedSettlement = await query<{
         transactions: string;
         entitlements: string;
@@ -8265,21 +8297,24 @@ describe("atomic commerce orders and payments", () => {
          WHERE order_id = $1`,
         [order.body.id]
       );
-      const concurrentCompletions = await Promise.all([
-        request(app).post(`${launch.pathname}${launch.search}`).send({}),
-        request(app).post(`${launch.pathname}${launch.search}`).send({})
-      ]);
-      expect(concurrentCompletions.map((item) => item.status).sort()).toEqual([
-        200,
-        409
+      const concurrentCompletions = await Promise.allSettled([
+        markOrderPaid({
+          orderId: order.body.id,
+          paymentAttemptId: attempt.rows[0].id,
+          verified
+        }),
+        markOrderPaid({
+          orderId: order.body.id,
+          paymentAttemptId: attempt.rows[0].id,
+          verified
+        })
       ]);
       expect(
-        concurrentCompletions.find((item) => item.status === 200)?.body.status
-      ).toBe("COMPLETED");
-      await request(app)
-        .post(`${launch.pathname}${launch.search}`)
-        .send({})
-        .expect(409);
+        concurrentCompletions.every(
+          (item) =>
+            item.status === "fulfilled" && item.value.status === "COMPLETED"
+        )
+      ).toBe(true);
 
       const invoice = await request(app)
         .post(`/api/commerce/orders/${order.body.id}/invoice`)
@@ -8332,12 +8367,6 @@ describe("atomic commerce orders and payments", () => {
       });
     } finally {
       await cleanupEntitlementTestUsers(userIds);
-      if (previousPaymentMode === undefined) {
-        delete process.env.PAYMENT_MODE;
-      } else {
-        process.env.PAYMENT_MODE = previousPaymentMode;
-      }
-      resetConfigForTests();
     }
   });
 

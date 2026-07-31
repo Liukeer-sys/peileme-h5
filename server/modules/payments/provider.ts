@@ -3,22 +3,25 @@ import type { Currency, PaymentChannel } from "../commerce/types.js";
 export type CreatePaymentInput = {
   attemptId: string;
   orderNo: string;
+  providerOrderNo: string;
   description: string;
   amountFen: string;
   clientIp: string;
   returnUrl: string;
   notifyUrl: string;
+  expiresAt: string;
   signal: AbortSignal;
 };
 
 export type CreatedPayment = {
   prepayId?: string;
   launchUrl: string;
+  launchExpiresAt?: string;
   response: Record<string, unknown>;
 };
 
 export type VerifiedPayment = {
-  orderNo: string;
+  providerOrderNo: string;
   channel: PaymentChannel;
   channelTransactionId: string;
   amountFen: string;
@@ -31,11 +34,11 @@ export interface PaymentProvider {
   readonly channel: PaymentChannel;
   createPayment(input: CreatePaymentInput): Promise<CreatedPayment>;
   queryPayment(
-    orderNo: string,
+    providerOrderNo: string,
     signal: AbortSignal
   ): Promise<VerifiedPayment | null>;
   refund(input: {
-    orderNo: string;
+    providerOrderNo: string;
     refundNo: string;
     amountFen: string;
     totalFen: string;

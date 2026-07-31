@@ -211,6 +211,21 @@ const makeOrderNo = () =>
     .slice(0, 14)
     .toUpperCase()}`;
 
+const makeProviderOrderNo = (channel: PaymentChannel) => {
+  if (channel !== "wechat_h5" && channel !== "alipay_wap") {
+    throw new CommerceError("PAYMENT_PROVIDER_FAILED");
+  }
+  const prefix = channel === "wechat_h5" ? "WX" : "AL";
+  return `${prefix}${Date.now().toString(36).toUpperCase()}${crypto
+    .randomUUID()
+    .replaceAll("-", "")
+    .slice(0, 20)
+    .toUpperCase()}`;
+};
+
+const enableIdentityPaymentWrites = (client: pg.PoolClient) =>
+  client.query("SET LOCAL peileme.payment_write_contract = 'identity_v1'");
+
 const assertOwnedBusinessDraft = async (
   client: pg.PoolClient,
   userId: string,
@@ -561,7 +576,7 @@ const recordPaymentAnomalyInTransaction = async (
     160
   );
   const providerOrderNo = sanitizePaymentEvidenceText(
-    input.verified.orderNo,
+    input.verified.providerOrderNo,
     160
   );
   const amountFen = sanitizePaymentEvidenceText(
@@ -686,7 +701,10 @@ const recordPaymentAnomalyInTransaction = async (
        WHERE order_id = $1
          AND id <> $2
          AND (
-           status IN ('CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED')
+           status IN (
+             'CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED', 'CREATE_UNKNOWN',
+             'RECONCILING', 'CLOSE_UNKNOWN'
+           )
            OR reconciliation_state IN ('REQUIRED', 'RETRY_SCHEDULED')
          )`,
       [input.order.id, input.paymentAttemptId]
@@ -704,7 +722,9 @@ const recordPaymentAnomalyInTransaction = async (
            'CREATED',
            'REDIRECT_READY',
            'PENDING',
-           'FAILED'
+           'CREATE_UNKNOWN',
+           'RECONCILING',
+           'CLOSE_UNKNOWN'
          )
          AND NOT EXISTS (
            SELECT 1
@@ -763,7 +783,10 @@ const recordPaymentAnomalyInTransaction = async (
            'CREATED',
            'REDIRECT_READY',
            'PENDING',
-           'FAILED'
+           'FAILED',
+           'CREATE_UNKNOWN',
+           'RECONCILING',
+           'CLOSE_UNKNOWN'
          )
        RETURNING id
      )
@@ -826,11 +849,20 @@ const markOrderPaidInTransaction = async (
       id: string;
       channel: PaymentChannel;
       error_code: string | null;
+      provider_order_no: string;
     }>(
-      `SELECT id, channel, error_code
-       FROM payment_attempts
-       WHERE id = $1
-         AND order_id = $2
+      `SELECT attempt.id,
+              attempt.channel,
+              attempt.error_code,
+              identity.provider_order_no
+       FROM payment_attempts attempt
+       JOIN provider_payment_orders identity
+         ON identity.id = attempt.provider_payment_order_id
+       WHERE attempt.id = $1
+         AND attempt.order_id = $2
+         AND attempt.provider_identity_role = 'canonical_owner'
+         AND attempt.provider_operation_eligible
+         AND identity.canonical_attempt_id = attempt.id
          AND (
            $3::integer IS NULL
            OR (
@@ -857,7 +889,7 @@ const markOrderPaidInTransaction = async (
       !selectedAttempt ||
       !paymentChannels.includes(verified.channel) ||
       selectedAttempt.channel !== verified.channel ||
-      order.order_no !== verified.orderNo ||
+      selectedAttempt.provider_order_no !== verified.providerOrderNo ||
       !verified.channelTransactionId.trim()
     ) {
       throw new CommerceError("PAYMENT_VERIFICATION_FAILED");
@@ -1031,7 +1063,10 @@ const markOrderPaidInTransaction = async (
                'CREATED',
                'REDIRECT_READY',
                'PENDING',
-               'FAILED'
+               'FAILED',
+               'CREATE_UNKNOWN',
+               'RECONCILING',
+               'CLOSE_UNKNOWN'
              )
                THEN 'CLOSED'
              ELSE status
@@ -1045,7 +1080,10 @@ const markOrderPaidInTransaction = async (
        WHERE order_id = $1
          AND id <> $2
          AND (
-           status IN ('CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED')
+           status IN (
+             'CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED', 'CREATE_UNKNOWN',
+             'RECONCILING', 'CLOSE_UNKNOWN'
+           )
            OR reconciliation_state IN ('REQUIRED', 'RETRY_SCHEDULED')
          )`,
       [order.id, selectedAttempt.id]
@@ -1072,6 +1110,7 @@ export const markOrderPaid = async (
   input: MarkOrderPaidInput
 ): Promise<CommerceOrder> => {
   const outcome = await withTransaction(async (client) => {
+    await enableIdentityPaymentWrites(client);
     return markOrderPaidInTransaction(client, input);
   });
   if ("anomaly" in outcome) {
@@ -1165,7 +1204,10 @@ export const closeExpiredOrdersInTransaction = async (
      SET status = 'CLOSED',
          updated_at = now()
      WHERE order_id = ANY($1::uuid[])
-       AND status IN ('CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED')`,
+       AND status IN (
+         'CREATED', 'REDIRECT_READY', 'PENDING', 'CREATE_UNKNOWN',
+         'RECONCILING', 'CLOSE_UNKNOWN'
+       )`,
     [orderIds]
   );
   const result = await client.query<{ id: string }>(
@@ -1182,9 +1224,10 @@ export const closeExpiredOrdersInTransaction = async (
 };
 
 export const closeExpiredOrders = async (limit = 200) => {
-  return withTransaction((client) =>
-    closeExpiredOrdersInTransaction(client, limit)
-  );
+  return withTransaction(async (client) => {
+    await enableIdentityPaymentWrites(client);
+    return closeExpiredOrdersInTransaction(client, limit);
+  });
 };
 
 type ExpiredCloseCandidate = {
@@ -1236,7 +1279,9 @@ const closeExpiredCandidatesInTransaction = async (
          'CREATED',
          'REDIRECT_READY',
          'PENDING',
-         'FAILED'
+         'CREATE_UNKNOWN',
+         'RECONCILING',
+         'CLOSE_UNKNOWN'
        )
        ORDER BY pa.order_id, pa.channel, pa.created_at DESC, pa.id DESC
      ),
@@ -1268,7 +1313,10 @@ const closeExpiredCandidatesInTransaction = async (
            END,
            updated_at = now()
        WHERE order_id IN (SELECT id FROM locked)
-         AND status IN ('CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED')
+         AND status IN (
+           'CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED', 'CREATE_UNKNOWN',
+           'RECONCILING', 'CLOSE_UNKNOWN'
+         )
      )
      UPDATE orders
      SET status = 'CLOSED',
@@ -1305,19 +1353,15 @@ type PreparedPayment =
   | {
       expired?: false;
       existing?: PaymentStartResult;
+      recovery?: {
+        providerOrderNo: string;
+        status: string;
+      };
       attemptId: string;
       generation: string;
+      providerOrderNo: string;
       order: CommerceOrder;
     };
-
-type FailedPaymentRecovery = {
-  orderId: string;
-  orderNo: string;
-  attemptId: string;
-  orderStatus: OrderStatus;
-  attemptErrorCode: string | null;
-  attemptUpdatedAt: Date;
-};
 
 class PaymentProviderTimeoutError extends Error {
   constructor() {
@@ -1409,20 +1453,68 @@ export const reconcileAndCloseExpiredOrders = async (input: {
   }
   const provider = input.provider;
   const providerChannel = provider?.channel ?? null;
-  const noAttemptCandidates = await query<{
+  const locallyClosableCandidates = await query<{
     id: string;
     status: OrderStatus;
+    attempt_id: string | null;
+    attempt_channel: PaymentChannel | null;
   }>(
-    `SELECT o.id, o.status
-     FROM orders o
-     WHERE o.expires_at <= now()
-       AND o.status = 'CREATED'
-       AND NOT EXISTS (
-         SELECT 1
-         FROM payment_attempts
-         WHERE payment_attempts.order_id = o.id
-       )
-     ORDER BY o.expires_at, o.id
+    `WITH locally_closable AS (
+       SELECT
+         o.id,
+         o.status,
+         NULL::uuid AS attempt_id,
+         NULL::text AS attempt_channel,
+         o.expires_at
+       FROM orders o
+       WHERE o.expires_at <= now()
+         AND o.status = 'CREATED'
+         AND NOT EXISTS (
+           SELECT 1
+           FROM payment_attempts
+           WHERE payment_attempts.order_id = o.id
+         )
+       UNION ALL
+       SELECT
+         o.id,
+         o.status,
+         latest.id AS attempt_id,
+         latest.channel AS attempt_channel,
+         o.expires_at
+       FROM orders o
+       JOIN LATERAL (
+         SELECT attempt.id, attempt.channel, attempt.status
+         FROM payment_attempts attempt
+         WHERE attempt.order_id = o.id
+         ORDER BY attempt.created_at DESC, attempt.id DESC
+         LIMIT 1
+       ) latest ON true
+       WHERE o.expires_at <= now()
+         AND o.status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED')
+         AND latest.status = 'FAILED'
+         AND NOT EXISTS (
+           SELECT 1
+           FROM payment_attempts unresolved
+           WHERE unresolved.order_id = o.id
+             AND (
+               unresolved.status IN (
+                 'CREATED',
+                 'REDIRECT_READY',
+                 'PENDING',
+                 'CREATE_UNKNOWN',
+                 'RECONCILING',
+                 'CLOSE_UNKNOWN'
+               )
+               OR unresolved.reconciliation_state IN (
+                 'REQUIRED',
+                 'RETRY_SCHEDULED'
+               )
+             )
+         )
+     )
+     SELECT id, status, attempt_id, attempt_channel
+     FROM locally_closable
+     ORDER BY expires_at, id
      LIMIT $1`,
     [limit]
   );
@@ -1433,6 +1525,7 @@ export const reconcileAndCloseExpiredOrders = async (input: {
     expires_at: Date;
     attempt_id: string | null;
     attempt_channel: PaymentChannel | null;
+    provider_order_no: string | null;
     reconciliation_state:
       | "NONE"
       | "REQUIRED"
@@ -1447,13 +1540,13 @@ export const reconcileAndCloseExpiredOrders = async (input: {
     reconciliation_last_result: string | null;
   };
   const safeToClose: ExpiredCloseCandidate[] =
-    noAttemptCandidates.rows.map((candidate) => ({
+    locallyClosableCandidates.rows.map((candidate) => ({
       id: candidate.id,
       status: candidate.status,
-      attemptId: null,
-      attemptChannel: null
+      attemptId: candidate.attempt_id,
+      attemptChannel: candidate.attempt_channel
     }));
-  let scannedCount = noAttemptCandidates.rows.length;
+  let scannedCount = locallyClosableCandidates.rows.length;
   let providerConfirmedPaidCount = 0;
   let terminalCount = 0;
   const deferredByReason = {
@@ -1521,6 +1614,7 @@ export const reconcileAndCloseExpiredOrders = async (input: {
            o.expires_at,
            attempt.id AS attempt_id,
            attempt.channel AS attempt_channel,
+           identity.provider_order_no,
            attempt.reconciliation_state,
            attempt.reconciliation_attempt_count,
            attempt.reconciliation_no_payment_count,
@@ -1534,7 +1628,12 @@ export const reconcileAndCloseExpiredOrders = async (input: {
            ) AS candidate_at
          FROM payment_attempts attempt
          JOIN orders o ON o.id = attempt.order_id
+         JOIN provider_payment_orders identity
+           ON identity.id = attempt.provider_payment_order_id
          WHERE attempt.channel = $2
+           AND attempt.provider_identity_role = 'canonical_owner'
+           AND attempt.provider_operation_eligible
+           AND identity.canonical_attempt_id = attempt.id
            AND attempt.reconciliation_state IN (
              'REQUIRED',
              'RETRY_SCHEDULED'
@@ -1561,6 +1660,7 @@ export const reconcileAndCloseExpiredOrders = async (input: {
            o.expires_at,
            attempt.id AS attempt_id,
            attempt.channel AS attempt_channel,
+           attempt.provider_order_no,
            attempt.reconciliation_state,
            attempt.reconciliation_attempt_count,
            attempt.reconciliation_no_payment_count,
@@ -1572,20 +1672,34 @@ export const reconcileAndCloseExpiredOrders = async (input: {
          FROM orders o
          JOIN LATERAL (
            SELECT
-             id,
-             channel,
-             updated_at,
-             reconciliation_state,
-             reconciliation_attempt_count,
-             reconciliation_no_payment_count,
-             reconciliation_query_error_count,
-             reconciliation_next_at,
-             reconciliation_deadline_at,
-             reconciliation_last_result
+             payment_attempts.id,
+             payment_attempts.channel,
+             identity.provider_order_no,
+             payment_attempts.updated_at,
+             payment_attempts.reconciliation_state,
+             payment_attempts.reconciliation_attempt_count,
+             payment_attempts.reconciliation_no_payment_count,
+             payment_attempts.reconciliation_query_error_count,
+             payment_attempts.reconciliation_next_at,
+             payment_attempts.reconciliation_deadline_at,
+             payment_attempts.reconciliation_last_result
            FROM payment_attempts
-           WHERE order_id = o.id
-             AND channel = $2
-           ORDER BY created_at DESC, id DESC
+           JOIN provider_payment_orders identity
+             ON identity.id = payment_attempts.provider_payment_order_id
+           WHERE payment_attempts.order_id = o.id
+             AND payment_attempts.channel = $2
+             AND payment_attempts.provider_identity_role = 'canonical_owner'
+             AND payment_attempts.provider_operation_eligible
+             AND identity.canonical_attempt_id = payment_attempts.id
+             AND payment_attempts.status IN (
+               'CREATED',
+               'REDIRECT_READY',
+               'PENDING',
+               'CREATE_UNKNOWN',
+               'RECONCILING',
+               'CLOSE_UNKNOWN'
+             )
+           ORDER BY payment_attempts.created_at DESC, payment_attempts.id DESC
            LIMIT 1
          ) attempt ON true
          WHERE o.expires_at <= now()
@@ -1605,6 +1719,7 @@ export const reconcileAndCloseExpiredOrders = async (input: {
          expires_at,
          attempt_id,
          attempt_channel,
+         provider_order_no,
          reconciliation_state,
          reconciliation_attempt_count,
          reconciliation_no_payment_count,
@@ -1630,7 +1745,8 @@ export const reconcileAndCloseExpiredOrders = async (input: {
       const isClosedRecovery = candidate.status === "CLOSED";
       if (
         !candidate.attempt_id ||
-        candidate.attempt_channel !== provider.channel
+        candidate.attempt_channel !== provider.channel ||
+        !candidate.provider_order_no
       ) {
         outcomes[candidateIndex] = {
           kind: "deferred",
@@ -1671,10 +1787,12 @@ export const reconcileAndCloseExpiredOrders = async (input: {
           Date.now() +
             closedPaymentReconciliationBackoffMs(nextAttemptCount)
         );
-        const claimed = await query<{
-          reconciliation_attempt_count: number;
-          reconciliation_next_at: Date;
-        }>(
+        const claimed = await withTransaction(async (client) => {
+          await enableIdentityPaymentWrites(client);
+          return client.query<{
+            reconciliation_attempt_count: number;
+            reconciliation_next_at: Date;
+          }>(
           `UPDATE payment_attempts pa
            SET reconciliation_state = 'RETRY_SCHEDULED',
                reconciliation_attempt_count =
@@ -1702,7 +1820,8 @@ export const reconcileAndCloseExpiredOrders = async (input: {
              reconciliation_attempt_count,
              reconciliation_next_at`,
           [candidate.attempt_id, nextRetryAt.toISOString()]
-        );
+          );
+        });
         if (!claimed.rowCount) {
           outcomes[candidateIndex] = {
             kind: "deferred",
@@ -1719,7 +1838,7 @@ export const reconcileAndCloseExpiredOrders = async (input: {
       }
       try {
         const verified = await withPaymentProviderTimeout(
-          (signal) => provider.queryPayment(candidate.order_no, signal),
+          (signal) => provider.queryPayment(candidate.provider_order_no!, signal),
           providerTimeoutMs
         );
         outcomes[candidateIndex] = {
@@ -1754,6 +1873,7 @@ export const reconcileAndCloseExpiredOrders = async (input: {
   }
 
   return withTransaction(async (client) => {
+    await enableIdentityPaymentWrites(client);
     const recordChangedState = (isClosedRecovery: boolean) => {
       deferredByReason.unsafeOrChangedState += 1;
       if (isClosedRecovery) {
@@ -1895,7 +2015,9 @@ export const reconcileAndCloseExpiredOrders = async (input: {
                  'CREATED',
                  'REDIRECT_READY',
                  'PENDING',
-                 'FAILED'
+                 'CREATE_UNKNOWN',
+                 'RECONCILING',
+                 'CLOSE_UNKNOWN'
                )
                AND EXISTS (
                  SELECT 1
@@ -1973,7 +2095,9 @@ export const reconcileAndCloseExpiredOrders = async (input: {
                    'CREATED',
                    'REDIRECT_READY',
                    'PENDING',
-                   'FAILED'
+                   'CREATE_UNKNOWN',
+                   'RECONCILING',
+                   'CLOSE_UNKNOWN'
                  )
                  AND EXISTS (
                    SELECT 1
@@ -2095,7 +2219,9 @@ export const reconcileAndCloseExpiredOrders = async (input: {
                'CREATED',
                'REDIRECT_READY',
                'PENDING',
-               'FAILED'
+               'CREATE_UNKNOWN',
+               'RECONCILING',
+               'CLOSE_UNKNOWN'
              )`,
           [candidate.attempt_id]
         );
@@ -2132,11 +2258,59 @@ export const reconcileAndCloseExpiredOrders = async (input: {
              SELECT o.id
              FROM orders o
              JOIN LATERAL (
-               SELECT id
-               FROM payment_attempts
-               WHERE order_id = o.id
-                 AND channel = $1
-               ORDER BY created_at DESC, id DESC
+               SELECT attempt.status
+               FROM payment_attempts attempt
+               WHERE attempt.order_id = o.id
+               ORDER BY attempt.created_at DESC, attempt.id DESC
+               LIMIT 1
+             ) latest ON true
+             WHERE o.expires_at <= now()
+               AND o.status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED')
+               AND latest.status = 'FAILED'
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM payment_attempts unresolved
+                 WHERE unresolved.order_id = o.id
+                   AND (
+                     unresolved.status IN (
+                       'CREATED',
+                       'REDIRECT_READY',
+                       'PENDING',
+                       'CREATE_UNKNOWN',
+                       'RECONCILING',
+                       'CLOSE_UNKNOWN'
+                     )
+                     OR unresolved.reconciliation_state IN (
+                       'REQUIRED',
+                       'RETRY_SCHEDULED'
+                     )
+                   )
+               )
+             LIMIT 1
+           )
+           UNION ALL
+           (
+             SELECT o.id
+             FROM orders o
+             JOIN LATERAL (
+               SELECT attempt.id
+               FROM payment_attempts attempt
+               JOIN provider_payment_orders identity
+                 ON identity.id = attempt.provider_payment_order_id
+               WHERE attempt.order_id = o.id
+                 AND attempt.channel = $1
+                 AND attempt.provider_identity_role = 'canonical_owner'
+                 AND attempt.provider_operation_eligible
+                 AND identity.canonical_attempt_id = attempt.id
+                 AND attempt.status IN (
+                   'CREATED',
+                   'REDIRECT_READY',
+                   'PENDING',
+                   'CREATE_UNKNOWN',
+                   'RECONCILING',
+                   'CLOSE_UNKNOWN'
+                 )
+               ORDER BY attempt.created_at DESC, attempt.id DESC
                LIMIT 1
              ) channel_attempt ON true
              WHERE $1::text IS NOT NULL
@@ -2149,8 +2323,13 @@ export const reconcileAndCloseExpiredOrders = async (input: {
              SELECT attempt.order_id
              FROM payment_attempts attempt
              JOIN orders o ON o.id = attempt.order_id
+             JOIN provider_payment_orders identity
+               ON identity.id = attempt.provider_payment_order_id
              WHERE $1::text IS NOT NULL
                AND attempt.channel = $1
+               AND attempt.provider_identity_role = 'canonical_owner'
+               AND attempt.provider_operation_eligible
+               AND identity.canonical_attempt_id = attempt.id
                AND attempt.reconciliation_state IN (
                  'REQUIRED',
                  'RETRY_SCHEDULED'
@@ -2170,8 +2349,13 @@ export const reconcileAndCloseExpiredOrders = async (input: {
       `SELECT count(*)::integer AS count
        FROM payment_attempts attempt
        JOIN orders o ON o.id = attempt.order_id
+       JOIN provider_payment_orders identity
+         ON identity.id = attempt.provider_payment_order_id
        WHERE $1::text IS NOT NULL
          AND attempt.channel = $1
+         AND attempt.provider_identity_role = 'canonical_owner'
+         AND attempt.provider_operation_eligible
+         AND identity.canonical_attempt_id = attempt.id
          AND o.status = 'CLOSED'
          AND attempt.reconciliation_state IN (
            'REQUIRED',
@@ -2204,55 +2388,6 @@ export const reconcileAndCloseExpiredOrders = async (input: {
   });
 };
 
-const getFailedPaymentRecovery = async (
-  userId: string,
-  orderId: string,
-  productChannel: OrderProductChannel,
-  paymentChannel: PaymentChannel
-): Promise<FailedPaymentRecovery | undefined> => {
-  const result = await query<{
-    id: string;
-    order_no: string;
-    attempt_id: string;
-    status: OrderStatus;
-    error_code: string | null;
-    attempt_updated_at: Date;
-  }>(
-    `SELECT
-       o.id,
-       o.order_no,
-       attempt.id AS attempt_id,
-       o.status,
-       attempt.error_code,
-       attempt.updated_at AS attempt_updated_at
-     FROM orders o
-     JOIN LATERAL (
-       SELECT id, error_code, updated_at
-       FROM payment_attempts
-       WHERE order_id = o.id
-         AND channel = $4
-       ORDER BY created_at DESC, id DESC
-       LIMIT 1
-     ) attempt ON true
-     WHERE o.id = $1
-       AND o.user_id = $2
-       AND o.product_channel = $3
-       AND o.status IN ('PAYING', 'PAYMENT_FAILED', 'CLOSED')`,
-    [orderId, userId, productChannel, paymentChannel]
-  );
-  const row = result.rows[0];
-  return row
-    ? {
-        orderId: row.id,
-        orderNo: row.order_no,
-        attemptId: row.attempt_id,
-        orderStatus: row.status,
-        attemptErrorCode: row.error_code,
-        attemptUpdatedAt: row.attempt_updated_at
-      }
-    : undefined;
-};
-
 const preparePayment = async (
   userId: string,
   orderId: string,
@@ -2260,6 +2395,11 @@ const preparePayment = async (
   provider: PaymentProvider
 ): Promise<PreparedPayment> =>
   withTransaction(async (client) => {
+    if (provider.channel !== "wechat_h5" && provider.channel !== "alipay_wap") {
+      throw new CommerceError("PAYMENT_PROVIDER_FAILED");
+    }
+    await enableIdentityPaymentWrites(client);
+    await client.query("SET CONSTRAINTS ALL DEFERRED");
     const generation = crypto.randomUUID();
     const selected = await client.query<OrderRow>(
       `${orderSelect}
@@ -2271,99 +2411,92 @@ const preparePayment = async (
     );
     const row = selected.rows[0];
     if (!row) throw new CommerceError("ORDER_NOT_FOUND");
-    if (row.expires_at.getTime() <= Date.now()) {
-      if (["CREATED", "PAYING", "PAYMENT_FAILED"].includes(row.status)) {
-        await client.query(
-          `WITH latest_active_attempts AS MATERIALIZED (
-             SELECT DISTINCT ON (channel) id
-             FROM payment_attempts
-             WHERE order_id = $1
-               AND status IN (
-                 'CREATED',
-                 'REDIRECT_READY',
-                 'PENDING',
-                 'FAILED'
-               )
-             ORDER BY channel, created_at DESC, id DESC
-           ),
-           closed_attempts AS (
-             UPDATE payment_attempts
-           SET status = 'CLOSED',
-               reconciliation_state = CASE
-                 WHEN id IN (SELECT id FROM latest_active_attempts)
-                   THEN 'REQUIRED'
-                 ELSE 'NONE'
-               END,
-               reconciliation_attempt_count = 0,
-               reconciliation_no_payment_count = 0,
-               reconciliation_query_error_count = 0,
-               reconciliation_next_at = CASE
-                 WHEN id IN (SELECT id FROM latest_active_attempts)
-                   THEN now() + ($2::integer * interval '1 second')
-                 ELSE NULL
-               END,
-               reconciliation_deadline_at = CASE
-                 WHEN id IN (SELECT id FROM latest_active_attempts)
-                   THEN now() + ($3::integer * interval '1 second')
-                 ELSE NULL
-               END,
-               reconciliation_last_result = CASE
-                 WHEN id IN (SELECT id FROM latest_active_attempts)
-                   THEN 'LOCAL_CLOSE_PENDING_FINAL_QUERY'
-                 ELSE NULL
-               END,
-               updated_at = now()
-           WHERE order_id = $1
-             AND status IN (
-               'CREATED',
-               'REDIRECT_READY',
-               'PENDING',
-               'FAILED'
-             )
-           RETURNING id
-           )
-           SELECT count(*) FROM closed_attempts`,
-          [
-            row.id,
-            closedPaymentReconciliationInitialDelaySeconds,
-            closedPaymentReconciliationDeadlineSeconds
-          ]
-        );
-        await client.query(
-          `UPDATE orders
-           SET status = 'CLOSED',
-               closed_at = now(),
-               updated_at = now()
-           WHERE id = $1`,
-          [row.id]
-        );
-      }
-      return { expired: true };
-    }
-    if (!["CREATED", "PAYING", "PAYMENT_FAILED"].includes(row.status)) {
-      throw new CommerceError("ORDER_STATE_CONFLICT");
-    }
-
     const attempts = await client.query<{
       id: string;
       status: string;
       launch_url: string | null;
+      launch_expires_at: Date | null;
       updated_at: Date;
+      channel: PaymentChannel;
+      provider_order_no: string;
     }>(
-      `SELECT id, status, launch_url, updated_at
-       FROM payment_attempts
-       WHERE order_id = $1
-         AND channel = $2
-         AND status IN ('CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED')
-       ORDER BY created_at DESC, id DESC
-       FOR UPDATE`,
-      [row.id, provider.channel]
+      `SELECT attempt.id,
+              attempt.status,
+              attempt.launch_url,
+              attempt.launch_expires_at,
+              attempt.updated_at,
+              attempt.channel,
+              identity.provider_order_no
+         FROM payment_attempts attempt
+         JOIN provider_payment_orders identity
+           ON identity.id = attempt.provider_payment_order_id
+        WHERE attempt.order_id = $1
+          AND attempt.provider_identity_role = 'canonical_owner'
+          AND attempt.provider_operation_eligible
+          AND identity.canonical_attempt_id = attempt.id
+          AND (
+            attempt.status IN (
+              'CREATED', 'REDIRECT_READY', 'PENDING', 'CREATE_UNKNOWN',
+              'RECONCILING', 'CLOSE_UNKNOWN'
+            )
+            OR attempt.reconciliation_state IN ('REQUIRED', 'RETRY_SCHEDULED')
+          )
+        ORDER BY attempt.created_at DESC, attempt.id DESC
+        FOR UPDATE OF attempt, identity`,
+      [row.id]
     );
     const active = attempts.rows[0];
+    if (active && active.channel !== provider.channel) {
+      throw new CommerceError("PAYMENT_CHANNEL_LOCKED");
+    }
+    if (active?.status === "CREATED") {
+      if (active.updated_at.getTime() > Date.now() - 120_000) {
+        throw new CommerceError("PAYMENT_INITIALIZING");
+      }
+      await client.query(
+        `UPDATE payment_attempts
+         SET status = 'CREATE_UNKNOWN',
+             error_code = 'PAYMENT_ATTEMPT_STALE',
+             error_message = '支付初始化状态不明，等待同号查单',
+             updated_at = now()
+         WHERE id = $1`,
+        [active.id]
+      );
+    }
+    if (row.expires_at.getTime() <= Date.now()) {
+      if (active) {
+        return {
+          attemptId: active.id,
+          generation: "",
+          providerOrderNo: active.provider_order_no,
+          recovery: {
+            providerOrderNo: active.provider_order_no,
+            status:
+              active.status === "CREATED" ? "CREATE_UNKNOWN" : active.status
+          },
+          order: mapOrder(row)
+        };
+      }
+      if (!["CREATED", "PAYING", "PAYMENT_FAILED"].includes(row.status)) {
+        throw new CommerceError("ORDER_STATE_CONFLICT");
+      }
+      await client.query(
+        `UPDATE orders
+         SET status = 'CLOSED',
+             closed_at = now(),
+             updated_at = now()
+         WHERE id = $1`,
+        [row.id]
+      );
+      return { expired: true };
+    }
     if (
       active &&
+      ["CREATED", "PAYING", "PAYMENT_FAILED"].includes(row.status) &&
       ["REDIRECT_READY", "PENDING"].includes(active.status) &&
-      active.launch_url
+      active.launch_url &&
+      active.launch_expires_at &&
+      active.launch_expires_at.getTime() > Date.now()
     ) {
       return {
         attemptId: active.id,
@@ -2376,79 +2509,65 @@ const preparePayment = async (
           paymentAttemptId: active.id,
           launchUrl: active.launch_url,
           expiresAt: row.expires_at
-        }
+        },
+        providerOrderNo: active.provider_order_no
       };
     }
-    if (active?.status === "CREATED") {
-      if (active.updated_at.getTime() > Date.now() - 120_000) {
-        throw new CommerceError("PAYMENT_INITIALIZING");
-      }
-      await client.query(
-        `UPDATE payment_attempts
-         SET status = 'FAILED',
-             error_code = 'PAYMENT_ATTEMPT_STALE',
-             error_message = '支付初始化超时，请重试',
-             updated_at = now()
-         WHERE id = $1`,
-        [active.id]
-      );
+
+    if (active) {
+      return {
+        attemptId: active.id,
+        generation: "",
+        providerOrderNo: active.provider_order_no,
+        recovery: {
+          providerOrderNo: active.provider_order_no,
+          status: active.status === "CREATED" ? "CREATE_UNKNOWN" : active.status
+        },
+        order: mapOrder(row)
+      };
     }
 
-    const attempt =
-      active && ["CREATED", "FAILED"].includes(active.status)
-        ? await client.query<{ id: string }>(
-            `UPDATE payment_attempts
-             SET status = 'CREATED',
-                 channel_prepay_id = NULL,
-                 launch_url = NULL,
-                 request_snapshot = jsonb_build_object(
-                   'orderNo', $2::text,
-                   'amountFen', $3::text,
-                   'currency', $4::text,
-                   'generation', $5::text
-                 ),
-                 response_snapshot = '{}'::jsonb,
-                 error_code = NULL,
-                 error_message = NULL,
-                 updated_at = now()
-             WHERE id = $1
-             RETURNING id`,
-            [
-              active.id,
-              row.order_no,
-              row.total_fen,
-              row.currency,
-              generation
-            ]
-          )
-        : await client.query<{ id: string }>(
-            `INSERT INTO payment_attempts(
-               order_id,
-               channel,
-               status,
-               request_snapshot
-             )
-             VALUES (
-               $1,
-               $2,
-               'CREATED',
-               jsonb_build_object(
-                 'orderNo', $3::text,
-                 'amountFen', $4::text,
-                 'currency', $5::text,
-                 'generation', $6::text
-               )
-             )
-             RETURNING id`,
-            [
-              row.id,
-              provider.channel,
-              row.order_no,
-              row.total_fen,
-              row.currency,
-              generation
-            ]
-          );
+    if (!["CREATED", "PAYING", "PAYMENT_FAILED"].includes(row.status)) {
+      throw new CommerceError("ORDER_STATE_CONFLICT");
+    }
+
+    const attemptId = crypto.randomUUID();
+    const providerPaymentOrderId = crypto.randomUUID();
+    const providerOrderNo = makeProviderOrderNo(provider.channel);
+    await client.query(
+      `INSERT INTO provider_payment_orders(
+         id, order_id, channel, provider_order_no, origin, allocated_at,
+         canonical_attempt_id, manual_review_required
+       ) VALUES ($1, $2, $3, $4, 'attempt_v1', now(), $5, false)`,
+      [providerPaymentOrderId, row.id, provider.channel, providerOrderNo, attemptId]
+    );
+    const attempt = await client.query<{ id: string }>(
+      `INSERT INTO payment_attempts(
+         id, order_id, channel, status, provider_payment_order_id,
+         provider_identity_role, provider_operation_eligible, request_snapshot
+       ) VALUES (
+         $1, $2, $3, 'CREATED', $4, 'canonical_owner', true,
+         jsonb_build_object(
+           'orderNo', $5::text,
+           'providerOrderNo', $6::text,
+           'amountFen', $7::text,
+           'currency', $8::text,
+           'generation', $9::text
+         )
+       )
+       RETURNING id`,
+      [
+        attemptId,
+        row.id,
+        provider.channel,
+        providerPaymentOrderId,
+        row.order_no,
+        providerOrderNo,
+        row.total_fen,
+        row.currency,
+        generation
+      ]
+    );
     await client.query(
       `UPDATE orders
        SET status = 'PAYING',
@@ -2459,6 +2578,7 @@ const preparePayment = async (
     return {
       attemptId: attempt.rows[0].id,
       generation,
+      providerOrderNo,
       order: {
         ...mapOrder(row),
         status: "PAYING"
@@ -2489,55 +2609,6 @@ export const startPayment = async (
   ) {
     throw new CommerceError("INVALID_COMMERCE_INPUT");
   }
-  const failedRecovery = await getFailedPaymentRecovery(
-    userId,
-    orderId,
-    productChannel,
-    input.provider.channel
-  );
-  if (failedRecovery) {
-    if (failedRecovery.attemptErrorCode === "PAYMENT_REVIEW_REQUIRED") {
-      throw new CommerceError("ORDER_STATE_CONFLICT");
-    }
-    let verified: VerifiedPayment | null;
-    try {
-      verified = await withPaymentProviderTimeout(
-        (signal) =>
-          input.provider.queryPayment(
-            failedRecovery.orderNo,
-            signal
-          ),
-        providerTimeoutMs
-      );
-    } catch {
-      throw new CommerceError("PAYMENT_PROVIDER_FAILED");
-    }
-    if (verified) {
-      const completed = await markOrderPaid({
-        orderId: failedRecovery.orderId,
-        paymentAttemptId: failedRecovery.attemptId,
-        verified
-      });
-      return {
-        orderId: completed.id,
-        orderNo: completed.orderNo,
-        status: completed.status,
-        paymentAttemptId: failedRecovery.attemptId,
-        launchUrl: input.returnUrl,
-        expiresAt: completed.expiresAt
-      };
-    }
-    if (failedRecovery.orderStatus === "CLOSED") {
-      throw new CommerceError("ORDER_STATE_CONFLICT");
-    }
-    if (
-      failedRecovery.attemptErrorCode === "PAYMENT_PROVIDER_TIMEOUT" &&
-      failedRecovery.attemptUpdatedAt.getTime() >
-        Date.now() - 120_000
-    ) {
-      throw new CommerceError("PAYMENT_INITIALIZING");
-    }
-  }
   const prepared = await preparePayment(
     userId,
     orderId,
@@ -2548,6 +2619,41 @@ export const startPayment = async (
     throw new CommerceError("ORDER_EXPIRED");
   }
   if (prepared.existing) return prepared.existing;
+  if (prepared.recovery) {
+    let verified: VerifiedPayment | null;
+    try {
+      verified = await withPaymentProviderTimeout(
+        (signal) =>
+          input.provider.queryPayment(
+            prepared.recovery!.providerOrderNo,
+            signal
+          ),
+        providerTimeoutMs
+      );
+    } catch {
+      throw new CommerceError("PAYMENT_PROVIDER_FAILED");
+    }
+    if (verified) {
+      const completed = await markOrderPaid({
+        orderId: prepared.order.id,
+        paymentAttemptId: prepared.attemptId,
+        verified
+      });
+      return {
+        orderId: completed.id,
+        orderNo: completed.orderNo,
+        status: completed.status,
+        paymentAttemptId: prepared.attemptId,
+        launchUrl: input.returnUrl,
+        expiresAt: completed.expiresAt
+      };
+    }
+    throw new CommerceError(
+      prepared.recovery.status === "CREATE_UNKNOWN"
+        ? "PAYMENT_INITIALIZING"
+        : "PAYMENT_CHANNEL_LOCKED"
+    );
+  }
 
   try {
     const created = await withPaymentProviderTimeout(
@@ -2555,11 +2661,13 @@ export const startPayment = async (
         input.provider.createPayment({
           attemptId: prepared.attemptId,
           orderNo: prepared.order.orderNo,
+          providerOrderNo: prepared.providerOrderNo,
           description: prepared.order.productName,
           amountFen: prepared.order.amountFen,
           clientIp: input.clientIp,
           returnUrl: input.returnUrl,
           notifyUrl: input.notifyUrl,
+          expiresAt: prepared.order.expiresAt.toISOString(),
           signal
         }),
       providerTimeoutMs
@@ -2567,7 +2675,32 @@ export const startPayment = async (
     if (!created.launchUrl.trim()) {
       throw new Error("Provider returned an empty launch URL");
     }
+    const providerLaunchExpiry = created.launchExpiresAt
+      ? new Date(created.launchExpiresAt)
+      : undefined;
+    const channelLaunchDeadline = new Date(
+      Math.min(
+        prepared.order.expiresAt.getTime(),
+        input.provider.channel === "wechat_h5"
+          ? Date.now() + 5 * 60_000
+          : prepared.order.expiresAt.getTime()
+      )
+    );
+    const launchExpiresAt =
+      providerLaunchExpiry &&
+      !Number.isNaN(providerLaunchExpiry.getTime())
+        ? new Date(
+            Math.min(
+              providerLaunchExpiry.getTime(),
+              channelLaunchDeadline.getTime()
+            )
+          )
+        : channelLaunchDeadline;
+    if (launchExpiresAt.getTime() <= Date.now()) {
+      throw new Error("Provider returned an expired launch URL");
+    }
     return withTransaction(async (client) => {
+      await enableIdentityPaymentWrites(client);
       const attempt = await client.query<{
         status: string;
         generation: string | null;
@@ -2613,15 +2746,17 @@ export const startPayment = async (
          SET status = 'REDIRECT_READY',
              channel_prepay_id = $2,
              launch_url = $3,
-             response_snapshot = $4::jsonb,
+             launch_expires_at = $4,
+             response_snapshot = $5::jsonb,
              updated_at = now()
          WHERE id = $1
            AND status = 'CREATED'
-           AND request_snapshot->>'generation' = $5`,
+           AND request_snapshot->>'generation' = $6`,
         [
           prepared.attemptId,
           created.prepayId ?? null,
           created.launchUrl,
+          launchExpiresAt.toISOString(),
           JSON.stringify(created.response),
           prepared.generation
         ]
@@ -2642,23 +2777,16 @@ export const startPayment = async (
     const providerTimedOut =
       error instanceof PaymentProviderTimeoutError;
     await withTransaction(async (client) => {
+      await enableIdentityPaymentWrites(client);
       await client.query(
-        `WITH failed_attempt AS (
-           UPDATE payment_attempts
-           SET status = 'FAILED',
-               error_code = $3,
-               error_message = '支付渠道暂时不可用',
-               updated_at = now()
-           WHERE id = $1
-             AND status = 'CREATED'
-             AND request_snapshot->>'generation' = $2
-           RETURNING order_id
-         )
-         UPDATE orders
-         SET status = 'PAYMENT_FAILED',
-             updated_at = now()
-         WHERE id IN (SELECT order_id FROM failed_attempt)
-           AND status = 'PAYING'`,
+        `UPDATE payment_attempts
+            SET status = 'CREATE_UNKNOWN',
+                error_code = $3,
+                error_message = '支付创建结果不明，等待使用原商户单号查单',
+                updated_at = now()
+          WHERE id = $1
+            AND status = 'CREATED'
+            AND request_snapshot->>'generation' = $2`,
         [
           prepared.attemptId,
           prepared.generation,

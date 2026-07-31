@@ -95,7 +95,13 @@ if (invokedFile === fileURLToPath(import.meta.url)) {
   runMigrations()
     .then(() => closePool())
     .catch(async (error) => {
-      console.error(error);
+      const message =
+        error instanceof Error ? error.message : String(error);
+      if (message.startsWith("PAYMENT_MIGRATION_DIAGNOSTIC ")) {
+        console.error(message);
+      } else {
+        console.error(error);
+      }
       await closePool();
       process.exitCode = 1;
     });

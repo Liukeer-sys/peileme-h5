@@ -46,7 +46,10 @@ export type PaymentAttemptStatus =
   | "PENDING"
   | "SUCCEEDED"
   | "FAILED"
-  | "CLOSED";
+  | "CLOSED"
+  | "CREATE_UNKNOWN"
+  | "RECONCILING"
+  | "CLOSE_UNKNOWN";
 
 export type PaymentTransactionStatus = "SUCCESS" | "CLOSED" | "REFUND";
 export type EntitlementSourceType = "first_free" | "order" | "invite" | "admin";
@@ -86,6 +89,7 @@ export const commerceErrorCodes = [
   "PAYMENT_VERIFICATION_FAILED",
   "PAYMENT_PROVIDER_FAILED",
   "PAYMENT_INITIALIZING",
+  "PAYMENT_CHANNEL_LOCKED",
   "PAYMENT_TOKEN_INVALID",
   "PAYMENT_TOKEN_USED",
   "INVOICE_NOT_ALLOWED",
