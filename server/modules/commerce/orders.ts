@@ -19,6 +19,18 @@ import {
 const uuidPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const amountPattern = /^(0|[1-9]\d*)$/;
+const closedPaymentReconciliationInitialDelaySeconds = 30;
+const closedPaymentReconciliationDeadlineSeconds = 24 * 60 * 60;
+const closedPaymentReconciliationMaxNoPaymentConfirmations = 5;
+const closedPaymentReconciliationMaxBackoffMs = 30 * 60_000;
+
+const closedPaymentReconciliationBackoffMs = (attemptCount: number) =>
+  Math.min(
+    closedPaymentReconciliationMaxBackoffMs,
+    closedPaymentReconciliationInitialDelaySeconds *
+      1_000 *
+      2 ** Math.max(0, attemptCount - 1)
+  );
 
 type OrderRow = {
   id: string;
@@ -635,9 +647,39 @@ export const markOrderPaid = async ({
     await client.query(
       `UPDATE payment_attempts
        SET status = 'SUCCEEDED',
+           reconciliation_state = 'RECOVERED',
+           reconciliation_next_at = NULL,
+           reconciliation_deadline_at = NULL,
+           reconciliation_last_result = 'PAID',
            updated_at = now()
        WHERE id = $1`,
       [selectedAttempt.id]
+    );
+    await client.query(
+      `UPDATE payment_attempts
+       SET status = CASE
+             WHEN status IN (
+               'CREATED',
+               'REDIRECT_READY',
+               'PENDING',
+               'FAILED'
+             )
+               THEN 'CLOSED'
+             ELSE status
+           END,
+           reconciliation_state = 'TERMINAL',
+           reconciliation_next_at = NULL,
+           reconciliation_deadline_at = NULL,
+           reconciliation_last_result =
+             'ORDER_COMPLETED_BY_OTHER_ATTEMPT',
+           updated_at = now()
+       WHERE order_id = $1
+         AND id <> $2
+         AND reconciliation_state IN (
+           'REQUIRED',
+           'RETRY_SCHEDULED'
+         )`,
+      [order.id, selectedAttempt.id]
     );
     await client.query(
       `UPDATE orders
@@ -792,9 +834,44 @@ const closeExpiredCandidatesInTransaction = async (
          )
        FOR UPDATE OF o SKIP LOCKED
      ),
+     latest_active_attempts AS MATERIALIZED (
+       SELECT DISTINCT ON (pa.order_id, pa.channel) pa.id
+       FROM payment_attempts pa
+       JOIN locked ON locked.id = pa.order_id
+       WHERE pa.status IN (
+         'CREATED',
+         'REDIRECT_READY',
+         'PENDING',
+         'FAILED'
+       )
+       ORDER BY pa.order_id, pa.channel, pa.created_at DESC, pa.id DESC
+     ),
      closed_attempts AS (
        UPDATE payment_attempts
        SET status = 'CLOSED',
+           reconciliation_state = CASE
+             WHEN id IN (SELECT id FROM latest_active_attempts)
+               THEN 'REQUIRED'
+             ELSE 'NONE'
+           END,
+           reconciliation_attempt_count = 0,
+           reconciliation_no_payment_count = 0,
+           reconciliation_query_error_count = 0,
+           reconciliation_next_at = CASE
+             WHEN id IN (SELECT id FROM latest_active_attempts)
+               THEN now() + ($5::integer * interval '1 second')
+             ELSE NULL
+           END,
+           reconciliation_deadline_at = CASE
+             WHEN id IN (SELECT id FROM latest_active_attempts)
+               THEN now() + ($6::integer * interval '1 second')
+             ELSE NULL
+           END,
+           reconciliation_last_result = CASE
+             WHEN id IN (SELECT id FROM latest_active_attempts)
+               THEN 'LOCAL_CLOSE_PENDING_FINAL_QUERY'
+             ELSE NULL
+           END,
            updated_at = now()
        WHERE order_id IN (SELECT id FROM locked)
          AND status IN ('CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED')
@@ -809,7 +886,9 @@ const closeExpiredCandidatesInTransaction = async (
       candidates.map((candidate) => candidate.id),
       candidates.map((candidate) => candidate.status),
       candidates.map((candidate) => candidate.attemptId),
-      candidates.map((candidate) => candidate.attemptChannel)
+      candidates.map((candidate) => candidate.attemptChannel),
+      closedPaymentReconciliationInitialDelaySeconds,
+      closedPaymentReconciliationDeadlineSeconds
     ]
   );
   const closedOrderIds = new Set(result.rows.map((row) => row.id));
@@ -879,12 +958,31 @@ export type ExpiredOrderReconciliationSummary = {
   closedCount: number;
   providerConfirmedPaidCount: number;
   deferredCount: number;
+  terminalCount: number;
   hasMore: boolean;
+  scheduledRecoveryCount: number;
   deferredByReason: {
     providerQueryError: number;
     paymentVerificationFailed: number;
     closeCapacityExceeded: number;
     unsafeOrChangedState: number;
+  };
+  closedRecovery: {
+    scannedCount: number;
+    recoveredCount: number;
+    retryScheduledCount: number;
+    terminalCount: number;
+    changedStateCount: number;
+    retryByReason: {
+      noPayment: number;
+      queryError: number;
+    };
+    terminalByReason: {
+      deadlineExceeded: number;
+      noPaymentLimitExceeded: number;
+      paymentAfterExpiry: number;
+      paymentVerificationFailed: number;
+    };
   };
 };
 
@@ -938,8 +1036,20 @@ export const reconcileAndCloseExpiredOrders = async (input: {
     id: string;
     order_no: string;
     status: OrderStatus;
+    expires_at: Date;
     attempt_id: string | null;
     attempt_channel: PaymentChannel | null;
+    reconciliation_state:
+      | "NONE"
+      | "REQUIRED"
+      | "RETRY_SCHEDULED"
+      | "RECOVERED"
+      | "TERMINAL";
+    reconciliation_attempt_count: number;
+    reconciliation_no_payment_count: number;
+    reconciliation_query_error_count: number;
+    reconciliation_next_at: Date | null;
+    reconciliation_deadline_at: Date | null;
   };
   const safeToClose: ExpiredCloseCandidate[] =
     noAttemptCandidates.rows.map((candidate) => ({
@@ -956,6 +1066,23 @@ export const reconcileAndCloseExpiredOrders = async (input: {
     closeCapacityExceeded: 0,
     unsafeOrChangedState: 0
   };
+  const closedRecovery = {
+    scannedCount: 0,
+    recoveredCount: 0,
+    retryScheduledCount: 0,
+    terminalCount: 0,
+    changedStateCount: 0,
+    retryByReason: {
+      noPayment: 0,
+      queryError: 0
+    },
+    terminalByReason: {
+      deadlineExceeded: 0,
+      noPaymentLimitExceeded: 0,
+      paymentAfterExpiry: 0,
+      paymentVerificationFailed: 0
+    }
+  };
 
   if (provider) {
     const candidates = await query<ReconciliationCandidate>(
@@ -963,24 +1090,72 @@ export const reconcileAndCloseExpiredOrders = async (input: {
          o.id,
          o.order_no,
          o.status,
+         o.expires_at,
          attempt.id AS attempt_id,
-         attempt.channel AS attempt_channel
+         attempt.channel AS attempt_channel,
+         attempt.reconciliation_state,
+         attempt.reconciliation_attempt_count,
+         attempt.reconciliation_no_payment_count,
+         attempt.reconciliation_query_error_count,
+         attempt.reconciliation_next_at,
+         attempt.reconciliation_deadline_at
        FROM orders o
        JOIN LATERAL (
-         SELECT id, channel, updated_at
+         SELECT
+           id,
+           channel,
+           updated_at,
+           reconciliation_state,
+           reconciliation_attempt_count,
+           reconciliation_no_payment_count,
+           reconciliation_query_error_count,
+           reconciliation_next_at,
+           reconciliation_deadline_at
          FROM payment_attempts
          WHERE order_id = o.id
+           AND channel = $2
          ORDER BY created_at DESC, id DESC
          LIMIT 1
        ) attempt ON true
        WHERE o.expires_at <= now()
-         AND o.status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED')
          AND attempt.channel = $2
-       ORDER BY attempt.updated_at, o.expires_at, o.id
+         AND (
+           o.status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED')
+           OR (
+             o.status = 'CLOSED'
+             AND attempt.reconciliation_state IN (
+               'REQUIRED',
+               'RETRY_SCHEDULED'
+             )
+             AND (
+               attempt.reconciliation_next_at <= now()
+               OR attempt.reconciliation_deadline_at <= now()
+             )
+           )
+         )
+       ORDER BY
+         CASE
+           WHEN o.status = 'CLOSED'
+             THEN LEAST(
+               attempt.reconciliation_next_at,
+               attempt.reconciliation_deadline_at
+             )
+           ELSE attempt.updated_at
+         END,
+         o.expires_at,
+         o.id
        LIMIT $1`,
       [providerQueryBudget, providerChannel]
     );
     scannedCount += candidates.rows.length;
+    closedRecovery.scannedCount += candidates.rows.filter(
+      (candidate) => candidate.status === "CLOSED"
+    ).length;
+    type ClosedRecoveryTerminalReason =
+      | "deadlineExceeded"
+      | "noPaymentLimitExceeded"
+      | "paymentAfterExpiry"
+      | "paymentVerificationFailed";
     type ReconciliationOutcome =
       | { safeToClose: ExpiredCloseCandidate }
       | {
@@ -990,10 +1165,69 @@ export const reconcileAndCloseExpiredOrders = async (input: {
             | "closeCapacityExceeded"
             | "unsafeOrChangedState";
         }
-      | { providerConfirmedPaid: true };
+      | {
+          providerConfirmedPaid: true;
+          closedRecovery: boolean;
+        }
+      | {
+          closedRetryScheduled: "noPayment" | "queryError";
+        }
+      | {
+          closedTerminal: ClosedRecoveryTerminalReason;
+        }
+      | {
+          closedChangedState: true;
+        };
     const outcomes = new Array<ReconciliationOutcome | undefined>(
       candidates.rows.length
     );
+    const markClosedRecoveryTerminal = async (
+      candidate: ReconciliationCandidate,
+      reason: ClosedRecoveryTerminalReason
+    ) => {
+      const terminalResult = {
+        deadlineExceeded: "DEADLINE_EXCEEDED",
+        noPaymentLimitExceeded: "NO_PAYMENT_LIMIT_EXCEEDED",
+        paymentAfterExpiry: "PAYMENT_AFTER_EXPIRY",
+        paymentVerificationFailed: "PAYMENT_VERIFICATION_FAILED"
+      }[reason];
+      const terminal = await query(
+        `UPDATE payment_attempts pa
+         SET reconciliation_state = 'TERMINAL',
+             reconciliation_next_at = NULL,
+             reconciliation_deadline_at = NULL,
+             reconciliation_last_result = $2,
+             error_code = CASE
+               WHEN $2 IN (
+                 'PAYMENT_AFTER_EXPIRY',
+                 'PAYMENT_VERIFICATION_FAILED'
+               )
+                 THEN 'RECONCILIATION_' || $2
+               ELSE error_code
+             END,
+             error_message = CASE
+               WHEN $2 = 'PAYMENT_AFTER_EXPIRY'
+                 THEN '渠道付款时间晚于订单有效期，已停止自动恢复'
+               WHEN $2 = 'PAYMENT_VERIFICATION_FAILED'
+                 THEN '支付核验不一致，已停止自动恢复'
+               ELSE error_message
+             END,
+             updated_at = now()
+         WHERE pa.id = $1
+           AND pa.reconciliation_state IN (
+             'REQUIRED',
+             'RETRY_SCHEDULED'
+           )
+           AND EXISTS (
+             SELECT 1
+             FROM orders o
+             WHERE o.id = pa.order_id
+               AND o.status = 'CLOSED'
+           )`,
+        [candidate.attempt_id, terminalResult]
+      );
+      return Boolean(terminal.rowCount);
+    };
     let nextCandidateIndex = 0;
     const reconcileCandidate = async (candidateIndex: number) => {
       const candidate = candidates.rows[candidateIndex];
@@ -1006,6 +1240,69 @@ export const reconcileAndCloseExpiredOrders = async (input: {
         };
         return;
       }
+      const isClosedRecovery = candidate.status === "CLOSED";
+      if (isClosedRecovery) {
+        const deadline = candidate.reconciliation_deadline_at;
+        if (!deadline) {
+          outcomes[candidateIndex] = {
+            closedChangedState: true
+          };
+          return;
+        }
+        const terminalReason =
+          deadline.getTime() <= Date.now()
+            ? "deadlineExceeded"
+            : candidate.reconciliation_no_payment_count >=
+                closedPaymentReconciliationMaxNoPaymentConfirmations
+              ? "noPaymentLimitExceeded"
+              : undefined;
+        if (terminalReason) {
+          outcomes[candidateIndex] =
+            await markClosedRecoveryTerminal(candidate, terminalReason)
+              ? { closedTerminal: terminalReason }
+              : { closedChangedState: true };
+          return;
+        }
+        const nextAttemptCount =
+          candidate.reconciliation_attempt_count + 1;
+        const nextRetryAt = new Date(
+          Date.now() +
+            closedPaymentReconciliationBackoffMs(nextAttemptCount)
+        );
+        const claimed = await query(
+          `UPDATE payment_attempts pa
+           SET reconciliation_state = 'RETRY_SCHEDULED',
+               reconciliation_attempt_count =
+                 reconciliation_attempt_count + 1,
+               reconciliation_next_at = $2,
+               reconciliation_last_result = 'QUERY_IN_PROGRESS',
+               updated_at = now()
+           WHERE pa.id = $1
+             AND pa.reconciliation_state IN (
+               'REQUIRED',
+               'RETRY_SCHEDULED'
+             )
+             AND pa.reconciliation_deadline_at > now()
+             AND (
+               pa.reconciliation_next_at <= now()
+               OR pa.reconciliation_deadline_at <= now()
+             )
+             AND EXISTS (
+               SELECT 1
+               FROM orders o
+               WHERE o.id = pa.order_id
+                 AND o.status = 'CLOSED'
+             )
+           RETURNING reconciliation_attempt_count`,
+          [candidate.attempt_id, nextRetryAt.toISOString()]
+        );
+        if (!claimed.rowCount) {
+          outcomes[candidateIndex] = {
+            closedChangedState: true
+          };
+          return;
+        }
+      }
       let verified: VerifiedPayment | null;
       try {
         verified = await withPaymentProviderTimeout(
@@ -1013,21 +1310,68 @@ export const reconcileAndCloseExpiredOrders = async (input: {
           providerTimeoutMs
         );
       } catch {
-        await query(
+        const updated = await query(
           `UPDATE payment_attempts
            SET error_code = 'RECONCILIATION_QUERY_FAILED',
                error_message = '支付渠道查单失败，等待下次重试',
+               reconciliation_no_payment_count = CASE
+                 WHEN $2::boolean THEN 0
+                 ELSE reconciliation_no_payment_count
+               END,
+               reconciliation_query_error_count = CASE
+                 WHEN $2::boolean
+                   THEN reconciliation_query_error_count + 1
+                 ELSE reconciliation_query_error_count
+               END,
+               reconciliation_last_result = CASE
+                 WHEN $2::boolean THEN 'QUERY_ERROR'
+                 ELSE reconciliation_last_result
+               END,
                updated_at = now()
            WHERE id = $1
-             AND status IN ('CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED')`,
-          [candidate.attempt_id]
+             AND (
+               (
+                 $2::boolean
+                 AND status = 'CLOSED'
+                 AND reconciliation_state = 'RETRY_SCHEDULED'
+               )
+               OR (
+                 NOT $2::boolean
+                 AND status IN (
+                   'CREATED',
+                   'REDIRECT_READY',
+                   'PENDING',
+                   'FAILED'
+                 )
+               )
+             )`,
+          [candidate.attempt_id, isClosedRecovery]
         );
-        outcomes[candidateIndex] = {
-          deferred: "providerQueryError"
-        };
+        outcomes[candidateIndex] = isClosedRecovery
+          ? updated.rowCount
+            ? { closedRetryScheduled: "queryError" }
+            : { closedChangedState: true }
+          : { deferred: "providerQueryError" };
         return;
       }
       if (verified) {
+        if (isClosedRecovery) {
+          const paidAt = new Date(verified.paidAt);
+          const terminalReason =
+            !Number.isNaN(paidAt.getTime()) &&
+            paidAt.getTime() > candidate.expires_at.getTime()
+              ? "paymentAfterExpiry"
+              : Number.isNaN(paidAt.getTime())
+                ? "paymentVerificationFailed"
+                : undefined;
+          if (terminalReason) {
+            outcomes[candidateIndex] =
+              await markClosedRecoveryTerminal(candidate, terminalReason)
+                ? { closedTerminal: terminalReason }
+                : { closedChangedState: true };
+            return;
+          }
+        }
         try {
           await markOrderPaid({
             orderId: candidate.id,
@@ -1035,12 +1379,23 @@ export const reconcileAndCloseExpiredOrders = async (input: {
             verified
           });
           outcomes[candidateIndex] = {
-            providerConfirmedPaid: true
+            providerConfirmedPaid: true,
+            closedRecovery: isClosedRecovery
           };
         } catch (error) {
           const verificationFailed =
             error instanceof CommerceError &&
             error.code === "PAYMENT_VERIFICATION_FAILED";
+          if (isClosedRecovery && verificationFailed) {
+            outcomes[candidateIndex] =
+              await markClosedRecoveryTerminal(
+                candidate,
+                "paymentVerificationFailed"
+              )
+                ? { closedTerminal: "paymentVerificationFailed" }
+                : { closedChangedState: true };
+            return;
+          }
           await query(
             `UPDATE payment_attempts
              SET error_code = $2,
@@ -1064,6 +1419,47 @@ export const reconcileAndCloseExpiredOrders = async (input: {
               : "unsafeOrChangedState"
           };
         }
+        return;
+      }
+      if (isClosedRecovery) {
+        const updated = await query<{
+          reconciliation_no_payment_count: number;
+        }>(
+          `UPDATE payment_attempts
+           SET reconciliation_no_payment_count =
+                 reconciliation_no_payment_count + 1,
+               reconciliation_last_result = 'NO_PAYMENT',
+               error_code = NULL,
+               error_message = NULL,
+               updated_at = now()
+           WHERE id = $1
+             AND status = 'CLOSED'
+             AND reconciliation_state = 'RETRY_SCHEDULED'
+           RETURNING reconciliation_no_payment_count`,
+          [candidate.attempt_id]
+        );
+        if (!updated.rowCount) {
+          outcomes[candidateIndex] = {
+            closedChangedState: true
+          };
+          return;
+        }
+        if (
+          updated.rows[0].reconciliation_no_payment_count >=
+          closedPaymentReconciliationMaxNoPaymentConfirmations
+        ) {
+          outcomes[candidateIndex] =
+            await markClosedRecoveryTerminal(
+              candidate,
+              "noPaymentLimitExceeded"
+            )
+              ? { closedTerminal: "noPaymentLimitExceeded" }
+              : { closedChangedState: true };
+          return;
+        }
+        outcomes[candidateIndex] = {
+          closedRetryScheduled: "noPayment"
+        };
         return;
       }
       outcomes[candidateIndex] = {
@@ -1090,6 +1486,18 @@ export const reconcileAndCloseExpiredOrders = async (input: {
       if (!outcome) continue;
       if ("providerConfirmedPaid" in outcome) {
         providerConfirmedPaidCount += 1;
+        if (outcome.closedRecovery) {
+          closedRecovery.recoveredCount += 1;
+        }
+      } else if ("closedRetryScheduled" in outcome) {
+        closedRecovery.retryScheduledCount += 1;
+        closedRecovery.retryByReason[outcome.closedRetryScheduled] += 1;
+      } else if ("closedTerminal" in outcome) {
+        closedRecovery.terminalCount += 1;
+        closedRecovery.terminalByReason[outcome.closedTerminal] += 1;
+      } else if ("closedChangedState" in outcome) {
+        closedRecovery.changedStateCount += 1;
+        deferredByReason.unsafeOrChangedState += 1;
       } else if ("deferred" in outcome) {
         deferredByReason[outcome.deferred] += 1;
       } else if (safeToClose.length < limit) {
@@ -1119,36 +1527,88 @@ export const reconcileAndCloseExpiredOrders = async (input: {
          SELECT 1
          FROM orders o
          LEFT JOIN LATERAL (
-           SELECT id, channel
+           SELECT id
            FROM payment_attempts
            WHERE order_id = o.id
            ORDER BY created_at DESC, id DESC
            LIMIT 1
-         ) attempt ON true
+         ) latest_attempt ON true
+         LEFT JOIN LATERAL (
+           SELECT
+             id,
+             channel,
+             reconciliation_state,
+             reconciliation_next_at,
+             reconciliation_deadline_at
+           FROM payment_attempts
+           WHERE order_id = o.id
+             AND channel = $1
+           ORDER BY created_at DESC, id DESC
+           LIMIT 1
+         ) channel_attempt ON $1::text IS NOT NULL
          WHERE o.expires_at <= now()
-           AND o.status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED')
            AND (
-             (o.status = 'CREATED' AND attempt.id IS NULL)
+             (o.status = 'CREATED' AND latest_attempt.id IS NULL)
              OR (
                $1::text IS NOT NULL
-               AND attempt.channel = $1
+               AND channel_attempt.channel = $1
+               AND (
+                 o.status IN ('CREATED', 'PAYING', 'PAYMENT_FAILED')
+                 OR (
+                   o.status = 'CLOSED'
+                   AND channel_attempt.reconciliation_state IN (
+                     'REQUIRED',
+                     'RETRY_SCHEDULED'
+                   )
+                   AND (
+                     channel_attempt.reconciliation_next_at <= now()
+                     OR channel_attempt.reconciliation_deadline_at <= now()
+                   )
+                 )
+               )
              )
            )
        ) AS has_more`,
+      [providerChannel]
+    );
+    const scheduledRecovery = await client.query<{ count: number }>(
+      `SELECT count(*)::integer AS count
+       FROM orders o
+       JOIN LATERAL (
+         SELECT
+           reconciliation_state,
+           reconciliation_deadline_at
+         FROM payment_attempts
+         WHERE order_id = o.id
+           AND channel = $1
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1
+       ) attempt ON $1::text IS NOT NULL
+       WHERE $1::text IS NOT NULL
+         AND o.status = 'CLOSED'
+         AND attempt.reconciliation_state IN (
+           'REQUIRED',
+           'RETRY_SCHEDULED'
+         )
+         AND attempt.reconciliation_deadline_at > now()`,
       [providerChannel]
     );
     const deferredCount =
       deferredByReason.providerQueryError +
       deferredByReason.paymentVerificationFailed +
       deferredByReason.closeCapacityExceeded +
-      deferredByReason.unsafeOrChangedState;
+      deferredByReason.unsafeOrChangedState +
+      closedRecovery.retryScheduledCount;
     const summary: ExpiredOrderReconciliationSummary = {
       scannedCount,
       closedCount: closedOrderIds.length,
       providerConfirmedPaidCount,
       deferredCount,
+      terminalCount: closedRecovery.terminalCount,
       hasMore: moreCandidates.rows[0]?.has_more ?? false,
-      deferredByReason
+      scheduledRecoveryCount: scheduledRecovery.rows[0]?.count ?? 0,
+      deferredByReason,
+      closedRecovery
     };
     if (input.onClosed) {
       await input.onClosed(client, closedOrderIds, summary);
@@ -1188,7 +1648,7 @@ const getFailedPaymentRecovery = async (
      ) attempt ON true
      WHERE o.id = $1
        AND o.user_id = $2
-       AND o.status IN ('PAYMENT_FAILED', 'CLOSED')`,
+       AND o.status IN ('PAYING', 'PAYMENT_FAILED', 'CLOSED')`,
     [orderId, userId, channel]
   );
   const row = result.rows[0];
@@ -1223,12 +1683,60 @@ const preparePayment = async (
     if (row.expires_at.getTime() <= Date.now()) {
       if (["CREATED", "PAYING", "PAYMENT_FAILED"].includes(row.status)) {
         await client.query(
-          `UPDATE payment_attempts
+          `WITH latest_active_attempts AS MATERIALIZED (
+             SELECT DISTINCT ON (channel) id
+             FROM payment_attempts
+             WHERE order_id = $1
+               AND status IN (
+                 'CREATED',
+                 'REDIRECT_READY',
+                 'PENDING',
+                 'FAILED'
+               )
+             ORDER BY channel, created_at DESC, id DESC
+           ),
+           closed_attempts AS (
+             UPDATE payment_attempts
            SET status = 'CLOSED',
+               reconciliation_state = CASE
+                 WHEN id IN (SELECT id FROM latest_active_attempts)
+                   THEN 'REQUIRED'
+                 ELSE 'NONE'
+               END,
+               reconciliation_attempt_count = 0,
+               reconciliation_no_payment_count = 0,
+               reconciliation_query_error_count = 0,
+               reconciliation_next_at = CASE
+                 WHEN id IN (SELECT id FROM latest_active_attempts)
+                   THEN now() + ($2::integer * interval '1 second')
+                 ELSE NULL
+               END,
+               reconciliation_deadline_at = CASE
+                 WHEN id IN (SELECT id FROM latest_active_attempts)
+                   THEN now() + ($3::integer * interval '1 second')
+                 ELSE NULL
+               END,
+               reconciliation_last_result = CASE
+                 WHEN id IN (SELECT id FROM latest_active_attempts)
+                   THEN 'LOCAL_CLOSE_PENDING_FINAL_QUERY'
+                 ELSE NULL
+               END,
                updated_at = now()
            WHERE order_id = $1
-             AND status IN ('CREATED', 'REDIRECT_READY', 'PENDING', 'FAILED')`,
-          [row.id]
+             AND status IN (
+               'CREATED',
+               'REDIRECT_READY',
+               'PENDING',
+               'FAILED'
+             )
+           RETURNING id
+           )
+           SELECT count(*) FROM closed_attempts`,
+          [
+            row.id,
+            closedPaymentReconciliationInitialDelaySeconds,
+            closedPaymentReconciliationDeadlineSeconds
+          ]
         );
         await client.query(
           `UPDATE orders

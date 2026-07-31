@@ -395,7 +395,8 @@ describe("migration concurrency", () => {
             { version: "005_remove_document_review_grants.sql" },
             { version: "006_policy_result_shares.sql" },
             { version: "007_policy_rule_regressions.sql" },
-            { version: "008_commerce.sql" }
+            { version: "008_commerce.sql" },
+            { version: "009_payment_reconciliation.sql" }
           ]);
           const tables = await verify.query<{ count: string }>(
             `SELECT count(*)::text AS count

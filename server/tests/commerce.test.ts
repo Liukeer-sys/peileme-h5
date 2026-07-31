@@ -157,6 +157,55 @@ const createFailedPaymentOrder = async (
   return { order, attemptId: attempt.rows[0].id };
 };
 
+const createScheduledClosedPaymentOrder = async (
+  userId: string,
+  marker: string
+) => {
+  const failed = await createFailedPaymentOrder(userId, marker);
+  await query(
+    `UPDATE orders
+     SET status = 'CLOSED',
+         created_at = now() - interval '3 minutes',
+         expires_at = now() - interval '1 minute',
+         closed_at = now(),
+         updated_at = now()
+     WHERE id = $1`,
+    [failed.order.id]
+  );
+  await query(
+    `UPDATE payment_attempts
+     SET status = 'CLOSED',
+         reconciliation_state = 'REQUIRED',
+         reconciliation_attempt_count = 0,
+         reconciliation_next_at = now() - interval '1 second',
+         reconciliation_deadline_at = now() + interval '24 hours',
+         reconciliation_last_result =
+           'LOCAL_CLOSE_PENDING_FINAL_QUERY',
+         updated_at = now()
+     WHERE id = $1`,
+    [failed.attemptId]
+  );
+  return failed;
+};
+
+const emptyClosedRecoverySummary = () => ({
+  scannedCount: 0,
+  recoveredCount: 0,
+  retryScheduledCount: 0,
+  terminalCount: 0,
+  changedStateCount: 0,
+  retryByReason: {
+    noPayment: 0,
+    queryError: 0
+  },
+  terminalByReason: {
+    deadlineExceeded: 0,
+    noPaymentLimitExceeded: 0,
+    paymentAfterExpiry: 0,
+    paymentVerificationFailed: 0
+  }
+});
+
 beforeAll(async () => {
   await runMigrations();
 });
@@ -897,6 +946,141 @@ describe("commerce catalog foundation", () => {
         data_type: "bigint"
       }
     ]);
+  });
+
+  it("persists bounded final payment reconciliation state from migration 009", async () => {
+    const columns = await query<{
+      column_name: string;
+      data_type: string;
+      column_default: string | null;
+      is_nullable: string;
+    }>(
+      `SELECT column_name, data_type, column_default, is_nullable
+         FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'payment_attempts'
+          AND column_name = ANY($1::text[])
+        ORDER BY column_name`,
+      [[
+        "reconciliation_state",
+        "reconciliation_attempt_count",
+        "reconciliation_no_payment_count",
+        "reconciliation_query_error_count",
+        "reconciliation_next_at",
+        "reconciliation_deadline_at",
+        "reconciliation_last_result"
+      ]]
+    );
+    expect(columns.rows).toEqual([
+      {
+        column_name: "reconciliation_attempt_count",
+        data_type: "integer",
+        column_default: "0",
+        is_nullable: "NO"
+      },
+      {
+        column_name: "reconciliation_deadline_at",
+        data_type: "timestamp with time zone",
+        column_default: null,
+        is_nullable: "YES"
+      },
+      {
+        column_name: "reconciliation_last_result",
+        data_type: "text",
+        column_default: null,
+        is_nullable: "YES"
+      },
+      {
+        column_name: "reconciliation_next_at",
+        data_type: "timestamp with time zone",
+        column_default: null,
+        is_nullable: "YES"
+      },
+      {
+        column_name: "reconciliation_no_payment_count",
+        data_type: "integer",
+        column_default: "0",
+        is_nullable: "NO"
+      },
+      {
+        column_name: "reconciliation_query_error_count",
+        data_type: "integer",
+        column_default: "0",
+        is_nullable: "NO"
+      },
+      {
+        column_name: "reconciliation_state",
+        data_type: "text",
+        column_default: "'NONE'::text",
+        is_nullable: "NO"
+      }
+    ]);
+
+    const indexes = await query<{ indexdef: string }>(
+      `SELECT indexdef
+         FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND tablename = 'payment_attempts'
+          AND indexname = 'payment_attempts_reconciliation_due_idx'`
+    );
+    expect(indexes.rows).toHaveLength(1);
+    expect(indexes.rows[0].indexdef).toContain(
+      "(channel, reconciliation_next_at, updated_at, id)"
+    );
+    expect(indexes.rows[0].indexdef).toContain(
+      "reconciliation_state = ANY (ARRAY['REQUIRED'::text, 'RETRY_SCHEDULED'::text])"
+    );
+  });
+
+  it("rejects invalid payment reconciliation result and schedule combinations", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const order = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `reconciliation-constraint-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      await expect(
+        query(
+          `INSERT INTO payment_attempts(
+             order_id,
+             channel,
+             status,
+             reconciliation_state
+           )
+           VALUES ($1, 'fake', 'CLOSED', 'REQUIRED')`,
+          [order.id]
+        )
+      ).rejects.toMatchObject({ code: "23514" });
+      const attempt = await query<{ id: string }>(
+        `INSERT INTO payment_attempts(order_id, channel, status)
+         VALUES ($1, 'fake', 'CLOSED')
+         RETURNING id`,
+        [order.id]
+      );
+      await expect(
+        query(
+          `UPDATE payment_attempts
+           SET reconciliation_next_at = now()
+           WHERE id = $1`,
+          [attempt.rows[0].id]
+        )
+      ).rejects.toMatchObject({ code: "23514" });
+      await expect(
+        query(
+          `UPDATE payment_attempts
+           SET reconciliation_last_result = 'UNRECOGNIZED_RESULT'
+           WHERE id = $1`,
+          [attempt.rows[0].id]
+        )
+      ).rejects.toMatchObject({ code: "23514" });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
   });
 });
 
@@ -2382,6 +2566,247 @@ describe("atomic commerce orders and payments", () => {
     }
   });
 
+  it("recovers an expired PAYING order on the first user retry when the provider already captured payment", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const order = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `expired-paying-recovery-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      const attempt = await query<{ id: string }>(
+        `INSERT INTO payment_attempts(order_id, channel, status)
+         VALUES ($1, 'fake', 'PENDING')
+         RETURNING id`,
+        [order.id]
+      );
+      await query(
+        `UPDATE orders
+         SET status = 'PAYING',
+             created_at = now() - interval '3 minutes',
+             expires_at = now() - interval '1 minute'
+         WHERE id = $1`,
+        [order.id]
+      );
+      let createCalls = 0;
+      let queryCalls = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          createCalls += 1;
+          throw new Error("must not create");
+        },
+        async queryPayment(orderNo: string) {
+          queryCalls += 1;
+          return {
+            orderNo,
+            channel: "fake" as const,
+            channelTransactionId: `expired-paying-${randomUUID()}`,
+            amountFen: order.amountFen,
+            currency: "CNY" as const,
+            paidAt: new Date(Date.now() - 2 * 60_000).toISOString(),
+            raw: { source: "provider-query" }
+          };
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+
+      await expect(
+        startPayment({
+          userId,
+          orderId: order.id,
+          provider,
+          clientIp: "127.0.0.1",
+          returnUrl: "http://peileme.test/return",
+          notifyUrl: "http://peileme.test/notify",
+          providerTimeoutMs: 100
+        })
+      ).resolves.toMatchObject({
+        status: "COMPLETED",
+        paymentAttemptId: attempt.rows[0].id,
+        launchUrl: "http://peileme.test/return"
+      });
+      expect({ createCalls, queryCalls }).toEqual({
+        createCalls: 0,
+        queryCalls: 1
+      });
+      const persisted = await query<{
+        status: string;
+        attempt_status: string;
+        transactions: string;
+        entitlements: string;
+      }>(
+        `SELECT
+           o.status,
+           pa.status AS attempt_status,
+           (SELECT count(*)::text
+              FROM payment_transactions
+             WHERE order_id = o.id) AS transactions,
+           (SELECT count(*)::text
+              FROM entitlements
+             WHERE source_id = o.id) AS entitlements
+         FROM orders o
+         JOIN payment_attempts pa ON pa.id = $2
+         WHERE o.id = $1`,
+        [order.id, attempt.rows[0].id]
+      );
+      expect(persisted.rows[0]).toEqual({
+        status: "COMPLETED",
+        attempt_status: "SUCCEEDED",
+        transactions: "1",
+        entitlements: "1"
+      });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("isolates PAYING recovery by owner and channel and aborts a timed out provider query", async () => {
+    await seedPolicyFoundation();
+    const userIds: string[] = [];
+    try {
+      const ownerId = await createEntitlementTestUser(true);
+      const otherUserId = await createEntitlementTestUser(true);
+      userIds.push(ownerId, otherUserId);
+      const order = await createOrder({
+        userId: ownerId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `paying-recovery-boundary-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(ownerId)
+      });
+      const attempt = await query<{ id: string }>(
+        `INSERT INTO payment_attempts(order_id, channel, status)
+         VALUES ($1, 'fake', 'PENDING')
+         RETURNING id`,
+        [order.id]
+      );
+      await query(
+        `UPDATE orders
+         SET status = 'PAYING',
+             created_at = now() - interval '3 minutes',
+             expires_at = now() - interval '1 minute'
+         WHERE id = $1`,
+        [order.id]
+      );
+      let queryCalls = 0;
+      let createCalls = 0;
+      let timedOutSignal: AbortSignal | undefined;
+      const fakeProvider = {
+        channel: "fake" as const,
+        async createPayment() {
+          createCalls += 1;
+          throw new Error("must not create");
+        },
+        async queryPayment(_orderNo: string, signal: AbortSignal) {
+          queryCalls += 1;
+          timedOutSignal = signal;
+          return await new Promise<never>((_resolve, reject) => {
+            signal.addEventListener(
+              "abort",
+              () => reject(new Error("provider query aborted")),
+              { once: true }
+            );
+          });
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      const start = (userId: string) =>
+        startPayment({
+          userId,
+          orderId: order.id,
+          provider: fakeProvider,
+          clientIp: "127.0.0.1",
+          returnUrl: "http://peileme.test/return",
+          notifyUrl: "http://peileme.test/notify",
+          providerTimeoutMs: 20
+        });
+
+      await expect(start(otherUserId)).rejects.toMatchObject({
+        code: "ORDER_NOT_FOUND"
+      });
+      expect(queryCalls).toBe(0);
+      await expect(start(ownerId)).rejects.toMatchObject({
+        code: "PAYMENT_PROVIDER_FAILED"
+      });
+      expect(timedOutSignal?.aborted).toBe(true);
+      expect({ createCalls, queryCalls }).toEqual({
+        createCalls: 0,
+        queryCalls: 1
+      });
+      const afterTimeout = await query<{
+        order_status: string;
+        attempt_status: string;
+      }>(
+        `SELECT o.status AS order_status, pa.status AS attempt_status
+         FROM orders o
+         JOIN payment_attempts pa ON pa.id = $2
+         WHERE o.id = $1`,
+        [order.id, attempt.rows[0].id]
+      );
+      expect(afterTimeout.rows[0]).toEqual({
+        order_status: "PAYING",
+        attempt_status: "PENDING"
+      });
+
+      let wrongChannelQueries = 0;
+      const alipayProvider = {
+        channel: "alipay_wap" as const,
+        async createPayment() {
+          throw new Error("must not create");
+        },
+        async queryPayment() {
+          wrongChannelQueries += 1;
+          return null;
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      await expect(
+        startPayment({
+          userId: ownerId,
+          orderId: order.id,
+          provider: alipayProvider,
+          clientIp: "127.0.0.1",
+          returnUrl: "http://peileme.test/return",
+          notifyUrl: "http://peileme.test/notify",
+          providerTimeoutMs: 100
+        })
+      ).rejects.toMatchObject({ code: "ORDER_EXPIRED" });
+      expect(wrongChannelQueries).toBe(0);
+      const closed = await query<{
+        order_status: string;
+        attempt_status: string;
+        reconciliation_state: string;
+      }>(
+        `SELECT
+           o.status AS order_status,
+           pa.status AS attempt_status,
+           pa.reconciliation_state
+         FROM orders o
+         JOIN payment_attempts pa ON pa.id = $2
+         WHERE o.id = $1`,
+        [order.id, attempt.rows[0].id]
+      );
+      expect(closed.rows[0]).toEqual({
+        order_status: "CLOSED",
+        attempt_status: "CLOSED",
+        reconciliation_state: "REQUIRED"
+      });
+    } finally {
+      await cleanupEntitlementTestUsers(userIds);
+    }
+  });
+
   it("commits expiry closure before returning ORDER_EXPIRED", async () => {
     await seedPolicyFoundation();
     let userId: string | undefined;
@@ -2438,8 +2863,19 @@ describe("atomic commerce orders and payments", () => {
         status: string;
         closed_at: Date | null;
         attempt_status: string;
+        reconciliation_state: string;
+        reconciliation_attempt_count: number;
+        reconciliation_next_at: Date | null;
+        reconciliation_deadline_at: Date | null;
       }>(
-        `SELECT o.status, o.closed_at, pa.status AS attempt_status
+        `SELECT
+           o.status,
+           o.closed_at,
+           pa.status AS attempt_status,
+           pa.reconciliation_state,
+           pa.reconciliation_attempt_count,
+           pa.reconciliation_next_at,
+           pa.reconciliation_deadline_at
          FROM orders o
          JOIN payment_attempts pa ON pa.order_id = o.id
          WHERE o.id = $1`,
@@ -2448,12 +2884,1008 @@ describe("atomic commerce orders and payments", () => {
       expect(first.rows[0]).toMatchObject({
         status: "CLOSED",
         closed_at: expect.any(Date),
-        attempt_status: "CLOSED"
+        attempt_status: "CLOSED",
+        reconciliation_state: "REQUIRED",
+        reconciliation_attempt_count: 0,
+        reconciliation_next_at: expect.any(Date),
+        reconciliation_deadline_at: expect.any(Date)
       });
       await expect(start()).rejects.toMatchObject({
         code: "ORDER_STATE_CONFLICT"
       });
       expect(createCalls).toBe(0);
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("recovers a locally closed order when the bounded background query later confirms payment", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const order = await createOrder({
+        userId,
+        sku: "POLICY_CALC",
+        channel: "main",
+        idempotencyKey: `closed-late-recovery-${randomUUID()}`,
+        businessDraftId: await insertPolicyDraft(userId)
+      });
+      const attempt = await query<{ id: string }>(
+        `INSERT INTO payment_attempts(order_id, channel, status)
+         VALUES ($1, 'fake', 'PENDING')
+         RETURNING id`,
+        [order.id]
+      );
+      await query(
+        `UPDATE orders
+         SET status = 'PAYING',
+             created_at = now() - interval '3 minutes',
+             expires_at = now() - interval '1 minute'
+         WHERE id = $1`,
+        [order.id]
+      );
+      let queryCalls = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          throw new Error("must not create");
+        },
+        async queryPayment(orderNo: string) {
+          queryCalls += 1;
+          if (queryCalls === 1) return null;
+          return {
+            orderNo,
+            channel: "fake" as const,
+            channelTransactionId: `closed-late-${randomUUID()}`,
+            amountFen: order.amountFen,
+            currency: "CNY" as const,
+            paidAt: new Date(Date.now() - 2 * 60_000).toISOString(),
+            raw: { source: "closed-final-query" }
+          };
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+
+      await expect(
+        startPayment({
+          userId,
+          orderId: order.id,
+          provider,
+          clientIp: "127.0.0.1",
+          returnUrl: "http://peileme.test/return",
+          notifyUrl: "http://peileme.test/notify",
+          providerTimeoutMs: 100
+        })
+      ).rejects.toMatchObject({ code: "ORDER_EXPIRED" });
+      const locallyClosed = await query<{
+        order_status: string;
+        attempt_status: string;
+        reconciliation_state: string;
+        reconciliation_attempt_count: number;
+        reconciliation_next_at: Date | null;
+        reconciliation_deadline_at: Date | null;
+        reconciliation_last_result: string | null;
+      }>(
+        `SELECT
+           o.status AS order_status,
+           pa.status AS attempt_status,
+           pa.reconciliation_state,
+           pa.reconciliation_attempt_count,
+           pa.reconciliation_next_at,
+           pa.reconciliation_deadline_at,
+           pa.reconciliation_last_result
+         FROM orders o
+         JOIN payment_attempts pa ON pa.id = $2
+         WHERE o.id = $1`,
+        [order.id, attempt.rows[0].id]
+      );
+      expect(locallyClosed.rows[0]).toMatchObject({
+        order_status: "CLOSED",
+        attempt_status: "CLOSED",
+        reconciliation_state: "REQUIRED",
+        reconciliation_attempt_count: 0,
+        reconciliation_next_at: expect.any(Date),
+        reconciliation_deadline_at: expect.any(Date),
+        reconciliation_last_result: "LOCAL_CLOSE_PENDING_FINAL_QUERY"
+      });
+      await query(
+        `UPDATE payment_attempts
+         SET reconciliation_next_at = now() - interval '1 second'
+         WHERE id = $1`,
+        [attempt.rows[0].id]
+      );
+
+      const reconciliation = await reconcileAndCloseExpiredOrders({
+        provider,
+        limit: 5,
+        providerQueryBudget: 5,
+        providerTimeoutMs: 100
+      });
+      expect(queryCalls).toBe(2);
+      expect(reconciliation.closedOrderIds).toEqual([]);
+      expect(reconciliation.summary).toEqual({
+        scannedCount: 1,
+        closedCount: 0,
+        providerConfirmedPaidCount: 1,
+        deferredCount: 0,
+        terminalCount: 0,
+        hasMore: false,
+        scheduledRecoveryCount: 0,
+        deferredByReason: {
+          providerQueryError: 0,
+          paymentVerificationFailed: 0,
+          closeCapacityExceeded: 0,
+          unsafeOrChangedState: 0
+        },
+        closedRecovery: {
+          scannedCount: 1,
+          recoveredCount: 1,
+          retryScheduledCount: 0,
+          terminalCount: 0,
+          changedStateCount: 0,
+          retryByReason: {
+            noPayment: 0,
+            queryError: 0
+          },
+          terminalByReason: {
+            deadlineExceeded: 0,
+            noPaymentLimitExceeded: 0,
+            paymentAfterExpiry: 0,
+            paymentVerificationFailed: 0
+          }
+        }
+      });
+      const persisted = await query<{
+        order_status: string;
+        attempt_status: string;
+        reconciliation_state: string;
+        reconciliation_attempt_count: number;
+        reconciliation_next_at: Date | null;
+        transactions: string;
+        entitlements: string;
+      }>(
+        `SELECT
+           o.status AS order_status,
+           pa.status AS attempt_status,
+           pa.reconciliation_state,
+           pa.reconciliation_attempt_count,
+           pa.reconciliation_next_at,
+           (SELECT count(*)::text
+              FROM payment_transactions
+             WHERE order_id = o.id) AS transactions,
+           (SELECT count(*)::text
+              FROM entitlements
+             WHERE source_id = o.id) AS entitlements
+         FROM orders o
+         JOIN payment_attempts pa ON pa.id = $2
+         WHERE o.id = $1`,
+        [order.id, attempt.rows[0].id]
+      );
+      expect(persisted.rows[0]).toEqual({
+        order_status: "COMPLETED",
+        attempt_status: "SUCCEEDED",
+        reconciliation_state: "RECOVERED",
+        reconciliation_attempt_count: 1,
+        reconciliation_next_at: null,
+        transactions: "1",
+        entitlements: "1"
+      });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("bounds persistent CLOSED no-payment reconciliation and persists a terminal state", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const closed = await createScheduledClosedPaymentOrder(
+        userId,
+        "closed-persistent-null"
+      );
+      let queryCalls = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          throw new Error("must not create");
+        },
+        async queryPayment() {
+          queryCalls += 1;
+          return null;
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      const summaries = [];
+      for (let attempt = 1; attempt <= 5; attempt += 1) {
+        await query(
+          `UPDATE payment_attempts
+           SET reconciliation_next_at = now() - interval '1 second'
+           WHERE id = $1`,
+          [closed.attemptId]
+        );
+        const reconciliation = await reconcileAndCloseExpiredOrders({
+          provider,
+          limit: 5,
+          providerQueryBudget: 1,
+          providerTimeoutMs: 100
+        });
+        summaries.push(reconciliation.summary);
+        expect(reconciliation.summary.scannedCount).toBe(
+          reconciliation.summary.closedCount +
+            reconciliation.summary.providerConfirmedPaidCount +
+            reconciliation.summary.deferredCount +
+            reconciliation.summary.terminalCount
+        );
+        if (attempt < 5) {
+          expect(reconciliation.summary).toMatchObject({
+            scannedCount: 1,
+            deferredCount: 1,
+            terminalCount: 0,
+            hasMore: false,
+            scheduledRecoveryCount: 1,
+            closedRecovery: {
+              retryScheduledCount: 1,
+              terminalCount: 0,
+              retryByReason: {
+                noPayment: 1,
+                queryError: 0
+              }
+            }
+          });
+        }
+      }
+      expect(queryCalls).toBe(5);
+      expect(summaries[4]).toMatchObject({
+        scannedCount: 1,
+        deferredCount: 0,
+        terminalCount: 1,
+        hasMore: false,
+        scheduledRecoveryCount: 0,
+        closedRecovery: {
+          retryScheduledCount: 0,
+          terminalCount: 1,
+          terminalByReason: {
+            noPaymentLimitExceeded: 1
+          }
+        }
+      });
+
+      const afterTerminal = await reconcileAndCloseExpiredOrders({
+        provider,
+        limit: 5,
+        providerQueryBudget: 1,
+        providerTimeoutMs: 100
+      });
+      expect(afterTerminal.summary).toMatchObject({
+        scannedCount: 0,
+        terminalCount: 0,
+        hasMore: false,
+        scheduledRecoveryCount: 0
+      });
+      expect(queryCalls).toBe(5);
+      const persisted = await query<{
+        reconciliation_state: string;
+        reconciliation_attempt_count: number;
+        reconciliation_no_payment_count: number;
+        reconciliation_query_error_count: number;
+        reconciliation_next_at: Date | null;
+        reconciliation_deadline_at: Date | null;
+        reconciliation_last_result: string | null;
+        transactions: string;
+        entitlements: string;
+      }>(
+        `SELECT
+           pa.reconciliation_state,
+           pa.reconciliation_attempt_count,
+           pa.reconciliation_no_payment_count,
+           pa.reconciliation_query_error_count,
+           pa.reconciliation_next_at,
+           pa.reconciliation_deadline_at,
+           pa.reconciliation_last_result,
+           (SELECT count(*)::text
+              FROM payment_transactions
+             WHERE order_id = pa.order_id) AS transactions,
+           (SELECT count(*)::text
+              FROM entitlements
+             WHERE source_id = pa.order_id) AS entitlements
+         FROM payment_attempts pa
+         WHERE pa.id = $1`,
+        [closed.attemptId]
+      );
+      expect(persisted.rows[0]).toEqual({
+        reconciliation_state: "TERMINAL",
+        reconciliation_attempt_count: 5,
+        reconciliation_no_payment_count: 5,
+        reconciliation_query_error_count: 0,
+        reconciliation_next_at: null,
+        reconciliation_deadline_at: null,
+        reconciliation_last_result: "NO_PAYMENT_LIMIT_EXCEEDED",
+        transactions: "0",
+        entitlements: "0"
+      });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("backs off a CLOSED provider query error and recovers on a later due retry", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const closed = await createScheduledClosedPaymentOrder(
+        userId,
+        "closed-query-error"
+      );
+      let queryCalls = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          throw new Error("must not create");
+        },
+        async queryPayment(orderNo: string) {
+          queryCalls += 1;
+          if (queryCalls === 1) {
+            throw new Error("temporary provider query failure");
+          }
+          return {
+            orderNo,
+            channel: "fake" as const,
+            channelTransactionId: `closed-query-retry-${randomUUID()}`,
+            amountFen: closed.order.amountFen,
+            currency: "CNY" as const,
+            paidAt: new Date(Date.now() - 2 * 60_000).toISOString(),
+            raw: { source: "closed-query-retry" }
+          };
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+
+      const errored = await reconcileAndCloseExpiredOrders({
+        provider,
+        limit: 5,
+        providerQueryBudget: 1,
+        providerTimeoutMs: 100
+      });
+      expect(errored.summary).toMatchObject({
+        scannedCount: 1,
+        deferredCount: 1,
+        terminalCount: 0,
+        hasMore: false,
+        scheduledRecoveryCount: 1,
+        closedRecovery: {
+          retryScheduledCount: 1,
+          retryByReason: {
+            noPayment: 0,
+            queryError: 1
+          }
+        }
+      });
+      const afterError = await query<{
+        reconciliation_state: string;
+        reconciliation_attempt_count: number;
+        reconciliation_no_payment_count: number;
+        reconciliation_query_error_count: number;
+        reconciliation_next_at: Date;
+        reconciliation_last_result: string;
+        error_code: string;
+      }>(
+        `SELECT
+           reconciliation_state,
+           reconciliation_attempt_count,
+           reconciliation_no_payment_count,
+           reconciliation_query_error_count,
+           reconciliation_next_at,
+           reconciliation_last_result,
+           error_code
+         FROM payment_attempts
+         WHERE id = $1`,
+        [closed.attemptId]
+      );
+      expect(afterError.rows[0]).toMatchObject({
+        reconciliation_state: "RETRY_SCHEDULED",
+        reconciliation_attempt_count: 1,
+        reconciliation_no_payment_count: 0,
+        reconciliation_query_error_count: 1,
+        reconciliation_next_at: expect.any(Date),
+        reconciliation_last_result: "QUERY_ERROR",
+        error_code: "RECONCILIATION_QUERY_FAILED"
+      });
+      expect(afterError.rows[0].reconciliation_next_at.getTime())
+        .toBeGreaterThan(Date.now());
+
+      const immediate = await reconcileAndCloseExpiredOrders({
+        provider,
+        limit: 5,
+        providerQueryBudget: 1,
+        providerTimeoutMs: 100
+      });
+      expect(immediate.summary).toMatchObject({
+        scannedCount: 0,
+        hasMore: false,
+        scheduledRecoveryCount: 1
+      });
+      expect(queryCalls).toBe(1);
+
+      await query(
+        `UPDATE payment_attempts
+         SET reconciliation_next_at = now() - interval '1 second'
+         WHERE id = $1`,
+        [closed.attemptId]
+      );
+      const recovered = await reconcileAndCloseExpiredOrders({
+        provider,
+        limit: 5,
+        providerQueryBudget: 1,
+        providerTimeoutMs: 100
+      });
+      expect(recovered.summary).toMatchObject({
+        scannedCount: 1,
+        providerConfirmedPaidCount: 1,
+        deferredCount: 0,
+        terminalCount: 0,
+        scheduledRecoveryCount: 0,
+        closedRecovery: {
+          recoveredCount: 1
+        }
+      });
+      expect(queryCalls).toBe(2);
+      const persisted = await query<{
+        status: string;
+        reconciliation_state: string;
+        reconciliation_attempt_count: number;
+        transactions: string;
+        entitlements: string;
+      }>(
+        `SELECT
+           o.status,
+           pa.reconciliation_state,
+           pa.reconciliation_attempt_count,
+           (SELECT count(*)::text
+              FROM payment_transactions
+             WHERE order_id = o.id) AS transactions,
+           (SELECT count(*)::text
+              FROM entitlements
+             WHERE source_id = o.id) AS entitlements
+         FROM orders o
+         JOIN payment_attempts pa ON pa.id = $2
+         WHERE o.id = $1`,
+        [closed.order.id, closed.attemptId]
+      );
+      expect(persisted.rows[0]).toEqual({
+        status: "COMPLETED",
+        reconciliation_state: "RECOVERED",
+        reconciliation_attempt_count: 2,
+        transactions: "1",
+        entitlements: "1"
+      });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("keeps CLOSED query errors scheduled beyond five attempts until the recovery deadline", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const closed = await createScheduledClosedPaymentOrder(
+        userId,
+        "closed-query-error-deadline"
+      );
+      let queryCalls = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          throw new Error("must not create");
+        },
+        async queryPayment() {
+          queryCalls += 1;
+          throw new Error("provider remains temporarily unavailable");
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+
+      for (let attempt = 1; attempt <= 6; attempt += 1) {
+        await query(
+          `UPDATE payment_attempts
+           SET reconciliation_next_at = now() - interval '1 second'
+           WHERE id = $1`,
+          [closed.attemptId]
+        );
+        const reconciliation = await reconcileAndCloseExpiredOrders({
+          provider,
+          limit: 5,
+          providerQueryBudget: 1,
+          providerTimeoutMs: 100
+        });
+        expect(reconciliation.summary).toMatchObject({
+          scannedCount: 1,
+          deferredCount: 1,
+          terminalCount: 0,
+          scheduledRecoveryCount: 1,
+          closedRecovery: {
+            retryScheduledCount: 1,
+            retryByReason: {
+              noPayment: 0,
+              queryError: 1
+            }
+          }
+        });
+      }
+      expect(queryCalls).toBe(6);
+      const stillScheduled = await query<{
+        reconciliation_state: string;
+        reconciliation_attempt_count: number;
+        reconciliation_no_payment_count: number;
+        reconciliation_query_error_count: number;
+      }>(
+        `SELECT
+           reconciliation_state,
+           reconciliation_attempt_count,
+           reconciliation_no_payment_count,
+           reconciliation_query_error_count
+         FROM payment_attempts
+         WHERE id = $1`,
+        [closed.attemptId]
+      );
+      expect(stillScheduled.rows[0]).toEqual({
+        reconciliation_state: "RETRY_SCHEDULED",
+        reconciliation_attempt_count: 6,
+        reconciliation_no_payment_count: 0,
+        reconciliation_query_error_count: 6
+      });
+
+      await query(
+        `UPDATE payment_attempts
+         SET reconciliation_next_at = now() + interval '1 hour',
+             reconciliation_deadline_at = now() - interval '1 second'
+         WHERE id = $1`,
+        [closed.attemptId]
+      );
+      const terminal = await reconcileAndCloseExpiredOrders({
+        provider,
+        limit: 5,
+        providerQueryBudget: 1,
+        providerTimeoutMs: 100
+      });
+      expect(terminal.summary).toMatchObject({
+        scannedCount: 1,
+        deferredCount: 0,
+        terminalCount: 1,
+        hasMore: false,
+        scheduledRecoveryCount: 0,
+        closedRecovery: {
+          terminalCount: 1,
+          terminalByReason: {
+            deadlineExceeded: 1
+          }
+        }
+      });
+      expect(queryCalls).toBe(6);
+      const persisted = await query<{
+        reconciliation_state: string;
+        reconciliation_last_result: string;
+      }>(
+        `SELECT reconciliation_state, reconciliation_last_result
+         FROM payment_attempts
+         WHERE id = $1`,
+        [closed.attemptId]
+      );
+      expect(persisted.rows[0]).toEqual({
+        reconciliation_state: "TERMINAL",
+        reconciliation_last_result: "DEADLINE_EXCEEDED"
+      });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("terminally rejects a CLOSED provider payment captured after order expiry", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const closed = await createScheduledClosedPaymentOrder(
+        userId,
+        "closed-late-paid"
+      );
+      let queryCalls = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          throw new Error("must not create");
+        },
+        async queryPayment(orderNo: string) {
+          queryCalls += 1;
+          return {
+            orderNo,
+            channel: "fake" as const,
+            channelTransactionId: `closed-after-expiry-${randomUUID()}`,
+            amountFen: closed.order.amountFen,
+            currency: "CNY" as const,
+            paidAt: new Date().toISOString(),
+            raw: { source: "closed-after-expiry" }
+          };
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+
+      const reconciliation = await reconcileAndCloseExpiredOrders({
+        provider,
+        limit: 5,
+        providerQueryBudget: 1,
+        providerTimeoutMs: 100
+      });
+      expect(reconciliation.summary).toMatchObject({
+        scannedCount: 1,
+        providerConfirmedPaidCount: 0,
+        deferredCount: 0,
+        terminalCount: 1,
+        hasMore: false,
+        scheduledRecoveryCount: 0,
+        closedRecovery: {
+          terminalCount: 1,
+          terminalByReason: {
+            paymentAfterExpiry: 1
+          }
+        }
+      });
+      expect(queryCalls).toBe(1);
+      const persisted = await query<{
+        order_status: string;
+        reconciliation_state: string;
+        reconciliation_attempt_count: number;
+        reconciliation_last_result: string;
+        transactions: string;
+        entitlements: string;
+      }>(
+        `SELECT
+           o.status AS order_status,
+           pa.reconciliation_state,
+           pa.reconciliation_attempt_count,
+           pa.reconciliation_last_result,
+           (SELECT count(*)::text
+              FROM payment_transactions
+             WHERE order_id = o.id) AS transactions,
+           (SELECT count(*)::text
+              FROM entitlements
+             WHERE source_id = o.id) AS entitlements
+         FROM orders o
+         JOIN payment_attempts pa ON pa.id = $2
+         WHERE o.id = $1`,
+        [closed.order.id, closed.attemptId]
+      );
+      expect(persisted.rows[0]).toEqual({
+        order_status: "CLOSED",
+        reconciliation_state: "TERMINAL",
+        reconciliation_attempt_count: 1,
+        reconciliation_last_result: "PAYMENT_AFTER_EXPIRY",
+        transactions: "0",
+        entitlements: "0"
+      });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("keeps CLOSED worker recovery idempotent with a concurrent payment callback", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const closed = await createScheduledClosedPaymentOrder(
+        userId,
+        "closed-callback-race"
+      );
+      const verified = {
+        orderNo: closed.order.orderNo,
+        channel: "fake" as const,
+        channelTransactionId: `closed-callback-${randomUUID()}`,
+        amountFen: closed.order.amountFen,
+        currency: "CNY" as const,
+        paidAt: new Date(Date.now() - 2 * 60_000).toISOString(),
+        raw: { source: "closed-callback-race" }
+      };
+      let releaseProvider!: () => void;
+      const providerReleased = new Promise<void>((resolve) => {
+        releaseProvider = resolve;
+      });
+      let reportProviderQuery!: () => void;
+      const providerQueried = new Promise<void>((resolve) => {
+        reportProviderQuery = resolve;
+      });
+      let queryCalls = 0;
+      const provider = {
+        channel: "fake" as const,
+        async createPayment() {
+          throw new Error("must not create");
+        },
+        async queryPayment() {
+          queryCalls += 1;
+          reportProviderQuery();
+          await providerReleased;
+          return verified;
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+
+      const worker = reconcileAndCloseExpiredOrders({
+        provider,
+        limit: 5,
+        providerQueryBudget: 1,
+        providerTimeoutMs: 1_000
+      });
+      await providerQueried;
+      const callback = markOrderPaid({
+        orderId: closed.order.id,
+        paymentAttemptId: closed.attemptId,
+        verified
+      });
+      await callback;
+      releaseProvider();
+      await expect(worker).resolves.toMatchObject({
+        summary: {
+          providerConfirmedPaidCount: 1,
+          closedRecovery: {
+            recoveredCount: 1
+          }
+        }
+      });
+      expect(queryCalls).toBe(1);
+      const persisted = await query<{
+        status: string;
+        attempt_status: string;
+        reconciliation_state: string;
+        transactions: string;
+        entitlements: string;
+      }>(
+        `SELECT
+           o.status,
+           pa.status AS attempt_status,
+           pa.reconciliation_state,
+           (SELECT count(*)::text
+              FROM payment_transactions
+             WHERE order_id = o.id) AS transactions,
+           (SELECT count(*)::text
+              FROM entitlements
+             WHERE source_id = o.id) AS entitlements
+         FROM orders o
+         JOIN payment_attempts pa ON pa.id = $2
+         WHERE o.id = $1`,
+        [closed.order.id, closed.attemptId]
+      );
+      expect(persisted.rows[0]).toEqual({
+        status: "COMPLETED",
+        attempt_status: "SUCCEEDED",
+        reconciliation_state: "RECOVERED",
+        transactions: "1",
+        entitlements: "1"
+      });
+    } finally {
+      if (userId) await cleanupEntitlementTestUsers([userId]);
+    }
+  });
+
+  it("schedules the latest due attempt per order and provider channel", async () => {
+    await seedPolicyFoundation();
+    let userId: string | undefined;
+    try {
+      userId = await createEntitlementTestUser(true);
+      const makeMultiChannelClosedOrder = async (marker: string) => {
+        const order = await createOrder({
+          userId: userId!,
+          sku: "POLICY_CALC",
+          channel: "main",
+          idempotencyKey: `${marker}-${randomUUID()}`,
+          businessDraftId: await insertPolicyDraft(userId!)
+        });
+        await query(
+          `UPDATE orders
+           SET status = 'CLOSED',
+               created_at = now() - interval '3 minutes',
+               expires_at = now() - interval '1 minute',
+               closed_at = now(),
+               updated_at = now()
+           WHERE id = $1`,
+          [order.id]
+        );
+        const attempts = await query<{ id: string; channel: string }>(
+          `INSERT INTO payment_attempts(
+             order_id,
+             channel,
+             status,
+             reconciliation_state,
+             reconciliation_next_at,
+             reconciliation_deadline_at,
+             reconciliation_last_result,
+             created_at,
+             updated_at
+           )
+           VALUES
+             (
+               $1,
+               'wechat_h5',
+               'CLOSED',
+               'REQUIRED',
+               now() - interval '1 second',
+               now() + interval '24 hours',
+               'LOCAL_CLOSE_PENDING_FINAL_QUERY',
+               now() - interval '2 minutes',
+               now() - interval '2 minutes'
+             ),
+             (
+               $1,
+               'alipay_wap',
+               'CLOSED',
+               'REQUIRED',
+               now() - interval '1 second',
+               now() + interval '24 hours',
+               'LOCAL_CLOSE_PENDING_FINAL_QUERY',
+               now() - interval '1 minute',
+               now() - interval '1 minute'
+             )
+           RETURNING id, channel`,
+          [order.id]
+        );
+        return {
+          order,
+          attemptByChannel: new Map(
+            attempts.rows.map((attempt) => [
+              attempt.channel,
+              attempt.id
+            ])
+          )
+        };
+      };
+      const recovered = await makeMultiChannelClosedOrder(
+        "multi-channel-recovered"
+      );
+      const terminal = await makeMultiChannelClosedOrder(
+        "multi-channel-terminal"
+      );
+      const wechatCalls: string[] = [];
+      const wechatProvider = {
+        channel: "wechat_h5" as const,
+        async createPayment() {
+          throw new Error("must not create");
+        },
+        async queryPayment(orderNo: string) {
+          wechatCalls.push(orderNo);
+          if (orderNo === terminal.order.orderNo) return null;
+          return {
+            orderNo,
+            channel: "wechat_h5" as const,
+            channelTransactionId: `wechat-recovered-${randomUUID()}`,
+            amountFen: recovered.order.amountFen,
+            currency: "CNY" as const,
+            paidAt: new Date(Date.now() - 2 * 60_000).toISOString(),
+            raw: { source: "multi-channel-wechat" }
+          };
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      const wechat = await reconcileAndCloseExpiredOrders({
+        provider: wechatProvider,
+        limit: 5,
+        providerQueryBudget: 5,
+        providerTimeoutMs: 100
+      });
+      expect(wechatCalls.sort()).toEqual(
+        [recovered.order.orderNo, terminal.order.orderNo].sort()
+      );
+      expect(wechat.summary).toMatchObject({
+        scannedCount: 2,
+        providerConfirmedPaidCount: 1,
+        deferredCount: 1,
+        terminalCount: 0,
+        scheduledRecoveryCount: 1,
+        closedRecovery: {
+          scannedCount: 2,
+          recoveredCount: 1,
+          retryScheduledCount: 1
+        }
+      });
+
+      let alipayCalls = 0;
+      const alipayProvider = {
+        channel: "alipay_wap" as const,
+        async createPayment() {
+          throw new Error("must not create");
+        },
+        async queryPayment(orderNo: string) {
+          alipayCalls += 1;
+          expect(orderNo).toBe(terminal.order.orderNo);
+          return {
+            orderNo,
+            channel: "alipay_wap" as const,
+            channelTransactionId: `alipay-terminal-${randomUUID()}`,
+            amountFen: terminal.order.amountFen,
+            currency: "CNY" as const,
+            paidAt: new Date().toISOString(),
+            raw: { source: "multi-channel-alipay" }
+          };
+        },
+        async refund() {
+          return { channelRefundId: "unused", raw: {} };
+        }
+      };
+      const alipay = await reconcileAndCloseExpiredOrders({
+        provider: alipayProvider,
+        limit: 5,
+        providerQueryBudget: 5,
+        providerTimeoutMs: 100
+      });
+      expect(alipayCalls).toBe(1);
+      expect(alipay.summary).toMatchObject({
+        scannedCount: 1,
+        providerConfirmedPaidCount: 0,
+        deferredCount: 0,
+        terminalCount: 1,
+        scheduledRecoveryCount: 0,
+        closedRecovery: {
+          scannedCount: 1,
+          terminalCount: 1,
+          terminalByReason: {
+            paymentAfterExpiry: 1
+          }
+        }
+      });
+
+      const persisted = await query<{
+        order_id: string;
+        channel: string;
+        reconciliation_state: string;
+      }>(
+        `SELECT order_id, channel, reconciliation_state
+         FROM payment_attempts
+         WHERE order_id = ANY($1::uuid[])
+         ORDER BY order_id, channel`,
+        [[recovered.order.id, terminal.order.id]]
+      );
+      expect(
+        new Map(
+          persisted.rows.map((row) => [
+            `${row.order_id}:${row.channel}`,
+            row.reconciliation_state
+          ])
+        )
+      ).toEqual(
+        new Map([
+          [
+            `${recovered.order.id}:wechat_h5`,
+            "RECOVERED"
+          ],
+          [
+            `${recovered.order.id}:alipay_wap`,
+            "TERMINAL"
+          ],
+          [
+            `${terminal.order.id}:wechat_h5`,
+            "RETRY_SCHEDULED"
+          ],
+          [
+            `${terminal.order.id}:alipay_wap`,
+            "TERMINAL"
+          ]
+        ])
+      );
     } finally {
       if (userId) await cleanupEntitlementTestUsers([userId]);
     }
@@ -3045,7 +4477,8 @@ describe("atomic commerce orders and payments", () => {
         expect(summary.scannedCount).toBe(
           summary.closedCount +
             summary.providerConfirmedPaidCount +
-            summary.deferredCount
+            summary.deferredCount +
+            summary.terminalCount
         );
       }
       if (outcomes[0].status === "rejected") {
@@ -3349,13 +4782,16 @@ describe("atomic commerce orders and payments", () => {
         closedCount: 1,
         providerConfirmedPaidCount: 0,
         deferredCount: 2,
+        terminalCount: 0,
         hasMore: true,
+        scheduledRecoveryCount: 0,
         deferredByReason: {
           providerQueryError: 2,
           paymentVerificationFailed: 0,
           closeCapacityExceeded: 0,
           unsafeOrChangedState: 0
-        }
+        },
+        closedRecovery: emptyClosedRecoverySummary()
       });
       expect(secondReconciliation.closedOrderIds).toEqual([
         unpaid.order.id
@@ -3365,13 +4801,16 @@ describe("atomic commerce orders and payments", () => {
         closedCount: 1,
         providerConfirmedPaidCount: 0,
         deferredCount: 1,
+        terminalCount: 0,
         hasMore: true,
+        scheduledRecoveryCount: 1,
         deferredByReason: {
           providerQueryError: 0,
           paymentVerificationFailed: 1,
           closeCapacityExceeded: 0,
           unsafeOrChangedState: 0
-        }
+        },
+        closedRecovery: emptyClosedRecoverySummary()
       });
       expect(queryCallsByRun).toEqual([
         [
@@ -3543,39 +4982,48 @@ describe("atomic commerce orders and payments", () => {
           closedCount: 1,
           providerConfirmedPaidCount: 0,
           deferredCount: 2,
+          terminalCount: 0,
           hasMore: true,
+          scheduledRecoveryCount: 1,
           deferredByReason: {
             providerQueryError: 0,
             paymentVerificationFailed: 0,
             closeCapacityExceeded: 2,
             unsafeOrChangedState: 0
-          }
+          },
+          closedRecovery: emptyClosedRecoverySummary()
         },
         {
           scannedCount: 2,
           closedCount: 1,
           providerConfirmedPaidCount: 0,
           deferredCount: 1,
+          terminalCount: 0,
           hasMore: true,
+          scheduledRecoveryCount: 2,
           deferredByReason: {
             providerQueryError: 0,
             paymentVerificationFailed: 0,
             closeCapacityExceeded: 1,
             unsafeOrChangedState: 0
-          }
+          },
+          closedRecovery: emptyClosedRecoverySummary()
         },
         {
           scannedCount: 1,
           closedCount: 1,
           providerConfirmedPaidCount: 0,
           deferredCount: 0,
+          terminalCount: 0,
           hasMore: false,
+          scheduledRecoveryCount: 3,
           deferredByReason: {
             providerQueryError: 0,
             paymentVerificationFailed: 0,
             closeCapacityExceeded: 0,
             unsafeOrChangedState: 0
-          }
+          },
+          closedRecovery: emptyClosedRecoverySummary()
         }
       ]);
       for (const reconciliation of reconciliations) {
@@ -3583,7 +5031,8 @@ describe("atomic commerce orders and payments", () => {
         expect(summary.scannedCount).toBe(
           summary.closedCount +
             summary.providerConfirmedPaidCount +
-            summary.deferredCount
+            summary.deferredCount +
+            summary.terminalCount
         );
       }
       expect(
@@ -3697,13 +5146,16 @@ describe("atomic commerce orders and payments", () => {
         closedCount: 1,
         providerConfirmedPaidCount: 1,
         deferredCount: 0,
+        terminalCount: 0,
         hasMore: true,
+        scheduledRecoveryCount: 0,
         deferredByReason: {
           providerQueryError: 0,
           paymentVerificationFailed: 0,
           closeCapacityExceeded: 0,
           unsafeOrChangedState: 0
-        }
+        },
+        closedRecovery: emptyClosedRecoverySummary()
       });
       const states = await query<{
         id: string;
@@ -4315,13 +5767,16 @@ describe("atomic commerce orders and payments", () => {
           closedCount: 1,
           providerConfirmedPaidCount: 0,
           deferredCount: 0,
+          terminalCount: 0,
           hasMore: false,
+          scheduledRecoveryCount: 0,
           deferredByReason: {
             providerQueryError: 0,
             paymentVerificationFailed: 0,
             closeCapacityExceeded: 0,
             unsafeOrChangedState: 0
-          }
+          },
+          closedRecovery: emptyClosedRecoverySummary()
         }
       });
       const audit = await query<{
@@ -4330,19 +5785,7 @@ describe("atomic commerce orders and payments", () => {
           limit: number;
           closedCount: number;
           closedOrderIds: string[];
-          reconciliation: {
-            scannedCount: number;
-            closedCount: number;
-            providerConfirmedPaidCount: number;
-            deferredCount: number;
-            hasMore: boolean;
-            deferredByReason: {
-              providerQueryError: number;
-              paymentVerificationFailed: number;
-              closeCapacityExceeded: number;
-              unsafeOrChangedState: number;
-            };
-          };
+          reconciliation: Record<string, unknown>;
         };
       }>(
         `SELECT action, detail
@@ -4363,13 +5806,16 @@ describe("atomic commerce orders and payments", () => {
               closedCount: 1,
               providerConfirmedPaidCount: 0,
               deferredCount: 0,
+              terminalCount: 0,
               hasMore: false,
+              scheduledRecoveryCount: 0,
               deferredByReason: {
                 providerQueryError: 0,
                 paymentVerificationFailed: 0,
                 closeCapacityExceeded: 0,
                 unsafeOrChangedState: 0
-              }
+              },
+              closedRecovery: emptyClosedRecoverySummary()
             }
           }
         }
