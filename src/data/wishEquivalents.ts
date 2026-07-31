@@ -98,7 +98,7 @@ const foodSeedsByCity: Record<CityKey, EquivalentSeed[]> = {
       name: "簋街胡大小龙虾",
       unitPrice: 200,
       unit: "顿",
-      text: "够你去簋街吃 `{count}` 顿小龙虾。以前老板扒我皮，现在我来扒虾皮。还要把手指嘬得震天响。",
+      text: "可以去簋街吃 `{count}` 顿小龙虾。以前老板扒我皮，现在我来扒虾皮。还要把手指嘬得震天响。",
       tier: "mid",
       tags: ["local_food", "hotpot"]
     }
@@ -336,15 +336,6 @@ const foodSeedsByCity: Record<CityKey, EquivalentSeed[]> = {
       text: "够你去肥肥虾庄吃 `{count}` 顿武汉小龙虾。这次不是公司剥你壳，是你剥虾壳。",
       tier: "mid",
       tags: ["local_food", "feast"]
-    },
-    {
-      id: "wh_liangdao_street",
-      name: "粮道街扫街",
-      unitPrice: 60,
-      unit: "轮",
-      text: "够你去粮道街扫街 `{count}` 轮。早餐再也不是赶时间的选择题，现在我全都要。",
-      tier: "low",
-      tags: ["local_food", "breakfast"]
     }
   ],
   chengdu: [
@@ -486,15 +477,6 @@ const foodSeedsByCity: Record<CityKey, EquivalentSeed[]> = {
       text: "够你吃 {count} 顿海底捞。以前像捞面一样被随意操纵的生活结束了！",
       tier: "mid",
       tags: ["hotpot", "feast"]
-    },
-    {
-      id: "other_buffet",
-      name: "高档自助餐",
-      unitPrice: 320,
-      unit: "顿",
-      text: "够你吃 {count} 顿高档自助。今天唯一 KPI：盘子别空。",
-      tier: "mid",
-      tags: ["buffet", "feast"]
     },
     {
       id: "huangmenji",
@@ -2377,10 +2359,10 @@ export const upgradeEquivalents = makeItems("self_upgrade", "装备升级", [
   },
   {
     id: "apple_studio_display",
-    name: "苹果 5K 视网膜显示器",
+    name: "苹果 5K 显示器",
     unitPrice: 12000,
     unit: "台",
-    text: "够你买 {count} 台苹果 5K 视网膜显示器。左边放网课，右边做练习，我的事业运能不能来一下。",
+    text: "够你买 {count} 台苹果 5K 显示器。左边放网课，右边做练习，我的事业运能不能来一下。",
     tier: "high",
     tags: ["monitor", "computer", "apple"]
   },
@@ -2480,7 +2462,7 @@ export const startupEquivalents = makeItems("be_your_own_boss", "自己当老板
   },
   {
     id: "independent_office",
-    name: "联合办公独立办公室",
+    name: "独立办公室",
     unitPrice: 10000,
     unit: "个月",
     text: "够你租 {count} 个月独立办公室。钥匙一拿，门口就差块“董事长办公室”的牌子了。",

@@ -1,4 +1,4 @@
-﻿import type { ReactNode } from "react";
+import type { ReactNode } from "react";
 import type { XiaoPeiAvatarState } from "../constants/xiaopeiAvatarStates";
 import { defaultXiaoPeiAvatarState } from "../constants/xiaopeiAvatarStates";
 import XiaoPeiAvatar from "./XiaoPeiAvatar";
@@ -14,7 +14,7 @@ export default function ChatBubble({ from, children, muted, avatarState }: ChatB
   return (
     <div className={`bubble-row ${from}`}>
       {from === "system" && (
-        <XiaoPeiAvatar state={avatarState || defaultXiaoPeiAvatarState} showName size={34} />
+        <XiaoPeiAvatar state={avatarState || defaultXiaoPeiAvatarState} size={46} />
       )}
       <div className={`chat-bubble ${from} ${muted ? "muted" : ""}`}>{children}</div>
     </div>

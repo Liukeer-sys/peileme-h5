@@ -44,3 +44,6 @@ export const getPersonaImageFile = (personaName: string) => {
 
 export const getPersonaImageSrc = (personaName: string) =>
   `/persona_images/${encodeURIComponent(getPersonaImageFile(personaName))}`;
+
+export const getPersonaStickerImageSrc = (personaName: string) =>
+  `/persona_images2/${encodeURIComponent(getPersonaImageFile(personaName))}`;

@@ -1,7 +1,9 @@
-﻿type OptionButtonsProps = {
+﻿import { useEffect, useRef, useState } from "react";
+
+type OptionButtonsProps = {
   options: string[];
   onChoose: (option: string) => void;
-  variant?: "default" | "wish" | "termination-root" | "contract-expired";
+  variant?: "default" | "city" | "bonus" | "work-schedule" | "wish" | "termination-root" | "forced-reason" | "dismiss-reason" | "no-fault-reason" | "contract-expired";
 };
 
 type StructuredOptionLabel = {
@@ -16,16 +18,48 @@ type WishOptionCopy = {
 };
 
 const terminationRootLabels: StructuredOptionLabel[] = [
-  { title: "自己提出辞职", legalType: "劳动合同解除", detail: "包括单位太恶毒，被迫辞职" },
-  { title: "单位要辞退我", legalType: "劳动合同解除", detail: "由单位提出解除劳动合同" },
-  { title: "劳动合同期满不续", legalType: "劳动合同终止", detail: "合同到期后不再续签" },
-  { title: "完全没有了", legalType: "劳动合同终止", detail: "公司遇到变故，呜呜呜" }
+  { title: "我自己想离职", legalType: "", detail: "单纯因为个人原因不干了" },
+  { title: "公司逼得我不得不走", legalType: "", detail: "比如公司欠薪、不交社保等，我只能被迫辞职" },
+  { title: "公司要我走", legalType: "", detail: "合同还没到期，公司就想提前让我离职" },
+  { title: "合同到期，不再续签", legalType: "", detail: "到期后，公司或我不准备继续签" },
+  { title: "公司完全没有了", legalType: "", detail: "比如公司破产、解散、注销，没法继续雇人了" }
+];
+
+const forcedReasonLabels: StructuredOptionLabel[] = [
+  { title: "工资被拖欠或克扣", legalType: "", detail: "该发的钱没按时、足额发给我" },
+  { title: "公司没依法给我交社保", legalType: "", detail: "该交的社保一直没给我交" },
+  { title: "工作条件没按约定提供", legalType: "", detail: "该有的工作条件、劳动保护，公司没给" },
+  { title: "公司制度违法，还坑到了我", legalType: "", detail: "违法的规定实际损害了我的权益" },
+  { title: "签劳动合同时被坑了", legalType: "", detail: "被骗、被逼着签，或者合同里有违法内容" },
+  { title: "公司威胁我，甚至限制我自由", legalType: "", detail: "暴力、威胁、不让我走，强迫我继续工作" },
+  { title: "公司逼我做危险的事", legalType: "", detail: "明知有危险，还强令我冒险作业" },
+  { title: "其他情况", legalType: "", detail: "上面都不太像，我自己描述" }
+];
+
+const companyDismissReasonLabels: StructuredOptionLabel[] = [
+  { title: "公司说是我的错", legalType: "", detail: "违纪、失职、试用不合格之类" },
+  { title: "我没犯错，但公司说没法继续用我", legalType: "", detail: "身体、能力或岗位变化等原因" },
+  { title: "公司要大规模裁员", legalType: "", detail: "裁员20人以上，或达到员工总数10%" }
+];
+
+const noFaultReasonLabels: StructuredOptionLabel[] = [
+  { title: "身体原因，实在干不了了", legalType: "", detail: "医疗期结束，原岗位和公司另安排的岗位都做不了" },
+  { title: "公司说我不能胜任工作", legalType: "", detail: "培训过或换过岗位，还是说我干不了" },
+  { title: "原来的工作条件变了，双方没谈拢", legalType: "", detail: "比如工作地点、业务等发生大变化，没谈拢新的安排" },
+  { title: "都不是，公司就是想赶我走", legalType: "", detail: "上面的情况都对不上，我认为公司是在找理由辞退" }
 ];
 
 const contractExpiredLabels: StructuredOptionLabel[] = [
   { title: "公司不续签", legalType: "通常参考 N", detail: "有眼无珠，不要续签我了" },
   { title: "我不续签", legalType: "通常无补偿", detail: "老娘（老子）不干了" },
   { title: "公司降低续签条件", legalType: "通常参考 N", detail: "原来的条件都不给，我不签了，我值得更好的" }
+];
+
+const workScheduleLabels = [
+  { title: "双休，很少加班", detail: "基本到点走人" },
+  { title: "双休，但不定期加班", detail: "工作日有时晚下班，周末偶有“临时需求”" },
+  { title: "大小周", detail: "隔周休一天" },
+  { title: "单休", detail: "每周仅休一天" }
 ];
 
 const getWishOptionCopy = (option: string, index: number): WishOptionCopy => {
@@ -42,67 +76,81 @@ const getWishOptionCopy = (option: string, index: number): WishOptionCopy => {
   return copies[index] || { title: option, detail: "离职之后，先把自己照顾好" };
 };
 
+const wishOptionImages = [
+  "/whattodo/1大吃.png",
+  "/whattodo/2出门玩.png",
+  "/whattodo/3宅家.png",
+  "/whattodo/4练出.png",
+  "/whattodo/5看世界.png",
+  "/whattodo/6升级.png",
+  "/whattodo/7喝酒.png",
+  "/whattodo/8当老板.png"
+];
+
 function WishOptionIcon({ index }: { index: number }) {
-  const commonProps = {
-    viewBox: "0 0 24 24",
-    fill: "none",
-    stroke: "currentColor",
-    strokeWidth: 1.8,
-    strokeLinecap: "round" as const,
-    strokeLinejoin: "round" as const,
-    "aria-hidden": true
-  };
-
-  switch (index) {
-    case 0:
-      return <svg {...commonProps}><path d="M4 11h16c-.5 4.4-3.4 7-8 7s-7.5-2.6-8-7Z"/><path d="M8 7c-1-1.2.8-2.1 0-3.3M12 7c-1-1.2.8-2.1 0-3.3M16 7c-1-1.2.8-2.1 0-3.3"/><path d="M7 20h10"/></svg>;
-    case 1:
-      return <svg {...commonProps}><path d="M4 7a2 2 0 0 0 2-2h12a2 2 0 0 0 2 2v3a2 2 0 0 0 0 4v3a2 2 0 0 0-2 2H6a2 2 0 0 0-2-2v-3a2 2 0 0 0 0-4V7Z"/><path d="M12 6v2M12 11v2M12 16v2"/><path d="m8.5 10 .6 1.2 1.4.2-1 .9.2 1.4-1.2-.7-1.2.7.2-1.4-1-.9 1.4-.2.6-1.2Z"/></svg>;
-    case 2:
-      return <svg {...commonProps}><rect x="3" y="5" width="18" height="13" rx="2"/><path d="m10 9 5 2.5-5 2.5V9ZM8 21h8M12 18v3"/></svg>;
-    case 3:
-      return <svg {...commonProps}><path d="M7 8v8M4 10v4M17 8v8M20 10v4M7 12h10M2 11v2M22 11v2"/></svg>;
-    case 4:
-      return <svg {...commonProps}><circle cx="17" cy="6" r="2.5"/><path d="M3 16c2-1.7 4-1.7 6 0s4 1.7 6 0 4-1.7 6 0M3 20c2-1.7 4-1.7 6 0s4 1.7 6 0 4-1.7 6 0"/><path d="M8 13c.3-4 1.8-6.8 4.5-8M10 8c-1.8-1.2-3.5-1.2-5 0M11 6c1.7-1.5 3.4-1.7 5-.7"/></svg>;
-    case 5:
-      return <svg {...commonProps}><path d="m12 3 1.4 4.6L18 9l-4.6 1.4L12 15l-1.4-4.6L6 9l4.6-1.4L12 3Z"/><path d="m18.5 14 .8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2ZM5 14l.6 1.5L7 16l-1.4.5L5 18l-.6-1.5L3 16l1.4-.5L5 14Z"/></svg>;
-    case 6:
-      return <svg {...commonProps}><path d="M5 4h14l-6 7v7M9 20h8"/><path d="M7 7h10"/><path d="M17 3v3M15.5 4.5h3"/></svg>;
-    default:
-      return <svg {...commonProps}><path d="M14 4c2.7-1.4 5-1.5 6-1-0.1 2.5-1.3 5.4-3.7 7.8l-4.2 4.2-4.8-4.8L11.5 6c.8-.8 1.6-1.4 2.5-2Z"/><circle cx="15.5" cy="7.5" r="1.5"/><path d="M8.5 12.5 5 13l-2 2 5.2.8M11.5 15.5 11 19l-2 2-.8-5.2M5 19c.5-1.7 1.5-2.7 3-3"/></svg>;
-  }
+  return <img src={wishOptionImages[index]} alt="" aria-hidden="true" />;
 }
-
 export default function OptionButtons({ options, onChoose, variant = "default" }: OptionButtonsProps) {
-  const isStructuredTermination = variant === "termination-root" || variant === "contract-expired";
-  const structuredLabels = variant === "contract-expired" ? contractExpiredLabels : terminationRootLabels;
+  const [selectedOption, setSelectedOption] = useState<string | null>(null);
+  const selectionTimerRef = useRef<number | null>(null);
+  const isStructuredTermination = variant === "termination-root" || variant === "forced-reason" || variant === "dismiss-reason" || variant === "no-fault-reason" || variant === "contract-expired";
+  const structuredLabels = variant === "contract-expired" ? contractExpiredLabels : variant === "forced-reason" ? forcedReasonLabels : variant === "dismiss-reason" ? companyDismissReasonLabels : variant === "no-fault-reason" ? noFaultReasonLabels : terminationRootLabels;
   const gridClassName =
-    variant === "wish"
-      ? "option-grid wish-option-grid"
-      : variant === "termination-root"
+    variant === "city"
+      ? "option-grid city-option-grid"
+      : variant === "bonus"
+        ? "option-grid bonus-option-grid"
+      : variant === "work-schedule"
+        ? "option-grid work-schedule-option-grid"
+      : variant === "wish"
+        ? "option-grid wish-option-grid"
+      : (variant === "termination-root" || variant === "forced-reason" || variant === "dismiss-reason" || variant === "no-fault-reason")
         ? "option-grid termination-root-option-grid"
         : variant === "contract-expired"
           ? "option-grid contract-expired-option-grid"
           : "option-grid";
 
-  return (
+  useEffect(
+    () => () => {
+      if (selectionTimerRef.current !== null) window.clearTimeout(selectionTimerRef.current);
+    },
+    []
+  );
+
+  const chooseOption = (option: string) => {
+    if (selectedOption) return;
+    setSelectedOption(option);
+    selectionTimerRef.current = window.setTimeout(() => onChoose(option), 180);
+  };
+
+  const optionGrid = (
     <div className={gridClassName}>
       {options.map((option, index) => {
         const wishCopy = variant === "wish" ? getWishOptionCopy(option, index) : undefined;
+        const isSelectedOption = selectedOption === option;
+
         return (
           <button
             key={option}
             className={
-              variant === "wish"
-                ? "option-button wish-option-button"
-                : variant === "termination-root"
-                  ? "option-button termination-root-option"
+              variant === "city"
+                ? `option-button city-option-button${isSelectedOption ? " is-selected" : ""}`
+                : variant === "bonus"
+                  ? `option-button city-option-button bonus-option-button${isSelectedOption ? " is-selected" : ""}`
+                : variant === "work-schedule"
+                  ? `option-button work-schedule-option-button work-schedule-option-${index + 1}${isSelectedOption ? " is-selected" : ""}`
+                : variant === "wish"
+                  ? `option-button wish-option-button${isSelectedOption ? " is-selected" : ""}`
+                : (variant === "termination-root" || variant === "forced-reason" || variant === "dismiss-reason" || variant === "no-fault-reason")
+                  ? `option-button termination-root-option${isSelectedOption ? " is-selected" : ""}`
                   : variant === "contract-expired"
-                    ? "option-button termination-root-option contract-expired-option"
-                    : "option-button"
+                    ? `option-button termination-root-option contract-expired-option${isSelectedOption ? " is-selected" : ""}`
+                    : `option-button city-option-button standard-option-button${isSelectedOption ? " is-selected" : ""}`
             }
             type="button"
-            onClick={() => onChoose(option)}
+            disabled={selectedOption !== null}
+            aria-pressed={isSelectedOption}
+            onClick={() => chooseOption(option)}
           >
             {wishCopy && (
               <>
@@ -113,23 +161,84 @@ export default function OptionButtons({ options, onChoose, variant = "default" }
                 </span>
               </>
             )}
+            {variant === "work-schedule" && (
+              <>
+                <span className="work-schedule-copy">
+                  <strong>{workScheduleLabels[index]?.title || option}</strong>
+                  <small>{workScheduleLabels[index]?.detail}</small>
+                </span>
+              </>
+            )}
             {isStructuredTermination ? (
               <>
-                <span className="termination-legal-type">{structuredLabels[index]?.legalType || "离职情形"}</span>
+                {structuredLabels[index]?.legalType && (
+                  <span className="termination-legal-type">{structuredLabels[index].legalType}</span>
+                )}
                 <strong>{structuredLabels[index]?.title || option}</strong>
                 <small>{structuredLabels[index]?.detail}</small>
               </>
-            ) : variant !== "wish" ? (
-              <span>{option}</span>
+            ) : variant !== "wish" && variant !== "work-schedule" ? (
+              <span>
+                {option}
+                {variant === "city" && option === "其他城市" && <span className="city-option-chevron">›</span>}
+              </span>
             ) : null}
+            {isSelectedOption && (
+              <span className="option-selected-check">✓</span>
+            )}
           </button>
         );
       })}
     </div>
   );
+
+  if (variant === "city") {
+    return (
+      <div className="city-picker">
+        <div className="city-picker-heading">
+          <strong>选择工作城市</strong>
+          <small>用于匹配当地工资与社保口径</small>
+        </div>
+        {optionGrid}
+      </div>
+    );
+  }
+
+  if (variant === "work-schedule") {
+    return (
+      <div className="work-schedule-picker">
+        <div className="city-picker-heading">
+          <strong>选择工作节奏</strong>
+          <small>不用特别精确，按长期工作状态判断</small>
+        </div>
+        {optionGrid}
+      </div>
+    );
+  }
+
+  if (variant === "bonus") {
+    return (
+      <div className="city-picker bonus-picker">
+        <div className="city-picker-heading">
+          <strong>选择年终奖情况</strong>
+          <small>按过去一年实际发放情况选择</small>
+        </div>
+        {optionGrid}
+      </div>
+    );
+  }
+
+  if (variant !== "default" && variant !== "forced-reason" && variant !== "dismiss-reason" && variant !== "no-fault-reason") return optionGrid;
+
+  return (
+    <div className="city-picker standard-option-picker">
+      <div className="city-picker-heading">
+        <strong>选择具体情况</strong>
+        <small>按实际情况选择最接近的一项</small>
+      </div>
+      {optionGrid}
+    </div>
+  );
 }
-
-
-
 
 

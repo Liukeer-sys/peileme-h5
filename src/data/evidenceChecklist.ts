@@ -1,4 +1,4 @@
-﻿import type { Answers } from "../types";
+import type { Answers } from "../types";
 import type { CalculationResult } from "../utils/calculate";
 
 export type EvidencePriority = "required" | "recommended" | "optional";
@@ -112,6 +112,7 @@ const reasonEvidenceMap: Record<string, EvidenceConfig> = {
   ])]),
   forced_other_reason: config(["其他原因是否属于公司违法、违约或严重过错", "你是否因此被迫提出解除劳动合同"], "你选的是其他原因，证据包会更通用。重点把公司做了什么、你为什么因此离职串起来。", [forcedCommon])
 };
+reasonEvidenceMap.forced_dangerous_work = reasonEvidenceMap.forced_violence_or_restriction;
 
 const noFaultCommon = section("nofault_common", "无过失辞退共同证据", "判断公司能否按无过失辞退解除，以及有没有提前 30 天。", [
   item("nofault_dismiss_notice", "无过失辞退通知", "required", "证明公司以医疗期满、不能胜任或客观情况变化为由解除。", ["解除通知", "HR 聊天记录", "邮件", "会议纪要"]),

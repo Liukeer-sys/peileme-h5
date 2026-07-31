@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import ChatBubble from "./components/ChatBubble";
 import OptionButtons from "./components/OptionButtons";
 import PaidUpsellCard, { PaidNextStepCard, SelectedReasonCard } from "./components/PaidUpsellCard";
@@ -20,7 +20,7 @@ import {
   parseLooseMonth,
   parseMoneyAmount,
 } from "./utils/chatFlow";
-import { calculateCompensation, currentMonthValue } from "./utils/calculate";
+import { calculateCompensation } from "./utils/calculate";
 import { clearAnswers, loadAnswers, saveAnswers } from "./utils/storage";
 
 type ChatMessage = {
@@ -46,7 +46,6 @@ const formatTerminationResultSuffix = (mode: string) => {
 
 
 const initialAnswers: Answers = {
-  endMonth: currentMonthValue(),
   followUps: {}
 };
 
@@ -124,7 +123,7 @@ export default function App() {
         {
           id: "hello",
           from: "system",
-          text: "你好，我是赔了么。先不讲大道理，咱们把你的离职身价粗算一下，枪口只对公司。",
+          text: "你好，我是小赔。咱们来把你的离职身价粗算一下。",
           avatarState: xiaoPeiAvatarStateByMessageIntent.welcome
         },
         { id: `q-${baseQuestions[0].id}`, from: "system", text: baseQuestions[0].message, avatarState: xiaoPeiAvatarStateByMessageIntent.question }
@@ -141,12 +140,12 @@ export default function App() {
   }, [messages, mode, loadingIndex, optionsPaused, stepIndex, terminationNodeId]);
 
   useEffect(() => {
-    if (currentQuestion?.id === "endDate") {
-      setTextValue(answers.endMonth || currentMonthValue());
+    if (currentQuestion?.kind === "month") {
+      setTextValue(currentQuestion.id === "startDate" ? answers.startMonth || "" : answers.endMonth || "");
       return;
     }
-    if (currentQuestion?.kind !== "month") setTextValue("");
-  }, [answers.endMonth, currentQuestion?.id, currentQuestion?.kind]);
+    setTextValue("");
+  }, [answers.endMonth, answers.startMonth, currentQuestion?.id, currentQuestion?.kind]);
 
   useEffect(() => {
     if (mode !== "loading") return;
@@ -182,7 +181,7 @@ export default function App() {
       const parsed = parseLooseMonth(value);
       next.endDate = value;
       next.endDateParsed = parsed.month;
-      next.endMonth = parsed.month || currentMonthValue();
+      next.endMonth = parsed.month;
     }
 
     if (questionId === "workSchedule") {
@@ -319,7 +318,9 @@ export default function App() {
       hasWrittenNotice: node.id.includes("30_DAYS") ? value === "是" : answers.hasWrittenNotice
     };
 
-    const leafReply = `${option.leaf.reply}${formatTerminationResultSuffix(option.leaf.resultMode)}`;
+    const leafReply = `${option.leaf.reply}${
+      option.leaf.showResultSuffix === false ? "" : formatTerminationResultSuffix(option.leaf.resultMode)
+    }`;
 
     setAnswers(leafAnswers);
     setTerminationConclusionReady(false);
@@ -383,6 +384,22 @@ export default function App() {
     appendMessages({ id: `a-custom-city-${Date.now()}`, from: "user", text: value });
     continueToNextQuestion(getReply("roast", "city", value, nextAnswers), 1);
   };
+
+  const cancelCustomCity = () => {
+    clearMessageTimers();
+    setAnswers({ ...answers, city: undefined, customCity: undefined });
+    setAwaitingCustomCity(false);
+    setTextValue("");
+    setMessages((previous) =>
+      previous.filter(
+        (message) =>
+          !message.id.startsWith("a-city-") &&
+          !message.id.startsWith("q-custom-city-") &&
+          !message.id.startsWith("typing-q-custom-city-")
+      )
+    );
+  };
+
   const handleBaseAnswer = (rawValue: string | number) => {
     if (!currentQuestion) return;
     const value = String(rawValue).trim();
@@ -457,7 +474,7 @@ export default function App() {
     setMessages([]);
     setOptionsPaused(true);
     appendMessagesSequentially(
-      { id: "hello-restart", from: "system", text: "好，重新来一遍。这次我们把账算得更顺一点。", avatarState: "smirk" },
+      { id: "hello-restart", from: "system", text: "好，重新来一遍。这次我们把牛马身价算得更准一点。", avatarState: "smirk" },
       { id: `q-${baseQuestions[0].id}-restart`, from: "system", text: baseQuestions[0].message, avatarState: xiaoPeiAvatarStateByMessageIntent.question }
     );
     setStepIndex(0);
@@ -523,6 +540,7 @@ export default function App() {
             <span className="brand-dot" />
             <strong>赔了么</strong>
           </div>
+          {mode !== "result" && <span className="chat-partner">小赔</span>}
           <button className="mini-button" type="button" onClick={restart}>
             重算
           </button>
@@ -563,11 +581,23 @@ export default function App() {
                 options={displayedOptions || currentQuestion.options}
                 onChoose={handleBaseAnswer}
                 variant={
-                  currentQuestion.id === "postExitWish"
-                    ? "wish"
+                  currentQuestion.id === "city"
+                    ? "city"
+                    : currentQuestion.id === "bonusInfo"
+                      ? "bonus"
+                    : currentQuestion.id === "workSchedule"
+                      ? "work-schedule"
+                    : currentQuestion.id === "postExitWish"
+                      ? "wish"
                     : currentQuestion.id === "terminationReason" && terminationNodeId === rootTerminationReasonNode.id
                       ? "termination-root"
-                      : currentQuestion.id === "terminationReason" && terminationNodeId === "CONTRACT_EXPIRED_CHECK"
+                      : currentQuestion.id === "terminationReason" && terminationNodeId === "SELF_RESIGN_REASON"
+                      ? "forced-reason"
+                    : currentQuestion.id === "terminationReason" && terminationNodeId === "COMPANY_DISMISS_REASON"
+                      ? "dismiss-reason"
+                    : currentQuestion.id === "terminationReason" && terminationNodeId === "NO_FAULT_DISMISS_CHECK"
+                      ? "no-fault-reason"
+                    : currentQuestion.id === "terminationReason" && terminationNodeId === "CONTRACT_EXPIRED_CHECK"
                         ? "contract-expired"
                         : "default"
                 }
@@ -580,30 +610,60 @@ export default function App() {
               </button>
             )}
 
-            {showInput && (
-              <div className="input-row">
-                <input
-                  value={textValue}
-                  type={currentQuestion?.kind === "month" ? "month" : "text"}
-                  inputMode={currentQuestion?.id === "avgMonthlySalary" ? "numeric" : "text"}
-                  placeholder={
-                    awaitingTerminationDetail
-                      ? pendingTerminationDetailLeaf
-                        ? "简单写一下原因"
-                        : "例如 有微信通知，还没签协议"
-                      : needsCustomCity
-                        ? "例如 苏州"
-                        : currentQuestion?.placeholder || "写在这里"
-                  }
-                  onChange={(event) => setTextValue(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") submitText();
-                  }}
-                />
-                <button type="button" onClick={submitText}>
-                  发送
+            {needsCustomCity && showInput && (
+              <div className="custom-city-picker">
+                <div className="city-picker-heading">
+                  <strong>输入工作城市</strong>
+                  <small>用于匹配当地工资与社保口径</small>
+                </div>
+                <div className="input-row custom-city-input-row">
+                  <input
+                    autoFocus
+                    value={textValue}
+                    type="text"
+                    placeholder="例如：苏州"
+                    onChange={(event) => setTextValue(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") submitText();
+                    }}
+                  />
+                  <button type="button" onClick={submitText}>
+                    确认
+                  </button>
+                </div>
+                <button className="city-picker-back" type="button" onClick={cancelCustomCity}>
+                  ‹ 返回选择热门城市
                 </button>
               </div>
+            )}
+
+            {showInput && !needsCustomCity && (
+              <>
+                {currentQuestion?.kind === "month" && <small className="date-input-hint">点击下方选择日期</small>}
+                <div className="input-row">
+                  <input
+                    value={textValue}
+                    type={currentQuestion?.kind === "month" ? "month" : "text"}
+                    inputMode={currentQuestion?.id === "avgMonthlySalary" ? "numeric" : "text"}
+                    placeholder={
+                      awaitingTerminationDetail
+                        ? pendingTerminationDetailLeaf
+                          ? "简单写一下原因"
+                          : "例如 有微信通知，还没签协议"
+                        : needsCustomCity
+                          ? "例如 苏州"
+                          : currentQuestion?.placeholder || "写在这里"
+                    }
+                    onChange={(event) => setTextValue(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") submitText();
+                    }}
+                  />
+                  <button className="send-button" type="button" onClick={submitText}>
+                    发送
+                  </button>
+                </div>
+              </>
             )}
           </footer>
         )}
@@ -633,57 +693,5 @@ export default function App() {
     </main>
   );
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 

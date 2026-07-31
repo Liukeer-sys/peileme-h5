@@ -1,8 +1,9 @@
-import type { CSSProperties } from "react";
+﻿import type { CSSProperties } from "react";
 import { useEffect, useMemo, useState } from "react";
-import { EquivalentIcon, getGeneratedIconSrc } from "./ResultCard";
+import { EquivalentIcon } from "./ResultCard";
+import { getEquivalentIconSrc } from "../data/equivalentIconMap";
 import type { CalculationResult } from "../utils/calculate";
-import { getPersonaImageSrc, getPersonaPunchline } from "../utils/persona";
+import { getPersonaPunchline, getPersonaStickerImageSrc } from "../utils/persona";
 import { createQrDataUrl, getShareUrl } from "../utils/shareQr";
 
 type StickerCardProps = {
@@ -23,8 +24,8 @@ const pileOffsets = [
 const getPileStyle = (index: number): CSSProperties => {
   const offset = pileOffsets[index] || pileOffsets[pileOffsets.length - 1];
   return {
-    left: `${12 + offset.x}px`,
-    top: `${4 + offset.y}px`,
+    left: `${8 + offset.x}px`,
+    top: `${6 + offset.y}px`,
     zIndex: 30 - index,
     transform: `rotate(${offset.r}deg)`
   };
@@ -123,7 +124,7 @@ export default function StickerCard({ result, equivalentId, onClose }: StickerCa
   const pileCount = featuredEquivalent ? Math.min(maxVisiblePile, equivalentCount) : 0;
   const punchline = getPersonaPunchline(result.levelCopy);
   const personaNameFontSize = result.level.length > 16 ? 15 : result.level.length > 12 ? 17 : result.level.length > 8 ? 19 : 22;
-  const personaImageSrc = getPersonaImageSrc(result.level);
+  const personaImageSrc = getPersonaStickerImageSrc(result.level);
   const shareUrl = useMemo(getShareUrl, []);
 
   useEffect(() => {
@@ -149,9 +150,9 @@ export default function StickerCard({ result, equivalentId, onClose }: StickerCa
       if (!ctx) return;
 
       const bg = ctx.createLinearGradient(0, 0, width, height);
-      bg.addColorStop(0, "#d9ccef");
-      bg.addColorStop(0.48, "#fff0c5");
-      bg.addColorStop(1, "#d7ecdc");
+      bg.addColorStop(0, "#d8c6a3");
+      bg.addColorStop(0.48, "#ead6aa");
+      bg.addColorStop(1, "#efe4c9");
       ctx.fillStyle = bg;
       ctx.fillRect(0, 0, width, height);
 
@@ -163,43 +164,35 @@ export default function StickerCard({ result, equivalentId, onClose }: StickerCa
       ctx.arc(110, 1220, 180, 0, Math.PI * 2);
       ctx.fill();
 
-      const hero = { x: 54, y: 54, width: 972, height: 1050, radius: 54 };
+      const hero = { x: 70, y: 54, width: 940, height: 1075, radius: 54 };
       ctx.save();
       roundRect(ctx, hero.x, hero.y, hero.width, hero.height, hero.radius);
       ctx.clip();
-      ctx.fillStyle = "#dcd2e8";
+      ctx.fillStyle = "#e3d6bd";
       ctx.fillRect(hero.x, hero.y, hero.width, hero.height);
       try {
         const personaImage = await loadImage(personaImageSrc);
-        drawCoverImage(ctx, personaImage, hero.x - 64, hero.y - 64, hero.width + 128, hero.height + 128, 0.49);
+        drawCoverImage(ctx, personaImage, hero.x - 28, hero.y, hero.width + 56, hero.height, 0.54);
       } catch {
         const fallback = ctx.createLinearGradient(hero.x, hero.y, hero.x + hero.width, hero.y + hero.height);
-        fallback.addColorStop(0, "#d9ccef");
-        fallback.addColorStop(0.55, "#f6e6bd");
-        fallback.addColorStop(1, "#cfe7d2");
+        fallback.addColorStop(0, "#d8c6a3");
+        fallback.addColorStop(0.55, "#e4cfaa");
+        fallback.addColorStop(1, "#eadfc5");
         ctx.fillStyle = fallback;
         ctx.fillRect(hero.x, hero.y, hero.width, hero.height);
       }
 
       const scrim = ctx.createLinearGradient(0, hero.y + 650, 0, hero.y + hero.height);
       scrim.addColorStop(0, "rgba(24,19,29,0)");
-      scrim.addColorStop(0.34, "rgba(24,19,29,0.58)");
-      scrim.addColorStop(1, "rgba(24,19,29,0.94)");
+      scrim.addColorStop(0.38, "rgba(24,19,29,0.38)");
+      scrim.addColorStop(1, "rgba(24,19,29,0.72)");
       ctx.fillStyle = scrim;
-      ctx.fillRect(hero.x, hero.y + 620, hero.width, 430);
+      ctx.fillRect(hero.x, hero.y + 620, hero.width, hero.height - 620);
       ctx.restore();
-
-      ctx.fillStyle = "rgba(33,27,39,0.72)";
-      roundRect(ctx, 92, 90, 236, 64, 32);
-      ctx.fill();
-      ctx.fillStyle = "#ffffff";
-      ctx.textAlign = "center";
-      ctx.font = "900 30px 'Microsoft YaHei', sans-serif";
-      ctx.fillText("赔了么 · 身份图鉴", 210, 132);
 
       ctx.textAlign = "left";
       ctx.fillStyle = "rgba(255,255,255,0.74)";
-      ctx.font = "800 25px 'Microsoft YaHei', sans-serif";
+      ctx.font = "800 32px 'Microsoft YaHei', sans-serif";
       ctx.fillText("你的牛马身份", 96, 850);
       ctx.fillStyle = "#ffffff";
       let levelFontSize = 58;
@@ -210,32 +203,29 @@ export default function StickerCard({ result, equivalentId, onClose }: StickerCa
       }
       ctx.fillText(result.level, 96, 914);
 
-      ctx.fillStyle = "rgba(255,253,248,0.94)";
-      roundRect(ctx, 88, 946, 904, 122, 30);
-      ctx.fill();
-      ctx.fillStyle = "#2b2531";
+      ctx.fillStyle = "#ffffff";
       ctx.font = "900 29px 'Microsoft YaHei', sans-serif";
-      const punchlineLines = getWrappedLines(ctx, punchline, 824, 2);
-      const punchlineStartY = 1001 - ((punchlineLines.length - 1) * 20);
-      punchlineLines.forEach((line, index) => ctx.fillText(line, 128, punchlineStartY + index * 40));
+      const punchlineLines = getWrappedLines(ctx, punchline, 880, 2);
+      const punchlineStartY = 986 - ((punchlineLines.length - 1) * 20);
+      punchlineLines.forEach((line, index) => ctx.fillText(line, 96, punchlineStartY + index * 40));
 
       ctx.textAlign = "left";
-      ctx.fillStyle = "#716477";
-      ctx.font = "850 25px 'Microsoft YaHei', sans-serif";
-      ctx.fillText("你的牛马身价约等于", 74, 1170);
-      ctx.fillStyle = "#2c2731";
-      ctx.font = "950 62px 'Microsoft YaHei', sans-serif";
-      ctx.fillText(`${featuredEquivalent.count}${featuredEquivalent.unit}`, 74, 1242);
-      ctx.font = "900 28px 'Microsoft YaHei', sans-serif";
-      drawWrappedText(ctx, featuredEquivalent.name, 74, 1292, 300, 36, 2);
+      ctx.fillStyle = "#6d7785";
+      ctx.font = "850 32px 'Microsoft YaHei', sans-serif";
+      ctx.fillText("你的牛马身价约等于", 74, 1164);
+      ctx.fillStyle = "#29384d";
+      ctx.font = "950 80px 'Microsoft YaHei', sans-serif";
+      ctx.fillText(`${featuredEquivalent.count}${featuredEquivalent.unit}`, 74, 1250);
+      ctx.font = "900 34px 'Microsoft YaHei', sans-serif";
+      drawWrappedText(ctx, featuredEquivalent.name, 74, 1302, 330, 42, 2);
 
-      const iconSrc = getGeneratedIconSrc(featuredEquivalent.id);
+      const iconSrc = getEquivalentIconSrc(featuredEquivalent.id, featuredEquivalent.name);
       if (iconSrc) {
         try {
           const image = await loadImage(iconSrc);
-          const iconSize = 160;
-          const baseX = 356;
-          const baseY = 1164;
+          const iconSize = 310;
+          const baseX = 330;
+          const baseY = 1098;
           for (let index = pileCount - 1; index >= 0; index -= 1) {
             const offset = pileOffsets[index] || pileOffsets[pileOffsets.length - 1];
             ctx.save();
@@ -253,19 +243,19 @@ export default function StickerCard({ result, equivalentId, onClose }: StickerCa
       }
       if (equivalentCount > maxVisiblePile) {
         ctx.fillStyle = "rgba(47,41,54,0.9)";
-        roundRect(ctx, 438, 1286, 94, 48, 24);
+        roundRect(ctx, 564, 1302, 114, 56, 28);
         ctx.fill();
         ctx.fillStyle = "#ffffff";
         ctx.textAlign = "center";
-        ctx.font = "900 24px 'Microsoft YaHei', sans-serif";
-        ctx.fillText(`×${featuredEquivalent.count}`, 485, 1318);
+        ctx.font = "900 27px 'Microsoft YaHei', sans-serif";
+        ctx.fillText(`×${featuredEquivalent.count}`, 621, 1339);
       }
 
       const finalQrDataUrl = qrDataUrl || await createQrDataUrl(shareUrl, 8);
       const qrImage = await loadImage(finalQrDataUrl);
       ctx.drawImage(qrImage, 810, 1148, 154, 154);
       ctx.textAlign = "center";
-      ctx.fillStyle = "#2c2731";
+      ctx.fillStyle = "#29384d";
       ctx.font = "900 25px 'Microsoft YaHei', sans-serif";
       ctx.fillText("扫码测测", 887, 1340);
       ctx.font = "900 22px 'Microsoft YaHei', sans-serif";
@@ -291,7 +281,6 @@ export default function StickerCard({ result, equivalentId, onClose }: StickerCa
           <section className="sticker-persona">
             <div className="sticker-persona-art">
               <img className="sticker-persona-image" src={personaImageSrc} alt={result.level} />
-              <div className="sticker-brand">赔了么 · 身份图鉴</div>
             </div>
             <div className="sticker-persona-copy">
               <span>你的牛马身份</span>

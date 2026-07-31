@@ -3,6 +3,7 @@ import { motion, useMotionValue, useSpring, useTransform } from "motion/react";
 import type { CalculationResult } from "../utils/calculate";
 import { formatMoney } from "../utils/calculate";
 import { getPersonaImageSrc, splitPersonaCopy } from "../utils/persona";
+import { getEquivalentIconSrc } from "../data/equivalentIconMap";
 
 type ResultCardProps = {
   result: CalculationResult;
@@ -207,36 +208,20 @@ const getIconGroup = (category: string) => {
 };
 
 const paletteMap: Record<string, string[]> = {
-  food: ["#FFF7E5", "#F7D9A8", "#DDAA72", "#8B6A52"],
-  drink: ["#FFF4DD", "#EECFA3", "#B98B6F", "#6F594E"],
-  tech: ["#F4F0FF", "#D7CFF0", "#8B81B7", "#4F4658"],
-  home: ["#F8F4EA", "#D9E9D7", "#A9CBAE", "#55735C"],
-  travel: ["#FFF6D8", "#D9EAF4", "#93B8C8", "#596B78"],
-  car: ["#F5F2EA", "#DDEBE2", "#BFD8CA", "#526C61"],
-  gold: ["#FFF2C7", "#E8C86E", "#B99033", "#6E5428"],
-  health: ["#FFF5F6", "#E9D6E8", "#C7A9C9", "#65546A"]
-};
-
-export const generatedIconMap: Record<string, string> = {
-  "luckin-99": "coffee.png",
-  huangmenji: "huangmenji.png",
-  "bar-cocktail": "cocktail.png",
-  "office-chair-pro": "chair.png",
-  "health-check": "check.png",
-  "island-trip": "island.png",
-  "gold-50g": "go;d.png",
-  "byd-seagull-basic": "byd.png"
-};
-
-export const getGeneratedIconSrc = (id: string) => {
-  const generatedIcon = generatedIconMap[id];
-  return generatedIcon ? `/equivalent-icons/generated/${generatedIcon}` : null;
+  food: ["#fff8ea", "#e8d3ad", "#c8a46b", "#785f42"],
+  drink: ["#fff4df", "#e3c89e", "#b88d5b", "#66513f"],
+  tech: ["#eef1f4", "#c7cfd8", "#6d7c90", "#3d4f6b"],
+  home: ["#f7f0e2", "#e6d7bc", "#b9a074", "#6e5a3d"],
+  travel: ["#f4f1e9", "#d8dee3", "#8796a8", "#4e6077"],
+  car: ["#f5f0e6", "#dfd5c3", "#a99779", "#596679"],
+  gold: ["#fff1cf", "#d8b871", "#b08a57", "#705633"],
+  health: ["#f7eee0", "#e5d2b5", "#c19b68", "#755a3f"]
 };
 
 export function EquivalentIcon({ id, category, name }: { id: string; category: string; name: string }) {
-  const generatedIconSrc = getGeneratedIconSrc(id);
-  if (generatedIconSrc) {
-    return <img src={generatedIconSrc} alt={name} />;
+  const equivalentIconSrc = getEquivalentIconSrc(id, name);
+  if (equivalentIconSrc) {
+    return <img src={equivalentIconSrc} alt={name} />;
   }
 
   const group = getIconGroup(category);
@@ -312,7 +297,7 @@ export function EquivalentIcon({ id, category, name }: { id: string; category: s
       <defs>
         <linearGradient id={`${gradientId}-bg`} x1="0" y1="0" x2="1" y2="1">
           <stop offset="0" stopColor={soft} />
-          <stop offset="1" stopColor="#f5eefa" />
+          <stop offset="1" stopColor="#efe4c9" />
         </linearGradient>
         <linearGradient id={`${gradientId}-body`} x1="0" y1="0" x2="1" y2="1">
           <stop offset="0" stopColor="#ffffff" stopOpacity=".9" />
@@ -320,7 +305,7 @@ export function EquivalentIcon({ id, category, name }: { id: string; category: s
           <stop offset="1" stopColor={deep} />
         </linearGradient>
         <filter id={`${gradientId}-shadow`} x="-20%" y="-20%" width="140%" height="150%">
-          <feDropShadow dx="0" dy="8" stdDeviation="8" floodColor="#4A4154" floodOpacity=".16" />
+          <feDropShadow dx="0" dy="8" stdDeviation="8" floodColor="#3d4f6b" floodOpacity=".16" />
         </filter>
       </defs>
       {common}
@@ -499,20 +484,5 @@ export default function ResultCard({ result, onSticker, postExitWish, onReselect
     </section>
   );
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 

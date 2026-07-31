@@ -15,18 +15,18 @@ export const cityOptions = ["上海", "北京", "深圳", "广州", "杭州", "�
 export const baseQuestions: BaseQuestion[] = [
   {
     id: "city",
-    message: "你在哪个城市工作？比如上海、北京、深圳。",
+    message: "你在哪座城市工作？",
     kind: "options",
     options: cityOptions
   },
   {
     id: "startDate",
-    message: "那你是什么时候入职的？选个大概年月就行。",
+    message: "那你是什么时候入职的？",
     kind: "month"
   },
   {
     id: "endDate",
-    message: "公司通知你什么时候离职呢？选个大概年月就行。",
+    message: "公司通知你什么时候离职呢？",
     kind: "month"
   },
   {
@@ -35,11 +35,9 @@ export const baseQuestions: BaseQuestion[] = [
     kind: "options",
     options: [
       "基本双休，很少加班",
-      "双休，但工作日经常晚下班",
+      "双休，但不定期加班",
       "大小周",
-      "单休，但每天工时还算正常",
-      "长期高强度加班（如 996）",
-      "工作时间不固定，经常临时加班"
+      "单休"
     ]
   },
   {
@@ -52,7 +50,7 @@ export const baseQuestions: BaseQuestion[] = [
     id: "bonusInfo",
     message: "过去一年有没有年终奖、季度奖、绩效奖金之类的？大概多少？",
     kind: "options",
-    options: ["没有年终奖", "1个月工资左右", "2个月工资左右", "3个月工资及以上", "不固定，但发得还算多", "不固定，偶尔有一点", "说不清 / 还没发"]
+    options: ["没有年终奖", "1个月工资左右", "2个月工资左右", "3个月工资及以上"]
   },
   {
     id: "terminationReason",

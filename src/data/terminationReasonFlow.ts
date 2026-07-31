@@ -1,10 +1,11 @@
-﻿export type TerminationResultMode = "n" | "nPlusOne" | "twoN" | "zeroRisk" | "zeroOrTwoN" | "range";
+export type TerminationResultMode = "n" | "nPlusOne" | "twoN" | "zeroRisk" | "zeroOrTwoN" | "range";
 
 export type TerminationLeaf = {
   id: string;
   label: string;
   reply: string;
   resultMode: TerminationResultMode;
+  showResultSuffix?: boolean;
   inferredType: string;
   compensationHint: string;
   note: string;
@@ -103,14 +104,27 @@ export const terminationReasonFlow: TerminationBranch[] = [
     id: "Q0",
     question: "这次离职大概是哪种情况？",
     options: [
-      { label: "我自己提出离职的，属于劳动合同解除（包括单位太烂，我被迫辞职）", nextId: "SELF_RESIGN_REASON" },
-      { label: "单位要辞退我，属于劳动合同解除", nextId: "COMPANY_DISMISS_REASON" },
-      { label: "劳动合同期满不续，属于劳动合同终止", nextId: "CONTRACT_EXPIRED_CHECK" },
       {
-        label: "公司遇到变故完全没有了呜呜呜",
+        label: "我自己想离职",
+        leaf: {
+          id: "self_resign_normal",
+          label: "我自己想离职",
+          reply: "祝贺你有勇气寻找自己的下一段故事！普通主动辞职一般不能要求单位支付经济补偿。请按规定提前通知单位。",
+          resultMode: "zeroRisk",
+          showResultSuffix: false,
+          inferredType: "员工主动辞职",
+          compensationHint: "通常无补偿",
+          note: "员工因个人原因主动辞职时，通常不产生经济补偿。"
+        }
+      },
+      { label: "公司逼得我不得不走", nextId: "SELF_RESIGN_REASON" },
+      { label: "公司要我走", nextId: "COMPANY_DISMISS_REASON" },
+      { label: "合同到期了，不再续签", nextId: "CONTRACT_EXPIRED_CHECK" },
+      {
+        label: "公司没有了",
         leaf: {
           id: "termination_company_disappears",
-          label: "公司遇到变故完全没有了呜呜呜",
+          label: "公司没有了",
           reply: "天哪真是“狗屎运之神”，怎么偏偏是你的单位没有了！这种情况也不要慌，按照法律，原单位应该赔偿你“N”。",
           resultMode: "n",
           inferredType: "单位主体消灭导致劳动合同终止",
@@ -122,36 +136,25 @@ export const terminationReasonFlow: TerminationBranch[] = [
   },
   {
     id: "SELF_RESIGN_REASON",
-    question: "具体原因是……",
+    question: "公司具体做了什么，让你不得不走？",
     options: [
-      {
-        label: "单位没啥问题，是我自己主动想辞职",
-        leaf: {
-          id: "self_resign_normal",
-          label: "单位没啥问题，是我自己主动想辞职",
-          reply: "祝贺你有勇气寻找自己的下一段故事！主动离开的话，单位不给赔偿喔。",
-          resultMode: "zeroRisk",
-          inferredType: "员工主动辞职",
-          compensationHint: "通常无补偿",
-          note: "员工因个人原因主动辞职时，通常不产生经济补偿。"
-        }
-      },
-      companyTooBadLeaf("forced_bad_conditions", "单位给我的工作条件太差！我只好被迫走"),
-      companyTooBadLeaf("forced_unpaid_or_underpaid_wage", "单位总是克扣工资，要么晚发要么少发！我受不了了只好被迫走"),
-      companyTooBadLeaf("forced_no_social_insurance", "黑心单位不给我交社保！我受不了了只好被迫走"),
-      companyTooBadLeaf("forced_illegal_rules", "单位的规章制度太离谱！我受不了了只好被迫走"),
-      companyTooBadLeaf("forced_contract_trap", "当时签的劳动合同明显藏了坑和套路！我被迫后悔引发麻烦只好被迫走"),
-      companyTooBadLeaf("forced_violence_or_restriction", "单位像黑社会一样，限制我人身自由/打我！我太害怕了只好被迫走"),
-      { label: "其他原因，可简单描述", nextId: "SELF_RESIGN_OTHER_REASON_DETAIL" }
+      companyTooBadLeaf("forced_unpaid_or_underpaid_wage", "工资被拖欠或克扣"),
+      companyTooBadLeaf("forced_no_social_insurance", "公司没依法给我交社保"),
+      companyTooBadLeaf("forced_bad_conditions", "工作条件没按约定提供"),
+      companyTooBadLeaf("forced_illegal_rules", "公司制度违法，还坑到了我"),
+      companyTooBadLeaf("forced_contract_trap", "签劳动合同时被坑了"),
+      companyTooBadLeaf("forced_violence_or_restriction", "公司威胁我，甚至限制我自由"),
+      companyTooBadLeaf("forced_dangerous_work", "公司逼我做危险的事"),
+      { label: "其他情况", nextId: "SELF_RESIGN_OTHER_REASON_DETAIL" }
     ]
   },
   {
     id: "COMPANY_DISMISS_REASON",
     question: "具体原因是……",
     options: [
-      { label: "单位把锅扣我头上，说我有错呜呜", nextId: "FAULT_DISMISS_CHECK" },
-      { label: "我没错，但因为一些客观原因要辞退我", nextId: "NO_FAULT_DISMISS_CHECK" },
-      { label: "公司出了大问题，要大裁员（达20人或公司10%以上）", nextId: "LAYOFF_30_DAYS_CHECK" }
+      { label: "公司说是我的错", nextId: "FAULT_DISMISS_CHECK" },
+      { label: "我没犯错，但公司说没法继续用我", nextId: "NO_FAULT_DISMISS_CHECK" },
+      { label: "公司要大规模裁员", nextId: "LAYOFF_30_DAYS_CHECK" }
     ]
   },
   {
@@ -201,14 +204,14 @@ export const terminationReasonFlow: TerminationBranch[] = [
     id: "NO_FAULT_DISMISS_CHECK",
     question: "具体发生了什么？",
     options: [
-      noticeCheckOption("NOTICE_30_DAYS_MEDICAL_CHECK", "说我因身体原因，干不了这活了，而且医疗期满了也没法再休了"),
-      noticeCheckOption("NOTICE_30_DAYS_INCOMPETENT_CHECK", "说我没能力干这份工作，培训补课、换岗后还是干不了"),
-      noticeCheckOption("NOTICE_30_DAYS_OBJECTIVE_CHECK", "公司发生了大变化（比如我的部门没了），新签我的劳动合同我也不满意"),
+      noticeCheckOption("NOTICE_30_DAYS_MEDICAL_CHECK", "身体原因，实在干不了了"),
+      noticeCheckOption("NOTICE_30_DAYS_INCOMPETENT_CHECK", "公司说我不能胜任工作"),
+      noticeCheckOption("NOTICE_30_DAYS_OBJECTIVE_CHECK", "原来的工作条件变了，双方没谈拢"),
       {
-        label: "并非以上问题，我觉得单位的就是找借口让我走！",
+        label: "都不是，公司就是想赶我走",
         leaf: {
           id: "nofault_not_listed_excuse",
-          label: "并非以上问题，我觉得单位的就是找借口让我走！",
+          label: "都不是，公司就是想赶我走",
           reply: "那你可能要赚了！单位这是违法解除，要陪你“2N”。",
           resultMode: "twoN",
           inferredType: "疑似违法解除",
@@ -310,14 +313,3 @@ export const getTerminationLeafById = (id?: string) => {
   }
   return undefined;
 };
-
-
-
-
-
-
-
-
-
-
-

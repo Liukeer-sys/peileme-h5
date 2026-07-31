@@ -1,4 +1,4 @@
-﻿import type { Answers } from "../types";
+import type { Answers } from "../types";
 
 export type LaborLawArticle = {
   id: string;
@@ -206,6 +206,16 @@ const references: Record<string, LaborLawPack> = {
     summary: "单位以暴力、威胁、非法限制人身自由等方式强迫劳动，劳动者可立即解除并通常可主张经济补偿。",
     citations: [
       { articleId: "article38", highlights: ["暴力、威胁或者非法限制人身自由", "违章指挥、强令冒险作业"] },
+      { articleId: "article46", highlights: ["(一)"] },
+      { articleId: "article47" }
+    ]
+  },
+  forced_dangerous_work: {
+    leafId: "forced_dangerous_work",
+    result: "N",
+    summary: "单位违章指挥、强令冒险作业，劳动者可立即解除并通常可主张经济补偿。",
+    citations: [
+      { articleId: "article38", highlights: ["违章指挥、强令冒险作业"] },
       { articleId: "article46", highlights: ["(一)"] },
       { articleId: "article47" }
     ]

@@ -1,5 +1,4 @@
-﻿import { buildEquivalentIconPrompt } from "../data/equivalentIconPrompts";
-import { getTerminationType } from "../data/terminationTypes";
+﻿import { getTerminationType } from "../data/terminationTypes";
 import { getWishEquivalentPool, type WishEquivalentItem } from "../data/wishEquivalents";
 import type { Answers } from "../types";
 
@@ -13,7 +12,6 @@ export type ResultEquivalent = {
   note?: string;
   displayValue: string;
   lifestyleCopy: string;
-  iconPrompt: string;
 };
 
 export type CalculationResult = {
@@ -71,10 +69,13 @@ const bonusMultiplierMap: Record<string, number> = {
 
 const getOvertimeProfile = (workSchedule?: string) => {
   switch (workSchedule) {
+    case "双休，但不定期加班":
+      return { hoursPerYear: 156, levelBoost: true, label: "不定期加班积攒的额外工时" };
     case "双休，但工作日经常晚下班":
       return { hoursPerYear: 312, levelBoost: true, label: "工作日晚下班积攒的额外工时" };
     case "大小周":
       return { hoursPerYear: 208, levelBoost: true, label: "大小周额外吞掉的周六" };
+    case "单休":
     case "单休，但每天工时还算正常":
       return { hoursPerYear: 416, levelBoost: true, label: "单休少掉的完整周末" };
     case "996 / 长期高强度加班":
@@ -411,8 +412,7 @@ const chooseWishEquivalents = (amount: number, wish?: string, city?: string): Re
       lifestyleCopy: item.text
         .replace(/`?\{count\}`?/g, String(count))
         .replace("{monthsAtThreePerDay}", String(monthsAtThreePerDay))
-        .replace("{monthsAtOnePerDay}", String(monthsAtOnePerDay)),
-      iconPrompt: buildEquivalentIconPrompt(item)
+        .replace("{monthsAtOnePerDay}", String(monthsAtOnePerDay))
     };
   });
 };
@@ -466,15 +466,4 @@ export const currentMonthValue = () => {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
 };
-
-
-
-
-
-
-
-
-
-
-
 
