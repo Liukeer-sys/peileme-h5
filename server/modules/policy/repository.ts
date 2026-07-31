@@ -4,7 +4,11 @@ import { z } from "zod";
 import { writeAdminAudit } from "../../audit.js";
 import { query, withTransaction } from "../../db.js";
 import { ApiError } from "../../errors.js";
-import { runPolicyRegression } from "./regression.js";
+import {
+  DEFAULT_POLICY_REGRESSION_EXPECTATIONS,
+  policyRegressionExpectationsSchema,
+  runPolicyRegression
+} from "./regression.js";
 import type {
   EnginePolicyRules,
   PolicyInput,
@@ -41,7 +45,7 @@ const reviewCandidateSchema = z
 
 export const policyDefinitionSchema = z
   .object({
-    schemaVersion: z.literal(2),
+    schemaVersion: z.union([z.literal(1), z.literal(2)]),
     decisionModel: z
       .object({
         mutualAgreement: z
@@ -117,7 +121,10 @@ export const policyDefinitionSchema = z
         localAverageMultiplier: z.number().min(1).max(10),
         serviceYearCap: z.number().int().min(1).max(50)
       })
-      .strict()
+      .strict(),
+    regressionExpectations: policyRegressionExpectationsSchema.default(
+      DEFAULT_POLICY_REGRESSION_EXPECTATIONS
+    )
   })
   .strict();
 
@@ -350,21 +357,28 @@ const formatVersion = (row: {
   regression_status?: string;
   regression_summary?: unknown;
   regression_run_at?: string | null;
-}) => ({
-  id: row.id,
-  version: row.version,
-  status: row.status,
-  definition: row.definition,
-  sourceSnapshot: row.source_snapshot,
-  effectiveFrom: row.effective_from,
-  effectiveTo: row.effective_to,
-  publishedBy: row.published_by ?? null,
-  publishedAt: row.published_at ?? null,
-  regressionStatus: row.regression_status ?? "pending",
-  regressionSummary: row.regression_summary ?? {},
-  regressionRunAt: row.regression_run_at ?? null,
-  ...(row.created_at ? { createdAt: row.created_at } : {})
-});
+}) => {
+  const normalizedDefinition = policyDefinitionSchema.safeParse(
+    row.definition
+  );
+  return {
+    id: row.id,
+    version: row.version,
+    status: row.status,
+    definition: normalizedDefinition.success
+      ? normalizedDefinition.data
+      : row.definition,
+    sourceSnapshot: row.source_snapshot,
+    effectiveFrom: row.effective_from,
+    effectiveTo: row.effective_to,
+    publishedBy: row.published_by ?? null,
+    publishedAt: row.published_at ?? null,
+    regressionStatus: row.regression_status ?? "pending",
+    regressionSummary: row.regression_summary ?? {},
+    regressionRunAt: row.regression_run_at ?? null,
+    ...(row.created_at ? { createdAt: row.created_at } : {})
+  };
+};
 
 const sourceLabel = (snapshot: unknown) => {
   if (!Array.isArray(snapshot) || snapshot.length === 0) return "api";
@@ -378,19 +392,33 @@ const sourceLabel = (snapshot: unknown) => {
 };
 
 const announcementAuditSnapshot = (announcement: {
+  id?: string;
   title: string;
   body: string;
   placement: string;
   status: string;
   starts_at: string | null;
   ends_at: string | null;
+  created_by?: string | null;
+  created_at?: string;
+  updated_at?: string;
 }) => ({
+  ...(announcement.id ? { id: announcement.id } : {}),
   title: announcement.title,
   body: announcement.body,
   placement: announcement.placement,
   status: announcement.status,
   startsAt: announcement.starts_at,
-  endsAt: announcement.ends_at
+  endsAt: announcement.ends_at,
+  ...(announcement.created_by !== undefined
+    ? { createdBy: announcement.created_by }
+    : {}),
+  ...(announcement.created_at
+    ? { createdAt: announcement.created_at }
+    : {}),
+  ...(announcement.updated_at
+    ? { updatedAt: announcement.updated_at }
+    : {})
 });
 
 export class PolicyRepository {
@@ -1101,7 +1129,8 @@ export class PolicyRepository {
     request: Request;
   }) {
     const regression = runPolicyRegression(
-      policyDefinitionToEngineRules(definition)
+      policyDefinitionToEngineRules(definition),
+      definition.regressionExpectations
     );
     const regressionStatus =
       regression.failed === 0 ? "passed" : "failed";
@@ -1354,7 +1383,7 @@ export class PolicyRepository {
         throw new ApiError(
           400,
           "INVALID_POLICY_DEFINITION",
-          "政策规则定义不符合 schemaVersion 2"
+          "政策规则定义不符合 schemaVersion 1/2"
         );
       }
       await this.preparePublishedInterval(
@@ -1466,7 +1495,8 @@ export class PolicyRepository {
         );
       }
       const regression = runPolicyRegression(
-        policyDefinitionToEngineRules(parsedTarget.data)
+        policyDefinitionToEngineRules(parsedTarget.data),
+        parsedTarget.data.regressionExpectations
       );
       if (regression.failed > 0) {
         throw new ApiError(
@@ -2218,9 +2248,18 @@ export class PolicyRepository {
       const selected = await client.query<{
         id: string;
         title: string;
+        body: string;
+        placement: "main" | "ai" | "all";
         status: "draft" | "published" | "archived";
+        starts_at: string | null;
+        ends_at: string | null;
+        created_by: string | null;
+        created_at: string;
+        updated_at: string;
       }>(
-        `SELECT id, title, status
+        `SELECT id, title, body, placement, status,
+                starts_at::text, ends_at::text, created_by,
+                created_at::text, updated_at::text
            FROM announcements
           WHERE id = $1
           FOR UPDATE`,
@@ -2247,7 +2286,10 @@ export class PolicyRepository {
         "announcement.delete",
         "announcement",
         id,
-        { title: announcement.title, status: announcement.status },
+        {
+          before: announcementAuditSnapshot(announcement),
+          after: null
+        },
         client
       );
     });

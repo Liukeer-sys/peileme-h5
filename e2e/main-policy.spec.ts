@@ -6,6 +6,7 @@ import {
   type Page
 } from "@playwright/test";
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { Client } from "pg";
 import bcrypt from "bcryptjs";
 
@@ -1265,7 +1266,7 @@ test("管理员校验草稿后发布并创建可追踪回滚版本", async ({ pa
   );
   await editor.getByRole("button", { name: "保存草稿" }).click();
   await expect(page.getByRole("alert")).toContainText(
-    "Invalid input: expected 2"
+    "Invalid input"
   );
 
   const assertCleanRuntime = watchRuntime(page);
@@ -1280,6 +1281,18 @@ test("管理员校验草稿后发布并创建可追踪回滚版本", async ({ pa
         notice30Days: { compensation: string };
       };
     };
+    regressionExpectations: {
+      cases: Array<{
+        id: string;
+        payableFen: number;
+        rangeFen: { low: number; high: number };
+        differenceRangeFen: { low: number; high: number };
+        formula: {
+          scenarioSemantics: string;
+          effectiveCompensationMultiplier: number;
+        };
+      }>;
+    };
   };
   controlledDefinition.decisionModel.article40EmployerTermination
     .notice30Days.compensation = "TWO_N";
@@ -1289,9 +1302,62 @@ test("管理员校验草稿后发布并创建可追踪回滚版本", async ({ pa
   }) as { result: { baseCompensationFen: number; payableFen: number } };
   await editor.getByRole("button", { name: "保存草稿" }).click();
   await expect(page.getByRole("status")).toContainText("草稿已创建");
+  const failedDraft = page
+    .getByRole("article", { name: /规则版本 v\d+/ })
+    .filter({ hasText: publishDate })
+    .filter({ hasText: "服务端回归失败" });
+  await expect(failedDraft).toContainText("payableFen");
+  await expect(failedDraft).toContainText("7000000");
+  await expect(failedDraft).toContainText("14000000");
+  const failedVersions = await apiContext.get(
+    "/api/admin/policy/rule-sets/cn-severance/versions",
+    { headers: { authorization: `Bearer ${adminAccessToken}` } }
+  );
+  const failedVersion = (
+    (await failedVersions.json()) as {
+      items: Array<{
+        id: string;
+        effectiveFrom: string;
+        regressionStatus: string;
+      }>;
+    }
+  ).items.find(
+    (item) =>
+      item.effectiveFrom === publishDate &&
+      item.regressionStatus === "failed"
+  )!;
+  await apiContext
+    .post(
+      `/api/admin/policy/rule-sets/cn-severance/versions/${failedVersion.id}/publish`,
+      { headers: { authorization: `Bearer ${adminAccessToken}` } }
+    )
+    .then((response) => expect(response.status()).toBe(409));
+
+  const article40Expectation =
+    controlledDefinition.regressionExpectations.cases.find(
+      (item) => item.id === "article-40-notice"
+    )!;
+  article40Expectation.payableFen = 14_000_000;
+  article40Expectation.rangeFen = {
+    low: 14_000_000,
+    high: 14_000_000
+  };
+  article40Expectation.differenceRangeFen = {
+    low: 14_000_000,
+    high: 14_000_000
+  };
+  article40Expectation.formula.scenarioSemantics =
+    "用人单位依据第四十条解除；当前有效规则配置为2N经济补偿和0个月代通知金";
+  article40Expectation.formula.effectiveCompensationMultiplier = 2;
+  await page.getByRole("button", { name: "新建规则草稿" }).click();
+  await editor.getByLabel("生效日期").fill(publishDate);
+  await definition.fill(JSON.stringify(controlledDefinition, null, 2));
+  await editor.getByRole("button", { name: "保存草稿" }).click();
+  await expect(page.getByRole("status")).toContainText("草稿已创建");
   const draft = page
     .getByRole("article", { name: /规则版本 v\d+/ })
-    .filter({ hasText: publishDate });
+    .filter({ hasText: publishDate })
+    .filter({ hasText: "服务端回归通过" });
   await expect(draft).toContainText("与当前版本");
   page.once("dialog", (dialog) => dialog.accept());
   await draft.getByRole("button", { name: "发布版本" }).click();
@@ -1338,8 +1404,23 @@ test("管理员校验草稿后发布并创建可追踪回滚版本", async ({ pa
   assertCleanRuntime();
 });
 
-test("管理员筛选编辑区域参数并覆盖严格 CSV 成功与失败", async ({ page }) => {
+test("管理员真实操作区域参数编辑、模板下载和严格 CSV 全边界", async ({
+  page
+}) => {
   const assertCleanRuntime = watchRuntime(page);
+  if (!e2eDatabaseUrl) throw new Error("E2E_DATABASE_URL is required");
+  const countParameters = async () => {
+    const database = new Client({ connectionString: e2eDatabaseUrl });
+    await database.connect();
+    try {
+      const result = await database.query<{ count: string }>(
+        "SELECT count(*)::text AS count FROM regional_parameters"
+      );
+      return result.rows[0].count;
+    } finally {
+      await database.end();
+    }
+  };
   const restored = await apiContext.put(
     "/api/admin/policy/regional-parameters",
     {
@@ -1373,29 +1454,146 @@ test("管理员筛选编辑区域参数并覆盖严格 CSV 成功与失败", asy
   await expect(row).toBeVisible();
   await row.getByRole("button", { name: /编辑/ }).click();
   const editor = page.getByRole("region", { name: "编辑区域参数" });
+  await editor.getByRole("button", { name: "关闭" }).click();
+  await expect(editor).toHaveCount(0);
+  await row.getByRole("button", { name: /编辑/ }).click();
   await editor.getByLabel("参数金额（元）").fill("9500");
   await editor.getByLabel("参数状态").selectOption("stale");
+  await editor
+    .getByLabel("来源名称")
+    .fill("武汉市统计局：Task8 来源字段真实编辑");
+  await editor
+    .getByLabel("来源地址")
+    .fill("https://tjj.wuhan.gov.cn/task8/source-fields.html");
+  await editor.getByLabel("来源发布日期").fill("2025-07-01");
   await editor.getByRole("button", { name: "保存参数" }).click();
   await expect(page.getByText("参数已保存", { exact: true })).toBeVisible();
-  await expect(page.getByRole("row", { name: /武汉市.*2024/ })).toContainText(
-    "已过期"
+  const updatedRow = page.getByRole("row", { name: /武汉市.*2024/ });
+  await expect(updatedRow).toContainText("已过期");
+  const updatedSource = updatedRow.getByRole("link", {
+    name: "武汉市统计局：Task8 来源字段真实编辑"
+  });
+  await expect(updatedSource).toHaveAttribute(
+    "href",
+    "https://tjj.wuhan.gov.cn/task8/source-fields.html"
+  );
+  const persistedResponse = await apiContext.get(
+    "/api/admin/policy/regional-parameters?cityCode=420100&year=2024&parameterType=employee_average_monthly_wage&pageSize=10",
+    { headers: { authorization: `Bearer ${adminAccessToken}` } }
+  );
+  expect(persistedResponse.status()).toBe(200);
+  expect(
+    (
+      (await persistedResponse.json()) as {
+        items: Array<{
+          sourceName: string;
+          sourceUrl: string;
+          sourcePublishedAt: string;
+        }>;
+      }
+    ).items[0]
+  ).toMatchObject({
+    sourceName: "武汉市统计局：Task8 来源字段真实编辑",
+    sourceUrl: "https://tjj.wuhan.gov.cn/task8/source-fields.html",
+    sourcePublishedAt: "2025-07-01"
+  });
+
+  const downloadPromise = page.waitForEvent("download");
+  await page.getByRole("link", { name: "查看字段模板" }).click();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toBe(
+    "regional-parameters-template.csv"
+  );
+  const downloadPath = await download.path();
+  expect(downloadPath).toBeTruthy();
+  expect(await readFile(downloadPath!, "utf8")).toContain(
+    "region_code,region_name,year,parameter_type,amount_fen,source_name,source_url,source_published_at,status"
   );
 
   const csvInput = page.getByLabel("区域参数 CSV 文件");
   const header =
     "region_code,region_name,year,parameter_type,amount_fen,source_name,source_url,source_published_at,status";
   await csvInput.setInputFiles({
-    name: "regional-parameters.csv",
+    name: "quoted-newline.csv",
     mimeType: "text/csv",
     buffer: Buffer.from(
-      `${header}\n150100,呼和浩特市,2025,employee_average_monthly_wage,1010000,呼和浩特市统计局,https://tjj.huhhot.gov.cn/task8/e2e.html,2026-06-01,verified`
+      [
+        header,
+        '510100,成都市,2099,minimum_monthly_wage,345600,"成都市人社局,',
+        '劳动关系处","https://example.test/task8/source?a=1,b=2",2099-01-01,draft'
+      ].join("\n")
     )
   });
   await page.getByRole("button", { name: "导入 CSV" }).click();
   await expect(
     page.getByText("已导入 1 条参数", { exact: true })
   ).toBeVisible();
+  const quotedPersisted = await apiContext.get(
+    "/api/admin/policy/regional-parameters?cityCode=510100&year=2099&parameterType=minimum_monthly_wage&pageSize=10",
+    { headers: { authorization: `Bearer ${adminAccessToken}` } }
+  );
+  expect(quotedPersisted.status()).toBe(200);
+  expect(
+    (
+      (await quotedPersisted.json()) as {
+        items: Array<{
+          amountFen: number;
+          sourceName: string;
+          sourceUrl: string;
+          status: string;
+        }>;
+      }
+    ).items[0]
+  ).toMatchObject({
+    amountFen: 345600,
+    sourceName: "成都市人社局,\n劳动关系处",
+    sourceUrl: "https://example.test/task8/source?a=1,b=2",
+    status: "draft"
+  });
+  const countAfterSuccess = await countParameters();
   assertCleanRuntime();
+
+  await csvInput.setInputFiles({
+    name: "duplicate.csv",
+    mimeType: "text/csv",
+    buffer: Buffer.from(
+      [
+        header,
+        "310000,上海市,2098,minimum_monthly_wage,300000,来源甲,https://example.test/a,2098-01-01,draft",
+        "310000,上海市,2098,minimum_monthly_wage,310000,来源乙,https://example.test/b,2098-01-02,draft"
+      ].join("\n")
+    )
+  });
+  await page.getByRole("button", { name: "导入 CSV" }).click();
+  await expect(page.getByRole("alert")).toContainText(
+    "第 3 行：区域参数 310000:2098:minimum_monthly_wage 重复"
+  );
+  expect(await countParameters()).toBe(countAfterSuccess);
+
+  await csvInput.setInputFiles({
+    name: "formula.csv",
+    mimeType: "text/csv",
+    buffer: Buffer.from(
+      [
+        header,
+        '310000,上海市,2097,minimum_monthly_wage,300000,"=HYPERLINK(""https://evil.example"")",https://example.test/formula,2097-01-01,draft'
+      ].join("\n")
+    )
+  });
+  await page.getByRole("button", { name: "导入 CSV" }).click();
+  await expect(page.getByRole("alert")).toContainText(
+    "文本字段不得以 =、+、- 或 @ 开头"
+  );
+  expect(await countParameters()).toBe(countAfterSuccess);
+
+  await csvInput.setInputFiles({
+    name: "oversize.csv",
+    mimeType: "text/csv",
+    buffer: Buffer.from("x".repeat(500_001))
+  });
+  await page.getByRole("button", { name: "导入 CSV" }).click();
+  await expect(page.getByRole("alert")).toContainText("500000");
+  expect(await countParameters()).toBe(countAfterSuccess);
 
   await csvInput.setInputFiles({
     name: "invalid.csv",
@@ -1406,6 +1604,7 @@ test("管理员筛选编辑区域参数并覆盖严格 CSV 成功与失败", asy
   await expect(page.getByRole("alert")).toContainText(
     "CSV header must be exactly"
   );
+  expect(await countParameters()).toBe(countAfterSuccess);
 });
 
 test("区域参数完整分页且较慢旧筛选不会覆盖最新结果", async ({ page }) => {
@@ -1617,6 +1816,7 @@ test("分析员按 capability 只读查看且普通用户被后台 API 拒绝", 
   await expect(publishButtons.first()).toBeDisabled();
 
   await page.getByRole("button", { name: /区域参数/ }).click();
+  await expect(page.getByLabel("区域参数 CSV 文件")).toBeDisabled();
   await expect(page.getByRole("button", { name: "导入 CSV" })).toBeDisabled();
   await expect(page.getByRole("button", { name: /编辑/ }).first()).toBeDisabled();
   await page.getByRole("button", { name: /公告设置/ }).click();

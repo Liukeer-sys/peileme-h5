@@ -17,6 +17,15 @@ type PolicyVersion = {
     total?: number;
     passed?: number;
     failed?: number;
+    cases?: Array<{
+      id: string;
+      status: "passed" | "failed";
+      diff: Array<{
+        path: string;
+        expected: unknown;
+        actual: unknown;
+      }>;
+    }>;
   };
   regressionRunAt: string | null;
 };
@@ -218,6 +227,15 @@ export default function PolicyRulesPanel({
             comparison &&
             JSON.stringify(comparison.definition) ===
               JSON.stringify(item.definition);
+          const regressionDiffs =
+            item.regressionSummary.cases
+              ?.filter((testCase) => testCase.status === "failed")
+              .flatMap((testCase) =>
+                testCase.diff.map((diff) => ({
+                  caseId: testCase.id,
+                  ...diff
+                }))
+              ) ?? [];
           return (
             <article
               className={`admin-version-card ${item.status}`}
@@ -268,6 +286,24 @@ export default function PolicyRulesPanel({
                 </div>
                 <div><dt>有效区间</dt><dd>{item.effectiveFrom} — {item.effectiveTo || "长期"}</dd></div>
               </dl>
+              {regressionDiffs.length > 0 && (
+                <details className="admin-regression-diff" open>
+                  <summary>
+                    语义回归差异 {regressionDiffs.length} 项
+                  </summary>
+                  <ul>
+                    {regressionDiffs.map((diff, index) => (
+                      <li key={`${diff.caseId}-${diff.path}-${index}`}>
+                        <code>{diff.caseId} · {diff.path}</code>
+                        <span>
+                          期望 {JSON.stringify(diff.expected)} · 实际{" "}
+                          {JSON.stringify(diff.actual)}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              )}
               <button
                 type="button"
                 disabled={!canPublish || item.status !== "draft"}

@@ -254,7 +254,12 @@ export default function RegionalDataPanel({
       <section className="admin-card">
         <div className="admin-section-title">
           <div><span>严格字段 · 原子写入</span><h2>CSV 批量导入</h2></div>
-          <a href="/database/seeds/regional-parameters.csv">查看字段模板</a>
+          <a
+            href="/regional-parameters-template.csv"
+            download="regional-parameters-template.csv"
+          >
+            查看字段模板
+          </a>
         </div>
         <div className="admin-csv-row">
           <label>

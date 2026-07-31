@@ -1,4 +1,5 @@
 import { withTransaction } from "../../db.js";
+import { DEFAULT_POLICY_REGRESSION_EXPECTATIONS } from "./regression.js";
 
 const severanceDefinition = {
   schemaVersion: 2,
@@ -49,7 +50,8 @@ const severanceDefinition = {
   highSalaryCap: {
     localAverageMultiplier: 3,
     serviceYearCap: 12
-  }
+  },
+  regressionExpectations: DEFAULT_POLICY_REGRESSION_EXPECTATIONS
 };
 
 const laborContractLawUrl =

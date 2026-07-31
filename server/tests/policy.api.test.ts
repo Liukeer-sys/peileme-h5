@@ -1999,6 +1999,130 @@ describe("policy capability administration", () => {
     expect(audits.rows[0].count).toBe("2");
   });
 
+  it("safely supplies the full semantic regression default to legacy v1 and v2 definitions", async () => {
+    const path = "/api/admin/policy/rule-sets/cn-severance/versions";
+    const listed = await request(createApp())
+      .get(path)
+      .set(authHeader(adminToken))
+      .expect(200);
+    expect(listed.body.items[0].definition.regressionExpectations).toMatchObject({
+      schemaVersion: 1
+    });
+    expect(
+      listed.body.items[0].definition.regressionExpectations.cases
+    ).toHaveLength(14);
+    const seeded = await query<{
+      definition: {
+        regressionExpectations?: { schemaVersion: number; cases: unknown[] };
+      };
+    }>(
+      `SELECT definition
+         FROM policy_rule_versions
+        WHERE version = 1
+          AND rule_set_id = (
+            SELECT id FROM policy_rule_sets WHERE code = 'cn-severance'
+          )`
+    );
+    expect(
+      seeded.rows[0].definition.regressionExpectations
+    ).toMatchObject({ schemaVersion: 1 });
+    expect(
+      seeded.rows[0].definition.regressionExpectations?.cases
+    ).toHaveLength(14);
+
+    for (const [schemaVersion, effectiveFrom] of [
+      [1, "2084-01-01"],
+      [2, "2085-01-01"]
+    ] as const) {
+      const definition = structuredClone(listed.body.items[0].definition);
+      definition.schemaVersion = schemaVersion;
+      delete definition.regressionExpectations;
+      const created = await request(createApp())
+        .post(path)
+        .set(authHeader(adminToken))
+        .send({
+          definition,
+          sourceSnapshot: [{ source: `legacy v${schemaVersion}` }],
+          effectiveFrom
+        })
+        .expect(201);
+      expect(created.body.definition.regressionExpectations).toMatchObject({
+        schemaVersion: 1
+      });
+      expect(
+        created.body.definition.regressionExpectations.cases
+      ).toHaveLength(14);
+      expect(created.body.regressionStatus).toBe("passed");
+    }
+  });
+
+  it("blocks an unsynchronized rule change and persists semantic expected actual diffs", async () => {
+    const path = "/api/admin/policy/rule-sets/cn-severance/versions";
+    const listed = await request(createApp())
+      .get(path)
+      .set(authHeader(adminToken))
+      .expect(200);
+    const definition = structuredClone(listed.body.items[0].definition);
+    definition.decisionModel.article40EmployerTermination
+      .notice30Days.compensation = "TWO_N";
+
+    const draft = await request(createApp())
+      .post(path)
+      .set(authHeader(adminToken))
+      .send({
+        definition,
+        sourceSnapshot: [{ source: "unsynchronized semantic change" }],
+        effectiveFrom: "2086-01-01"
+      })
+      .expect(201);
+
+    expect(draft.body.regressionStatus).toBe("failed");
+    expect(draft.body.regressionSummary).toMatchObject({
+      expectationSchemaVersion: 1,
+      total: 14,
+      passed: 13,
+      failed: 1
+    });
+    expect(
+      draft.body.regressionSummary.cases.find(
+        (item: { id: string }) => item.id === "article-40-notice"
+      )
+    ).toMatchObject({
+      status: "failed",
+      expected: { payableFen: 7_000_000 },
+      actual: { payableFen: 14_000_000 },
+      diff: expect.arrayContaining([
+        {
+          path: "payableFen",
+          expected: 7_000_000,
+          actual: 14_000_000
+        }
+      ])
+    });
+    await request(createApp())
+      .post(`${path}/${draft.body.id}/publish`)
+      .set(authHeader(adminToken))
+      .expect(409);
+
+    const persisted = await query<{
+      regression_status: string;
+      regression_summary: {
+        cases: Array<{ id: string; diff: unknown[] }>;
+      };
+    }>(
+      `SELECT regression_status, regression_summary
+         FROM policy_rule_versions
+        WHERE id = $1`,
+      [draft.body.id]
+    );
+    expect(persisted.rows[0].regression_status).toBe("failed");
+    expect(
+      persisted.rows[0].regression_summary.cases.find(
+        (item) => item.id === "article-40-notice"
+      )?.diff
+    ).not.toHaveLength(0);
+  });
+
   it("refuses to publish a draft whose persisted regression did not pass", async () => {
     const path = "/api/admin/policy/rule-sets/cn-severance/versions";
     const listed = await request(createApp())
@@ -2212,6 +2336,22 @@ describe("policy capability administration", () => {
     const definition = structuredClone(listed.body.items[0].definition);
     definition.decisionModel.article40EmployerTermination.notice30Days
       .compensation = "TWO_N";
+    const article40Expectation =
+      definition.regressionExpectations.cases.find(
+        (item: { id: string }) => item.id === "article-40-notice"
+      );
+    article40Expectation.payableFen = 14_000_000;
+    article40Expectation.rangeFen = {
+      low: 14_000_000,
+      high: 14_000_000
+    };
+    article40Expectation.differenceRangeFen = {
+      low: 14_000_000,
+      high: 14_000_000
+    };
+    article40Expectation.formula.scenarioSemantics =
+      "用人单位依据第四十条解除；当前有效规则配置为2N经济补偿和0个月代通知金";
+    article40Expectation.formula.effectiveCompensationMultiplier = 2;
     const input = calculationBody({ endDate: "2026-07-01" });
 
     const before = await request(createApp())
@@ -2417,7 +2557,7 @@ describe("policy capability administration", () => {
       .expect(400);
     expect(unsupportedSchema.body).toMatchObject({
       error: "VALIDATION_ERROR",
-      message: "Invalid input: expected 2"
+      message: expect.stringContaining("Invalid input")
     });
     expect(unsupportedSchema.body.issues[0]).toMatchObject({
       path: ["definition", "schemaVersion"]
@@ -2922,8 +3062,15 @@ describe("policy capability administration", () => {
       .set(authHeader(adminToken))
       .expect(204);
 
-    const audits = await query<{ action: string }>(
-      `SELECT action
+    const audits = await query<{
+      action: string;
+      target_id: string;
+      detail: {
+        before?: Record<string, unknown>;
+        after?: Record<string, unknown> | null;
+      };
+    }>(
+      `SELECT action, target_id, detail
          FROM admin_audit_logs
         WHERE target_type = 'announcement'
         ORDER BY created_at, action`
@@ -2935,6 +3082,25 @@ describe("policy capability administration", () => {
       "announcement.create",
       "announcement.delete"
     ]);
+    const deleteAudit = audits.rows.find(
+      (row) =>
+        row.action === "announcement.delete" &&
+        row.target_id === secondDraft.body.id
+    )!;
+    expect(deleteAudit.detail).toMatchObject({
+      before: {
+        title: "待删除公告",
+        body: "草稿内容",
+        placement: "all",
+        status: "draft",
+        startsAt: null,
+        endsAt: null,
+        createdBy: secondDraft.body.createdBy,
+        createdAt: expect.any(String),
+        updatedAt: expect.any(String)
+      },
+      after: null
+    });
   });
 
   it("rejects invalid announcement schedules without persisting partial data", async () => {

@@ -866,6 +866,22 @@
   padding-top: 18px;
 }
 
+.admin-regression-diff {
+  margin: 0.75rem 0;
+}
+
+.admin-regression-diff ul {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0.6rem 0 0;
+  padding-left: 1rem;
+}
+
+.admin-regression-diff li span {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
 .admin-pagination span {
   color: var(--admin-muted);
   font-size: 13px;
