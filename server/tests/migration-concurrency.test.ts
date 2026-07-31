@@ -394,7 +394,8 @@ describe("migration concurrency", () => {
             { version: "004_refresh_session_rotation.sql" },
             { version: "005_remove_document_review_grants.sql" },
             { version: "006_policy_result_shares.sql" },
-            { version: "007_policy_rule_regressions.sql" }
+            { version: "007_policy_rule_regressions.sql" },
+            { version: "008_commerce.sql" }
           ]);
           const tables = await verify.query<{ count: string }>(
             `SELECT count(*)::text AS count
@@ -402,15 +403,21 @@ describe("migration concurrency", () => {
              WHERE table_schema = 'public'
                AND table_name = ANY($1::text[])`,
             [[
-              "users",
-              "policy_rule_sets",
-              "policy_rule_versions",
-              "administrative_regions",
-              "regional_parameters",
-              "announcements"
+              "products",
+              "product_prices",
+              "promotion_rules",
+              "orders",
+              "order_items",
+              "payment_attempts",
+              "payment_transactions",
+              "entitlements",
+              "entitlement_usages",
+              "refunds",
+              "reconciliation_runs",
+              "invoice_requests"
             ]]
           );
-          expect(tables.rows[0].count).toBe("6");
+          expect(tables.rows[0].count).toBe("12");
         } finally {
           await verify.end();
         }

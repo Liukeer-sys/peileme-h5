@@ -1,0 +1,59 @@
+export const productSkus = [
+  "POLICY_CALC",
+  "AI_SEVERANCE_ANALYSIS",
+  "AI_DOCUMENT_REVIEW"
+] as const;
+export type ProductSku = (typeof productSkus)[number];
+
+export const productChannels = ["main", "ai", "all"] as const;
+export type ProductChannel = (typeof productChannels)[number];
+
+export const fulfillmentTypes = [
+  "policy_calculation",
+  "ai_analysis",
+  "document_review"
+] as const;
+export type FulfillmentType = (typeof fulfillmentTypes)[number];
+
+export type ProductStatus = "active" | "inactive";
+export type Currency = "CNY";
+
+export type OrderStatus =
+  | "CREATED"
+  | "PAYING"
+  | "PAID"
+  | "FULFILLING"
+  | "COMPLETED"
+  | "CLOSED"
+  | "PAYMENT_FAILED"
+  | "REFUND_PENDING"
+  | "PARTIALLY_REFUNDED"
+  | "REFUNDED"
+  | "REFUND_FAILED";
+
+export const paymentChannels = ["wechat_h5", "alipay_wap", "fake"] as const;
+export type PaymentChannel = (typeof paymentChannels)[number];
+
+export type PaymentAttemptStatus =
+  | "CREATED"
+  | "REDIRECT_READY"
+  | "PENDING"
+  | "SUCCEEDED"
+  | "FAILED"
+  | "CLOSED";
+
+export type PaymentTransactionStatus = "SUCCESS" | "CLOSED" | "REFUND";
+export type EntitlementSourceType = "first_free" | "order" | "invite" | "admin";
+export type EntitlementStatus = "active" | "reserved" | "consumed" | "revoked";
+export type EntitlementUsageStatus = "reserved" | "consumed" | "released";
+export type RefundStatus = "PENDING" | "PROCESSING" | "SUCCEEDED" | "FAILED";
+export type ReconciliationStatus =
+  | "RUNNING"
+  | "MATCHED"
+  | "DIFFERENCES"
+  | "FAILED";
+export type InvoiceRequestStatus =
+  | "SUBMITTED"
+  | "PROCESSING"
+  | "ISSUED"
+  | "REJECTED";

@@ -115,6 +115,33 @@ const severanceSourceSnapshot = [
   }
 ];
 
+const commerceCatalog = [
+  {
+    sku: "POLICY_CALC",
+    name: "政策补偿测算",
+    description: "中国大陆离职补偿政策测算单次使用权益",
+    productChannel: "main",
+    fulfillmentType: "policy_calculation",
+    amountFen: 990
+  },
+  {
+    sku: "AI_SEVERANCE_ANALYSIS",
+    name: "AI 离职补偿深度分析",
+    description: "离职补偿方案 AI 深度分析单次使用权益",
+    productChannel: "ai",
+    fulfillmentType: "ai_analysis",
+    amountFen: 3990
+  },
+  {
+    sku: "AI_DOCUMENT_REVIEW",
+    name: "AI 劳动文件审查",
+    description: "劳动文件签署与风险分析单次使用权益",
+    productChannel: "ai",
+    fulfillmentType: "document_review",
+    amountFen: 2990
+  }
+] as const;
+
 export const seedPolicyFoundation = async () => {
   await withTransaction(async (client) => {
     const desiredRuleSet = {
@@ -232,6 +259,116 @@ export const seedPolicyFoundation = async () => {
          ('admin', 'policy.publish'),
          ('analyst', 'policy.read')
        ON CONFLICT (role, capability) DO NOTHING`
+    );
+
+    for (const product of commerceCatalog) {
+      await client.query(
+        `INSERT INTO products(
+           sku,
+           name,
+           description,
+           product_channel,
+           fulfillment_type,
+           status,
+           entitlement_policy
+         )
+         VALUES ($1, $2, $3, $4, $5, 'active', '{"grantCount":1}'::jsonb)
+         ON CONFLICT (sku) DO NOTHING`,
+        [
+          product.sku,
+          product.name,
+          product.description,
+          product.productChannel,
+          product.fulfillmentType
+        ]
+      );
+
+      const lockedProduct = await client.query<{
+        id: string;
+        name: string;
+        description: string;
+        product_channel: string;
+        fulfillment_type: string;
+        entitlement_policy: unknown;
+      }>(
+        `SELECT
+           id,
+           name,
+           description,
+           product_channel,
+           fulfillment_type,
+           entitlement_policy
+         FROM products
+         WHERE sku = $1
+         FOR UPDATE`,
+        [product.sku]
+      );
+      const existing = lockedProduct.rows[0];
+      if (!existing) {
+        throw new Error(`Commerce product disappeared during seed: ${product.sku}`);
+      }
+      const existingPolicy = JSON.stringify(existing.entitlement_policy);
+      if (
+        existing.name !== product.name ||
+        existing.description !== product.description ||
+        existing.product_channel !== product.productChannel ||
+        existing.fulfillment_type !== product.fulfillmentType ||
+        existingPolicy !== '{"grantCount":1}'
+      ) {
+        await client.query(
+          `UPDATE products
+           SET name = $2,
+               description = $3,
+               product_channel = $4,
+               fulfillment_type = $5,
+               entitlement_policy = '{"grantCount":1}'::jsonb,
+               updated_at = now()
+           WHERE id = $1`,
+          [
+            existing.id,
+            product.name,
+            product.description,
+            product.productChannel,
+            product.fulfillmentType
+          ]
+        );
+      }
+
+      await client.query(
+        `INSERT INTO product_prices(
+           product_id,
+           amount_fen,
+           currency,
+           effective_from
+         )
+         VALUES ($1, $2, 'CNY', now())
+         ON CONFLICT (product_id) WHERE effective_to IS NULL
+         DO NOTHING`,
+        [existing.id, product.amountFen]
+      );
+    }
+
+    await client.query(
+      `INSERT INTO promotion_rules(
+         code,
+         name,
+         product_id,
+         grant_count,
+         trigger_type,
+         constraints,
+         status
+       )
+       SELECT
+         'FIRST_POLICY_CALC',
+         '首次实名用户政策测算',
+         id,
+         1,
+         'first_verified_user',
+         '{}'::jsonb,
+         'active'
+       FROM products
+       WHERE sku = 'POLICY_CALC'
+       ON CONFLICT (code) DO NOTHING`
     );
   });
 };
