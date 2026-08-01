@@ -9,7 +9,7 @@ type OtpDelivery = {
 };
 
 export const buildOtpEmail = (code: string, ttlMinutes: number) => {
-  const subject = "赔了么登录验证码";
+  const subject = "赔了么验证码｜登录验证";
   const text = [
     "赔了么登录验证",
     "",

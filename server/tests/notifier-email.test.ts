@@ -5,7 +5,8 @@ describe("OTP email presentation", () => {
   it("builds a branded, client-compatible email with text fallback", () => {
     const email = buildOtpEmail("482913", 10);
 
-    expect(email.subject).toBe("赔了么登录验证码");
+    expect(email.subject).toBe("赔了么验证码｜登录验证");
+    expect(email.subject).toContain("赔了么验证码");
     expect(email.text).toContain("482913");
     expect(email.text).toContain("10 分钟内有效");
     expect(email.html).toContain("赔了么");
