@@ -23,16 +23,16 @@
 
 ## 发布后记录
 
-### `51025ad` AI 政策一体化与进度发布
+### `51025ad` / `c55e966` AI 政策一体化、进度与邮件发布
 
-- 核心发布提交：`51025ad`；邮件主题补丁与最终生产版本：`c55e966`；生产备份：`/opt/1panel/backup/peileme/20260801T010307Z`；回滚镜像标签：`rollback-20260801T010307Z`。
+- 核心发布提交：`51025ad`；邮件主题补丁与最终生产版本：`c55e966`；最终一致性备份：`/opt/1panel/backup/peileme/20260801T011312Z`；回滚镜像标签：`rollback-20260801T010307Z`。
 - AI 产品体验：`https://ai.peileme.art/policy` 在 AI 站内复用完整政策问答、账号和历史，浏览器前进/后退及刷新保持同一产品；未确认工资流水时按钮保持禁用。
 - AI 路由：API 与 Worker 均以 `tuzi / gpt-5.6-sol` 为主路由，以 `dataeyes / gemini-2.5-pro` 为降级路由；真实离职分析和文件审查均由 `gpt-5.6-sol` 完成。
 - 任务进度：生产任务持久化 `0 → 10 claimed → 20 loading_materials → 35 materials_ready → 45 provider_started → 85 provider_succeeded → 95 persisting_report → 100`，页面按后端事件展示阶段与阶段内估算进度。
 - 邮件：登录验证码使用带品牌头、验证码卡片、有效期和安全提示的响应式 HTML，同时保留纯文本兜底；SMTP 与阿里云 DirectMail 共用模板。生产发送返回 201、无调试码，投递记录为 `sent` 且存在 provider message ID。
-- 本地证据：非支付服务端测试 682/682；完整服务端测试 824/853，剩余 29 条为暂缓支付渠道的 Alipay WAP 与 WeChat V3 RED 契约；双站构建与产物隔离通过；本地 Playwright 10/10；真实 DataEyes 降级演练 1/1。
-- 生产 Playwright：10 条生产矩阵中 8 条通过，2 条开发调试验证码专属账号创建/重置用例按环境跳过并已在本地通过；覆盖真实 AI、文件上传/下载、内部政策测算、历史、共享登录态、主站 11 个后台页、AI 站 12 个后台页、公告发布/归档、安全响应头和 404。
-- 运行恢复：五个容器均为 `unless-stopped` 且 healthy；四个应用服务重启后回环与公网检查恢复，`https://peileme.art/api/health`、`https://ai.peileme.art/api/health` 和 `https://ai.peileme.art/policy` 均返回 200，健康版本为 `c55e966`。
+- 最终本地证据：核心服务端测试 `824/824`；主站政策 `26/26`；AI、双站、后台、材料与安全头 `15/15`；注册 `1/1`；受控降级 `1/1`；Compose 重启前后 `4/4`，共 `47` 条 Playwright 通过。暂缓支付渠道仍保留 Alipay WAP 与 WeChat V3 的 `29` 条 RED 契约。
+- 最终生产证据：常规真实用户矩阵 `14` 条通过、`2` 条调试验证码专属用例按 `OTP_DEBUG=false` 跳过；真实外部邮箱、真实 DataEyes 降级与重启后双站共 `4/4` 通过，合计 `18` 条生产 Playwright 通过。邮箱投递状态为 `sent`、provider message ID 存在，API/Worker 无 fatal，Web 无 5xx，`app_errors` 为空。
+- 运行恢复：五个容器均为 `unless-stopped` 且 healthy；四个应用服务重启后最新 DataEyes 降级任务仍为 `COMPLETED`，回环和外部 HTTPS 检查恢复。`https://peileme.art`、`https://ai.peileme.art`、两个管理后台、两个健康接口与 `https://ai.peileme.art/policy` 均返回 200，健康版本为 `c55e966`。
 
 - 运行提交：`c9a0679`；生产备份：`/opt/1panel/backup/peileme/20260731T221906Z`；回滚镜像标签：`rollback-20260731T221908Z`。
 - 数据状态：迁移 `016_ai_worker_attempts.sql`，364 个行政区域，63 条参数；三项首次权益均为启用、每项 1 次。
