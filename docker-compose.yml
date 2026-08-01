@@ -45,7 +45,7 @@ services:
       LLM_PRIMARY: ${LLM_PRIMARY:-tuzi}
       LLM_TUZI_BASE_URL: ${LLM_TUZI_BASE_URL:-https://api.tu-zi.com}
       LLM_TUZI_API_KEY: ${LLM_TUZI_API_KEY:-}
-      LLM_TUZI_MODEL: ${LLM_TUZI_MODEL:-gpt-5.4}
+      LLM_TUZI_MODEL: ${LLM_TUZI_MODEL:-gpt-5.6-sol}
       LLM_DATAEYES_BASE_URL: ${LLM_DATAEYES_BASE_URL:-https://cloud.dataeyes.ai}
       LLM_DATAEYES_API_KEY: ${LLM_DATAEYES_API_KEY:-}
       LLM_DATAEYES_MODEL: ${LLM_DATAEYES_MODEL:-gemini-2.5-pro}
@@ -87,7 +87,7 @@ services:
       LLM_PRIMARY: ${LLM_PRIMARY:-tuzi}
       LLM_TUZI_BASE_URL: ${LLM_TUZI_BASE_URL:-https://api.tu-zi.com}
       LLM_TUZI_API_KEY: ${LLM_TUZI_API_KEY:-}
-      LLM_TUZI_MODEL: ${LLM_TUZI_MODEL:-gpt-5.4}
+      LLM_TUZI_MODEL: ${LLM_TUZI_MODEL:-gpt-5.6-sol}
       LLM_DATAEYES_BASE_URL: ${LLM_DATAEYES_BASE_URL:-https://cloud.dataeyes.ai}
       LLM_DATAEYES_API_KEY: ${LLM_DATAEYES_API_KEY:-}
       LLM_DATAEYES_MODEL: ${LLM_DATAEYES_MODEL:-gemini-2.5-pro}

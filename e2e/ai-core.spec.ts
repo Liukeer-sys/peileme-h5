@@ -55,6 +55,7 @@ type CompletedAiJob = {
   id: string;
   status: string;
   selectedProvider: string | null;
+  selectedModel: string | null;
   report: { summary: string; findings?: unknown[]; actions?: unknown[] } | null;
 };
 
@@ -115,10 +116,12 @@ test("真实用户完成 AI 分析、PDF 审查、历史、下载、资料与邀
   expect(response?.status()).toBe(200);
   await expect(page).toHaveTitle("赔了么 AI - 离职补偿深度分析");
   await expect(page.getByRole("heading", { name: "把材料、金额和风险一次讲清楚" })).toBeVisible();
-  await expect(page.getByRole("link", { name: "政策测算" })).toHaveAttribute(
-    "href",
-    "https://peileme.art"
-  );
+  await page.getByRole("link", { name: "政策测算", exact: true }).click();
+  await expect(page).toHaveURL(`${aiBaseUrl}/policy`);
+  await expect(page.getByRole("button", { name: "上海", exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "AI 深度分析", exact: true }).click();
+  await expect(page).toHaveURL(`${aiBaseUrl}/`);
+  await expect(page.getByRole("heading", { name: "把材料、金额和风险一次讲清楚" })).toBeVisible();
 
   await page.getByRole("button", { name: "登录", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "登录赔了么" });
@@ -150,9 +153,22 @@ test("真实用户完成 AI 分析、PDF 审查、历史、下载、资料与邀
   expect(analysisResponse.status()).toBe(202);
   const queuedAnalysis = (await analysisResponse.json()) as CompletedAiJob;
   expect(queuedAnalysis.status).toBe("QUEUED");
+  const progress = page.getByRole("progressbar", { name: "AI 分析进度" });
+  await expect(progress).toBeVisible();
+  await expect(page.getByText("真实阶段", { exact: true })).toBeVisible();
+  await expect.poll(async () => Number(await progress.getAttribute("aria-valuenow")), {
+    timeout: 30_000
+  }).toBeGreaterThanOrEqual(20);
   const analysis = await waitForCompletedJob(page, queuedAnalysis.id);
   expect(analysis.status).toBe("COMPLETED");
   expect(["tuzi", "dataeyes"]).toContain(analysis.selectedProvider);
+  expect(
+    analysis.selectedProvider === "tuzi"
+      ? analysis.selectedModel
+      : "fallback"
+  ).toBe(
+    analysis.selectedProvider === "tuzi" ? "gpt-5.6-sol" : "fallback"
+  );
   expect(analysis.report?.summary.length).toBeGreaterThan(10);
   expect(analysis.report?.findings?.length).toBeGreaterThan(0);
   expect(analysis.report?.actions?.length).toBeGreaterThan(0);
@@ -415,7 +431,7 @@ test("AI 管理后台覆盖全部导航并将发布公告送达用户端", async
   }
   await expect(page.getByRole("cell", { name: "tuzi", exact: true })).toBeVisible();
   await expect(page.getByRole("cell", { name: "dataeyes", exact: true })).toBeVisible();
-  await expect(page.getByRole("cell", { name: "gpt-5.4", exact: true })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "gpt-5.6-sol", exact: true })).toBeVisible();
   await expect(page.getByRole("cell", { name: "gemini-2.5-pro", exact: true })).toBeVisible();
 
   await page.getByRole("button", { name: /用户管理/ }).click();

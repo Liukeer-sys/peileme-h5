@@ -574,7 +574,7 @@ describe("operational readiness", () => {
       }
     });
     expect(system.body.aiProviders).toEqual([
-      { key: "tuzi", model: "gpt-5.4", enabled: false, primary: true },
+      { key: "tuzi", model: "gpt-5.6-sol", enabled: false, primary: true },
       {
         key: "dataeyes",
         model: "gemini-2.5-pro",

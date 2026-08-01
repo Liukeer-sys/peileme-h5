@@ -69,6 +69,73 @@
   gap: 8px;
 }
 
+.ai-top-actions nav {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px;
+  border: 1px solid rgba(82, 70, 94, 0.12);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.ai-top-actions nav .mini-button {
+  border-color: transparent;
+  background: transparent;
+  text-decoration: none;
+}
+
+.ai-top-actions nav .mini-button[aria-pressed="true"] {
+  background: #6654aa;
+  color: #fff;
+  box-shadow: 0 5px 14px rgba(102, 84, 170, 0.22);
+}
+
+.policy-embedded-shell {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.policy-embedded-frame {
+  width: 100%;
+  height: auto;
+  max-height: none;
+  flex: 1;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
+.policy-embedded-toolbar {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 18px;
+  border-bottom: 1px solid rgba(82, 70, 94, 0.08);
+  background: rgba(250, 247, 255, 0.9);
+}
+
+.policy-embedded-toolbar > div {
+  display: grid;
+  gap: 2px;
+}
+
+.policy-embedded-toolbar strong {
+  color: #40364a;
+  font-size: 13px;
+}
+
+.policy-embedded-toolbar span {
+  color: #8d8195;
+  font-size: 10px;
+}
+
 .ai-top-actions button {
   font: inherit;
   cursor: pointer;
@@ -161,6 +228,85 @@
   color: #8a4f3a;
   font-size: 13px;
   line-height: 1.55;
+}
+
+.ai-job-progress {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 13px;
+  border: 1px solid rgba(102, 84, 170, 0.16);
+  border-radius: 16px;
+  background:
+    radial-gradient(circle at 100% 0, rgba(188, 168, 240, 0.24), transparent 45%),
+    rgba(250, 247, 255, 0.9);
+}
+
+.ai-job-progress-copy {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: baseline;
+  gap: 3px 10px;
+}
+
+.ai-job-progress-copy > span {
+  grid-column: 1 / -1;
+  color: #806dbd;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+}
+
+.ai-job-progress-copy strong {
+  color: #40364a;
+  font-size: 13px;
+}
+
+.ai-job-progress-copy small {
+  color: #8d8195;
+  font-size: 10px;
+}
+
+.ai-progress-track {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(102, 84, 170, 0.11);
+}
+
+.ai-progress-track > span {
+  position: relative;
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #8ac89b, #7d6ac7 58%, #bca8f0);
+  transition: width 500ms ease;
+}
+
+.ai-progress-track > span::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 20%, rgba(255,255,255,.55) 48%, transparent 75%);
+  transform: translateX(-100%);
+  animation: ai-progress-shimmer 1.8s ease-in-out infinite;
+}
+
+.ai-job-progress.is-compact {
+  margin-top: 10px;
+  padding: 11px;
+}
+
+@keyframes ai-progress-shimmer {
+  to { transform: translateX(100%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ai-progress-track > span,
+  .ai-progress-track > span::after {
+    animation: none;
+    transition: none;
+  }
 }
 
 .ai-report-title span {
@@ -384,8 +530,15 @@
   }
 
   .ai-top-actions .mini-button {
-    padding-inline: 9px;
-    font-size: 11px;
+    padding-inline: 8px;
+    font-size: 10px;
+  }
+
+  .ai-top-actions nav .mini-button:first-child {
+    max-width: 68px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .ai-review-heading small {

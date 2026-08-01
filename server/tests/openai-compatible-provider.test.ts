@@ -53,6 +53,25 @@ afterEach(() => {
 });
 
 describe("OpenAI-compatible AI provider", () => {
+  it("defaults to Tuzi gpt-5.6-sol with DataEyes as the configured fallback model", () => {
+    delete process.env.LLM_TUZI_MODEL;
+    delete process.env.LLM_DATAEYES_MODEL;
+    resetConfigForTests();
+
+    expect(getConfig()).toMatchObject({
+      LLM_PRIMARY: "tuzi",
+      LLM_TUZI_MODEL: "gpt-5.6-sol",
+      LLM_DATAEYES_MODEL: "gemini-2.5-pro"
+    });
+  });
+
+  it("defaults the Tuzi route to gpt-5.6-sol", () => {
+    delete process.env.LLM_TUZI_MODEL;
+    resetConfigForTests();
+
+    expect(getConfig().LLM_TUZI_MODEL).toBe("gpt-5.6-sol");
+  });
+
   it("loads the shared OranMemory-style environment contract", () => {
     process.env.LLM_PRIMARY = "dataeyes";
     process.env.LLM_TUZI_BASE_URL = "https://tuzi.example/v1/";

@@ -46,7 +46,7 @@ describe("Rollup product module graph boundary", () => {
     ).toThrow("main bundle imports forbidden module");
   });
 
-  it("rejects a main source module in an AI chunk", () => {
+  it("allows shared policy modules in the AI suite", () => {
     expect(() =>
       runBundleCheck("ai", {
         "index.js": {
@@ -61,7 +61,7 @@ describe("Rollup product module graph boundary", () => {
           source: ".ai-intro{}"
         }
       })
-    ).toThrow("ai bundle imports forbidden module");
+    ).not.toThrow();
   });
 
   it("requires channel-owned CSS in actual emitted assets", () => {

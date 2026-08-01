@@ -6,6 +6,7 @@ import {
   AiPanelLifecycleGuard,
   type AiPanelLifecycle
 } from "./AiPanelLifecycle";
+import AiJobProgress from "./AiJobProgress";
 
 const documentReviewSku = "AI_DOCUMENT_REVIEW" as const;
 
@@ -24,6 +25,10 @@ type AiJob = {
   failureCode: string | null;
   progress?: number;
   report: { summary: string } | null;
+  events?: Array<{
+    progress: number;
+    detail?: { stage?: string };
+  }>;
 };
 
 const waitForTerminalJob = async (
@@ -79,6 +84,7 @@ export default function AiAccountPanel({
     "签署前检查放弃权利、补偿金额、付款时间、保密和违约责任"
   );
   const [reviewingUploadId, setReviewingUploadId] = useState<string | null>(null);
+  const [reviewJob, setReviewJob] = useState<AiJob | null>(null);
   const [busy, setBusy] = useState(false);
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const displayNameRef = useRef<HTMLInputElement | null>(null);
@@ -100,6 +106,7 @@ export default function AiAccountPanel({
     setUploadMessage("");
     setDocumentObjective("签署前检查放弃权利、补偿金额、付款时间、保密和违约责任");
     setReviewingUploadId(null);
+    setReviewJob(null);
     setBusy(false);
     if (fileInputRef.current) fileInputRef.current.value = "";
   }, []);
@@ -295,15 +302,17 @@ export default function AiAccountPanel({
       });
       if (!guard.isCurrent(lifecycle) || controller.signal.aborted) return;
       onJobCreated?.(queuedJob.id);
+      setReviewJob(queuedJob);
       setUploadMessage("文件审查已排队，正在等待 AI Worker");
       const job = await waitForTerminalJob(
         queuedJob,
         controller.signal,
         (current) => {
           if (!guard.isCurrent(lifecycle) || controller.signal.aborted) return;
+          setReviewJob(current);
           setUploadMessage(
             current.status === "RUNNING"
-              ? `AI 正在审查文件（${current.progress ?? 10}%）`
+              ? "AI 正在审查文件，进度会随后台阶段实时更新"
               : "文件审查已排队，正在等待 AI Worker"
           );
         }
@@ -399,6 +408,9 @@ export default function AiAccountPanel({
             <div className="account-message" role="status" aria-live="polite">
               {uploadMessage}
             </div>
+          )}
+          {reviewJob && (
+            <AiJobProgress job={reviewJob} compact />
           )}
         </div>
 

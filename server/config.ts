@@ -160,7 +160,7 @@ const envSchema = z.object({
   LLM_PRIMARY: z.enum(["tuzi", "dataeyes"]).default("tuzi"),
   LLM_TUZI_BASE_URL: llmBaseUrl.default("https://api.tu-zi.com"),
   LLM_TUZI_API_KEY: llmApiKey,
-  LLM_TUZI_MODEL: z.string().trim().min(1).max(160).default("gpt-5.4"),
+  LLM_TUZI_MODEL: z.string().trim().min(1).max(160).default("gpt-5.6-sol"),
   LLM_DATAEYES_BASE_URL: llmBaseUrl.default("https://cloud.dataeyes.ai"),
   LLM_DATAEYES_API_KEY: llmApiKey,
   LLM_DATAEYES_MODEL: z.string().trim().min(1).max(160).default("gemini-2.5-pro"),

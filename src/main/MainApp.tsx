@@ -117,7 +117,15 @@ const normalizeStoredDetail = (detail: PolicyHistoryDetail): Answers => ({
   followUps: {}
 });
 
-export default function MainApp() {
+type MainAppProps = {
+  embedded?: boolean;
+  accountRequestKey?: number;
+};
+
+export default function MainApp({
+  embedded = false,
+  accountRequestKey = 0
+}: MainAppProps) {
   const { user } = useAuth();
   const sharedToken = useMemo(
     () => new URLSearchParams(window.location.search).get("share") || "",
@@ -181,6 +189,7 @@ export default function MainApp() {
   const regionAbortRef = useRef<AbortController | null>(null);
   const regionDialogRef = useRef<HTMLDivElement | null>(null);
   const regionSearchRef = useRef<HTMLInputElement | null>(null);
+  const handledAccountRequestRef = useRef(0);
   const {
     busy: policyOperationBusy,
     cancel: cancelPolicyOperation,
@@ -309,6 +318,14 @@ export default function MainApp() {
       bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
     }
   }, [messages, mode, requestError, readyToCalculate]);
+
+  useEffect(() => {
+    if (!embedded || accountRequestKey === 0) return;
+    if (handledAccountRequestRef.current === accountRequestKey) return;
+    handledAccountRequestRef.current = accountRequestKey;
+    if (user) setAccountOpen(true);
+    else setAuthOpen(true);
+  }, [accountRequestKey, embedded, user]);
 
   useEffect(() => {
     const pageKey = `peileme-page-view:${window.location.pathname}`;
@@ -878,10 +895,13 @@ export default function MainApp() {
       ? currentTerminationNode?.options.map((option) => option.label) || []
       : currentQuestion?.options || [];
 
+  const Shell = embedded ? "div" : "main";
+
   return (
-    <main className="app-shell">
-      <section className="phone-frame">
-        <header className={mode === "result" ? "topbar result-topbar" : "topbar"}>
+    <Shell className={embedded ? "policy-embedded-shell" : "app-shell"}>
+      <section className={embedded ? "phone-frame policy-embedded-frame" : "phone-frame"}>
+        {!embedded && (
+          <header className={mode === "result" ? "topbar result-topbar" : "topbar"}>
           <div><span className="brand-dot" /><strong>赔了么</strong></div>
           <div className="topbar-actions">
             <button
@@ -897,9 +917,21 @@ export default function MainApp() {
               <button className="mini-button" type="button" onClick={restart}>重算</button>
             )}
           </div>
-        </header>
+          </header>
+        )}
 
-        <AnnouncementBanner />
+        {!embedded && <AnnouncementBanner />}
+        {embedded && mode !== "result" && (
+          <div className="policy-embedded-toolbar">
+            <div>
+              <strong>政策测算</strong>
+              <span>和 AI 分析共享账号与历史</span>
+            </div>
+            <button className="mini-button" type="button" onClick={restart}>
+              重新开始
+            </button>
+          </div>
+        )}
 
         {shareError && (
           <section className="shared-link-error" aria-labelledby="shared-link-error-title">
@@ -1297,6 +1329,6 @@ export default function MainApp() {
         policyRecalculating={accountOpen && policyOperationBusy}
         onPolicyRecalculate={recalculateHistory}
       />
-    </main>
+    </Shell>
   );
 }

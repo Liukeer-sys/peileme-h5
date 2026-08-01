@@ -4,12 +4,14 @@ import { runProviderChain } from "../llm/router.js";
 import type { AiProvider, AiProviderAttempt } from "../llm/types.js";
 import { loadOwnedProviderMaterials } from "./materials.js";
 import {
+  advanceAiJobProgress,
   claimNextAiJob,
   completeAiJob,
   failAiJob,
   recoverExpiredAiJobs,
   renewAiJobLease,
-  requeueAiJob
+  requeueAiJob,
+  setAiJobProgress
 } from "./repository.js";
 
 export type AiWorkerOptions = {
@@ -69,6 +71,21 @@ export const processNextAiJob = async (
     );
   }, Math.max(10_000, Math.floor(options.leaseSeconds * 1_000 / 3)));
   renewal.unref();
+  const publishProgress = (
+    progress: number,
+    stage: string,
+    detail?: Record<string, unknown>
+  ) =>
+    setAiJobProgress({
+      jobId: job.id,
+      workerId: options.workerId,
+      jobAttempt: job.attemptCount,
+      progress,
+      stage,
+      detail
+    });
+  await publishProgress(20, "loading_materials");
+  let progressHeartbeat: NodeJS.Timeout | null = null;
 
   let attempts: readonly AiProviderAttempt[] = [];
   try {
@@ -80,6 +97,7 @@ export const processNextAiJob = async (
           mimeType: "application/octet-stream",
           sizeBytes: "0"
         }));
+    await publishProgress(35, "materials_ready");
     let routed;
     try {
       routed = await runProviderChain(providers, {
@@ -87,6 +105,51 @@ export const processNextAiJob = async (
         kind: job.kind,
         input: job.input,
         uploads
+      }, {
+        onEvent: async (event) => {
+          if (event.type === "attempt_started") {
+            const progress = event.ordinal === 1
+              ? 45
+              : Math.min(80, 65 + (event.ordinal - 2) * 7);
+            await publishProgress(progress, "provider_started", {
+              ordinal: event.ordinal,
+              provider: event.providerKey,
+              model: event.model
+            });
+            if (!progressHeartbeat) {
+              progressHeartbeat = setInterval(() => {
+                void advanceAiJobProgress({
+                  jobId: job.id,
+                  workerId: options.workerId,
+                  jobAttempt: job.attemptCount,
+                  increment: 3,
+                  maximum: 82
+                }).catch(() => undefined);
+              }, 2_000);
+              progressHeartbeat.unref();
+            }
+            return;
+          }
+          if (event.type === "attempt_failed" && event.hasFallback) {
+            await publishProgress(
+              Math.min(82, 55 + (event.attempt.ordinal - 1) * 7),
+              "provider_fallback",
+              {
+                ordinal: event.attempt.ordinal,
+                provider: event.attempt.providerKey,
+                errorCode: event.attempt.errorCode
+              }
+            );
+            return;
+          }
+          if (event.type === "attempt_succeeded") {
+            await publishProgress(85, "provider_succeeded", {
+              ordinal: event.attempt.ordinal,
+              provider: event.attempt.providerKey,
+              model: event.attempt.model
+            });
+          }
+        }
       });
     } catch {
       const failureCode = "AI_PROVIDER_CONFIGURATION_ERROR";
@@ -108,6 +171,7 @@ export const processNextAiJob = async (
 
     attempts = routed.attempts;
     if (routed.ok) {
+      await publishProgress(95, "persisting_report");
       await completeAiJob({
         jobId: job.id,
         usageId: job.entitlementUsageId,
@@ -220,6 +284,7 @@ export const processNextAiJob = async (
     return { processed: true, jobId: job.id, status: "failed", failureCode };
   } finally {
     clearInterval(renewal);
+    if (progressHeartbeat) clearInterval(progressHeartbeat);
   }
 };
 

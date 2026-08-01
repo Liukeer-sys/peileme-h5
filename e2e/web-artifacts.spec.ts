@@ -135,7 +135,7 @@ test.describe("separate main and AI web artifacts", () => {
     expectNoFailures();
   });
 
-  test("AI happy path renders its own shell and main-site link", async ({ page }) => {
+  test("AI happy path keeps policy calculation inside the AI product", async ({ page }) => {
     const expectNoFailures = watchBrowserFailures(page);
     await page.setViewportSize({ width: 390, height: 844 });
 
@@ -146,13 +146,11 @@ test.describe("separate main and AI web artifacts", () => {
     await expect(
       page.getByRole("heading", { name: "把材料、金额和风险一次讲清楚" })
     ).toBeVisible();
-    await expect(page.getByRole("link", { name: "政策测算" })).toHaveAttribute(
-      "href",
-      "https://peileme.art"
-    );
-    await expect(page.getByRole("button", { name: "上海", exact: true })).toHaveCount(
-      0
-    );
+    await page.getByRole("link", { name: "政策测算", exact: true }).click();
+    await expect(page).toHaveURL(`${aiBaseUrl}/policy`);
+    await expect(page.getByRole("button", { name: "上海", exact: true })).toBeVisible();
+    await page.getByRole("link", { name: "AI 深度分析", exact: true }).click();
+    await expect(page).toHaveURL(`${aiBaseUrl}/`);
     await page.getByRole("button", { name: "登录并开始分析" }).click();
     await expect(
       page.getByText("登录后可进行离职补偿分析、文件签署审查", { exact: false })

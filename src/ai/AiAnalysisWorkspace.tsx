@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError, track } from "../lib/api";
+import AiJobProgress from "./AiJobProgress";
 
 type AiFinding = {
   title: string;
@@ -23,6 +24,10 @@ type AiJob = {
   progress?: number;
   report: AiReport | null;
   createdAt: string;
+  events?: Array<{
+    progress: number;
+    detail?: { stage?: string };
+  }>;
 };
 
 type AiJobList = {
@@ -77,7 +82,7 @@ export default function AiAnalysisWorkspace({
       setActiveJob(current);
       setMessage(
         current.status === "RUNNING"
-          ? `AI 正在分析（${current.progress ?? 10}%）`
+          ? "AI 正在处理，进度会随后台阶段实时更新"
           : "任务已排队，正在等待 AI Worker"
       );
     }
@@ -181,6 +186,9 @@ export default function AiAnalysisWorkspace({
           {busy ? "AI Worker 处理中…" : "开始 AI 分析"}
         </button>
         {message && <p className="ai-workspace-message" role="status">{message}</p>}
+        {activeJob && (
+          <AiJobProgress job={activeJob} eyebrow="真实阶段" />
+        )}
       </div>
 
       {report && (

@@ -317,7 +317,11 @@ export const claimNextAiJob = async (
     await client.query(
       `INSERT INTO ai_job_events(job_id, from_status, to_status, progress, detail)
        VALUES ($1, 'QUEUED', 'RUNNING', 10, $2)`,
-      [job.id, { workerId, attempt: job.attempt_count + 1 }]
+      [job.id, {
+        workerId,
+        attempt: job.attempt_count + 1,
+        stage: "claimed"
+      }]
     );
     return {
       id: job.id,
@@ -345,6 +349,65 @@ export const renewAiJobLease = async (
     [jobId, workerId, leaseSeconds]
   );
   return renewed.rowCount === 1;
+};
+
+export const setAiJobProgress = async (input: {
+  jobId: string;
+  workerId: string;
+  jobAttempt: number;
+  progress: number;
+  stage: string;
+  detail?: Record<string, unknown>;
+}) =>
+  withTransaction(async (client) => {
+    const updated = await client.query(
+      `UPDATE ai_jobs
+          SET progress = GREATEST(progress, $4),
+              updated_at = now()
+        WHERE id = $1
+          AND status = 'RUNNING'
+          AND claimed_by = $2
+          AND attempt_count = $3
+      RETURNING progress`,
+      [input.jobId, input.workerId, input.jobAttempt, input.progress]
+    );
+    if (!updated.rowCount) return false;
+    await client.query(
+      `INSERT INTO ai_job_events(job_id, from_status, to_status, progress, detail)
+       VALUES ($1, 'RUNNING', 'RUNNING', $2, $3)`,
+      [input.jobId, updated.rows[0].progress, {
+        stage: input.stage,
+        ...input.detail
+      }]
+    );
+    return true;
+  });
+
+export const advanceAiJobProgress = async (input: {
+  jobId: string;
+  workerId: string;
+  jobAttempt: number;
+  increment: number;
+  maximum: number;
+}) => {
+  const updated = await query(
+    `UPDATE ai_jobs
+        SET progress = LEAST($5, progress + $4),
+            updated_at = now()
+      WHERE id = $1
+        AND status = 'RUNNING'
+        AND claimed_by = $2
+        AND attempt_count = $3
+        AND progress < $5`,
+    [
+      input.jobId,
+      input.workerId,
+      input.jobAttempt,
+      input.increment,
+      input.maximum
+    ]
+  );
+  return updated.rowCount === 1;
 };
 
 const persistAttempts = async (

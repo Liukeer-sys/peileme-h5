@@ -175,9 +175,57 @@ describe("AI asynchronous API boundary", () => {
       selectedProvider: "delayed",
       report: { summary: "后台完成" }
     });
-    expect(completed.body.events.map((event: { toStatus: string }) => event.toStatus)).toEqual([
-      "QUEUED", "RUNNING", "COMPLETED"
+    expect(completed.body.events.map((event: { progress: number }) => event.progress)).toEqual([
+      0, 10, 20, 35, 45, 85, 95, 100
     ]);
+    expect(completed.body.events.map((event: { detail: { stage?: string } }) => event.detail.stage))
+      .toEqual([
+        undefined,
+        "claimed",
+        "loading_materials",
+        "materials_ready",
+        "provider_started",
+        "provider_succeeded",
+        "persisting_report",
+        undefined
+      ]);
+  });
+
+  it("publishes worker progress before the provider finishes", async () => {
+    let releaseProvider!: () => void;
+    let markProviderStarted!: () => void;
+    const providerStarted = new Promise<void>((resolve) => {
+      markProviderStarted = resolve;
+    });
+    const providerReleased = new Promise<void>((resolve) => {
+      releaseProvider = resolve;
+    });
+    const provider: AiProvider = {
+      key: "observable-progress",
+      model: "observable-v1",
+      priority: 1,
+      analyze: async () => {
+        markProviderStarted();
+        await providerReleased;
+        return report("可观察进度任务完成");
+      }
+    };
+    const queued = await submit(tokenA, {
+      kind: "severance_analysis",
+      idempotencyKey: "observable-progress-1",
+      input: { situation: "公司提出解除，我需要在等待模型返回期间看到持续更新的分析进度。" }
+    });
+    const running = processNextAiJob([provider], workerOptions("observable-progress"));
+    await providerStarted;
+
+    try {
+      const current = await detail(tokenA, queued.body.id);
+      expect(current.body).toMatchObject({ status: "RUNNING" });
+      expect(current.body.progress).toBeGreaterThanOrEqual(38);
+    } finally {
+      releaseProvider();
+      await running;
+    }
   });
 });
 
@@ -214,6 +262,26 @@ describe("AI Worker fallback, retry and entitlement settlement", () => {
       provider: "fallback"
     });
     expect(calls).toEqual(["primary", "fallback"]);
+
+    const progress = await query<{ progress: number; stage: string | null }>(
+      `SELECT progress, detail->>'stage' AS stage
+         FROM ai_job_events
+        WHERE job_id = $1
+        ORDER BY id`,
+      [queued.body.id]
+    );
+    expect(progress.rows).toEqual([
+      { progress: 0, stage: null },
+      { progress: 10, stage: "claimed" },
+      { progress: 20, stage: "loading_materials" },
+      { progress: 35, stage: "materials_ready" },
+      { progress: 45, stage: "provider_started" },
+      { progress: 55, stage: "provider_fallback" },
+      { progress: 65, stage: "provider_started" },
+      { progress: 85, stage: "provider_succeeded" },
+      { progress: 95, stage: "persisting_report" },
+      { progress: 100, stage: null }
+    ]);
 
     const attempts = await query<{
       job_attempt: number;

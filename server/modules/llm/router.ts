@@ -76,9 +76,31 @@ export type ProviderChainResult =
       attempts: AiProviderAttempt[];
     };
 
+export type ProviderChainEvent =
+  | {
+      type: "attempt_started";
+      ordinal: number;
+      providerKey: string;
+      model: string;
+    }
+  | {
+      type: "attempt_failed";
+      attempt: AiProviderAttempt;
+      hasFallback: boolean;
+    }
+  | {
+      type: "attempt_succeeded";
+      attempt: AiProviderAttempt;
+    };
+
+type ProviderChainOptions = {
+  onEvent?: (event: ProviderChainEvent) => void | Promise<void>;
+};
+
 export const runProviderChain = async (
   providers: readonly AiProvider[],
-  request: AiProviderRequest
+  request: AiProviderRequest,
+  options: ProviderChainOptions = {}
 ): Promise<ProviderChainResult> => {
   const chain = createProviderRegistry(providers);
   if (!chain.length) {
@@ -91,34 +113,50 @@ export const runProviderChain = async (
 
   const attempts: AiProviderAttempt[] = [];
   for (const [index, provider] of chain.entries()) {
+    await options.onEvent?.({
+      type: "attempt_started",
+      ordinal: index + 1,
+      providerKey: provider.key,
+      model: provider.model
+    });
     const startedAt = performance.now();
+    let report: AiReport;
     try {
-      const report = aiReportSchema.parse(await provider.analyze(request));
-      attempts.push({
-        ordinal: index + 1,
-        providerKey: provider.key,
-        model: provider.model,
-        outcome: "succeeded",
-        errorCode: null,
-        latencyMs: Math.max(0, Math.round(performance.now() - startedAt))
-      });
-      return {
-        ok: true,
-        report,
-        providerKey: provider.key,
-        model: provider.model,
-        attempts
-      };
+      report = aiReportSchema.parse(await provider.analyze(request));
     } catch (error) {
-      attempts.push({
+      const attempt: AiProviderAttempt = {
         ordinal: index + 1,
         providerKey: provider.key,
         model: provider.model,
         outcome: "failed",
         errorCode: classifyProviderError(error),
         latencyMs: Math.max(0, Math.round(performance.now() - startedAt))
+      };
+      attempts.push(attempt);
+      await options.onEvent?.({
+        type: "attempt_failed",
+        attempt,
+        hasFallback: index + 1 < chain.length
       });
+      continue;
     }
+    const attempt: AiProviderAttempt = {
+      ordinal: index + 1,
+      providerKey: provider.key,
+      model: provider.model,
+      outcome: "succeeded",
+      errorCode: null,
+      latencyMs: Math.max(0, Math.round(performance.now() - startedAt))
+    };
+    attempts.push(attempt);
+    await options.onEvent?.({ type: "attempt_succeeded", attempt });
+    return {
+      ok: true,
+      report,
+      providerKey: provider.key,
+      model: provider.model,
+      attempts
+    };
   }
   return {
     ok: false,

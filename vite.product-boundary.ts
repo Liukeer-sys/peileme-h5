@@ -15,7 +15,7 @@ export const assertProductBoundary = (
   channel: ProductBoundaryChannel,
   bundle: OutputBundle
 ) => {
-  const forbiddenSourceDirectory = channel === "main" ? "/src/ai/" : "/src/main/";
+  const forbiddenSourceDirectory = channel === "main" ? "/src/ai/" : null;
   const chunks = Object.values(bundle).filter(
     (entry): entry is OutputChunk => entry.type === "chunk"
   );
@@ -26,7 +26,10 @@ export const assertProductBoundary = (
 
   for (const chunk of chunks) {
     for (const moduleId of Object.keys(chunk.modules)) {
-      if (normalizeModuleId(moduleId).includes(forbiddenSourceDirectory)) {
+      if (
+        forbiddenSourceDirectory &&
+        normalizeModuleId(moduleId).includes(forbiddenSourceDirectory)
+      ) {
         throw new Error(
           `${channel} bundle imports forbidden module: ${normalizeModuleId(moduleId)}`
         );
