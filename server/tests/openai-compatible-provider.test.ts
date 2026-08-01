@@ -61,7 +61,7 @@ describe("OpenAI-compatible AI provider", () => {
     expect(getConfig()).toMatchObject({
       LLM_PRIMARY: "tuzi",
       LLM_TUZI_MODEL: "gpt-5.6-sol",
-      LLM_DATAEYES_MODEL: "gemini-2.5-pro"
+      LLM_DATAEYES_MODEL: "gpt-5.6-sol"
     });
   });
 
@@ -112,13 +112,13 @@ describe("OpenAI-compatible AI provider", () => {
       dataeyes: {
         baseUrl: "https://cloud.dataeyes.ai",
         apiKey: "dataeyes-secret",
-        model: "gemini-2.5-pro"
+        model: "gpt-5.6-sol"
       }
     });
 
     expect(providers.map(({ key, model, priority }) => ({ key, model, priority })))
       .toEqual([
-        { key: "dataeyes", model: "gemini-2.5-pro", priority: 1 },
+        { key: "dataeyes", model: "gpt-5.6-sol", priority: 1 },
         { key: "tuzi", model: "gpt-5.4", priority: 2 }
       ]);
     expect(JSON.stringify(providers)).not.toContain("secret");
@@ -136,7 +136,7 @@ describe("OpenAI-compatible AI provider", () => {
       dataeyes: {
         baseUrl: "https://cloud.dataeyes.ai",
         apiKey: "",
-        model: "gemini-2.5-pro"
+        model: "gpt-5.6-sol"
       }
     });
     expect(onlyTuzi.map((provider) => provider.key)).toEqual(["tuzi"]);
@@ -202,7 +202,7 @@ describe("OpenAI-compatible AI provider", () => {
         key: "dataeyes",
         baseUrl: "https://cloud.dataeyes.ai/v1",
         apiKey: "second-key",
-        model: "gemini-2.5-pro",
+        model: "gpt-5.6-sol",
         priority: 2,
         maxRetries: 1,
         retryBackoffMs: 1,

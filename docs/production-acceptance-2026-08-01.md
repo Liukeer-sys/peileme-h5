@@ -27,7 +27,7 @@
 
 - 核心发布提交：`51025ad`；邮件主题补丁与最终生产版本：`c55e966`；最终一致性备份：`/opt/1panel/backup/peileme/20260801T011312Z`；回滚镜像标签：`rollback-20260801T010307Z`。
 - AI 产品体验：`https://ai.peileme.art/policy` 在 AI 站内复用完整政策问答、账号和历史，浏览器前进/后退及刷新保持同一产品；未确认工资流水时按钮保持禁用。
-- AI 路由：API 与 Worker 均以 `tuzi / gpt-5.6-sol` 为主路由，以 `dataeyes / gemini-2.5-pro` 为降级路由；真实离职分析和文件审查均由 `gpt-5.6-sol` 完成。
+- AI 路由：API 与 Worker 均以 `tuzi / gpt-5.6-sol` 为主路由，以 `dataeyes / gpt-5.6-sol` 为降级路由；真实离职分析和文件审查均使用 `gpt-5.6-sol`。
 - 任务进度：生产任务持久化 `0 → 10 claimed → 20 loading_materials → 35 materials_ready → 45 provider_started → 85 provider_succeeded → 95 persisting_report → 100`，页面按后端事件展示阶段与阶段内估算进度。
 - 邮件：登录验证码使用带品牌头、验证码卡片、有效期和安全提示的响应式 HTML，同时保留纯文本兜底；SMTP 与阿里云 DirectMail 共用模板。生产发送返回 201、无调试码，投递记录为 `sent` 且存在 provider message ID。
 - 最终本地证据：核心服务端测试 `824/824`；主站政策 `26/26`；AI、双站、后台、材料与安全头 `15/15`；注册 `1/1`；受控降级 `1/1`；Compose 重启前后 `4/4`，共 `47` 条 Playwright 通过。暂缓支付渠道仍保留 Alipay WAP 与 WeChat V3 的 `29` 条 RED 契约。

@@ -431,8 +431,9 @@ test("AI 管理后台覆盖全部导航并将发布公告送达用户端", async
   }
   await expect(page.getByRole("cell", { name: "tuzi", exact: true })).toBeVisible();
   await expect(page.getByRole("cell", { name: "dataeyes", exact: true })).toBeVisible();
-  await expect(page.getByRole("cell", { name: "gpt-5.6-sol", exact: true })).toBeVisible();
-  await expect(page.getByRole("cell", { name: "gemini-2.5-pro", exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("cell", { name: "gpt-5.6-sol", exact: true })
+  ).toHaveCount(2);
 
   await page.getByRole("button", { name: /用户管理/ }).click();
   await expect(page.getByText(userEmail!, { exact: true })).toBeVisible();

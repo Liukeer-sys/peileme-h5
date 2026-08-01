@@ -163,7 +163,7 @@ const envSchema = z.object({
   LLM_TUZI_MODEL: z.string().trim().min(1).max(160).default("gpt-5.6-sol"),
   LLM_DATAEYES_BASE_URL: llmBaseUrl.default("https://cloud.dataeyes.ai"),
   LLM_DATAEYES_API_KEY: llmApiKey,
-  LLM_DATAEYES_MODEL: z.string().trim().min(1).max(160).default("gemini-2.5-pro"),
+  LLM_DATAEYES_MODEL: z.string().trim().min(1).max(160).default("gpt-5.6-sol"),
   LLM_MAX_RETRIES: z.coerce.number().int().min(1).max(5).default(3),
   LLM_RETRY_BACKOFF_MS: z.coerce.number().int().min(0).max(10_000).default(800),
   LLM_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(240_000).default(90_000),

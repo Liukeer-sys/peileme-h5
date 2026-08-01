@@ -577,7 +577,7 @@ describe("operational readiness", () => {
       { key: "tuzi", model: "gpt-5.6-sol", enabled: false, primary: true },
       {
         key: "dataeyes",
-        model: "gemini-2.5-pro",
+        model: "gpt-5.6-sol",
         enabled: false,
         primary: false
       }
