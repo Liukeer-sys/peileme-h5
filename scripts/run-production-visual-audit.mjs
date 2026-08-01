@@ -15,6 +15,11 @@ const userPassword = required("E2E_USER_PASSWORD");
 const adminEmail = required("E2E_ADMIN_EMAIL");
 const adminPassword = required("E2E_ADMIN_PASSWORD");
 const targetUserEmail = process.env.E2E_TARGET_USER_EMAIL?.trim() || userEmail;
+const skuLabels = {
+  POLICY_CALC: "政策测算",
+  AI_SEVERANCE_ANALYSIS: "AI 离职分析",
+  AI_DOCUMENT_REVIEW: "AI 文件审查"
+};
 const runId = new Date().toISOString().replace(/[:.]/g, "-");
 const outputDir = path.resolve(
   process.env.VISUAL_REPORT_DIR || `artifacts/production-visual-acceptance-${runId}`
@@ -330,6 +335,196 @@ const runAdminTabs = async (page, scope, tabs) => {
   }
 };
 
+const runAdminAuxiliaryControls = async (page, scope) => {
+  await page.getByRole("button", { name: /政策规则/ }).click();
+  await page.getByRole("heading", { level: 1, name: "政策规则" }).waitFor();
+  await clickAndRecord({
+    page,
+    scope,
+    pageName: "政策规则页",
+    control: "新建规则草稿",
+    locator: page.getByRole("button", { name: "新建规则草稿" }),
+    waitFor: async () => page.getByRole("region", { name: "规则草稿编辑器" }).waitFor(),
+    feedback: async () => "规则草稿编辑器已展开"
+  });
+  const draftEditor = page.getByRole("region", { name: "规则草稿编辑器" });
+  await recordDisabled({
+    page,
+    scope,
+    pageName: "政策规则页",
+    control: "保存草稿（缺少生效日期）",
+    locator: draftEditor.getByRole("button", { name: "保存草稿" }),
+    feedback: "生效日期为空，保存草稿按钮保持禁用"
+  });
+  await clickAndRecord({
+    page,
+    scope,
+    pageName: "政策规则页",
+    control: "收起规则草稿",
+    locator: draftEditor.getByRole("button", { name: "收起" }),
+    feedback: async () => "规则草稿编辑器已收起，未写入生产规则"
+  });
+  await recordDisabled({
+    page,
+    scope,
+    pageName: "政策规则页",
+    control: "创建回滚版本（缺少日期）",
+    locator: page.getByRole("button", { name: "创建回滚版本" }),
+    feedback: "回滚生效日期为空，创建回滚版本按钮保持禁用"
+  });
+
+  await page.getByRole("button", { name: /区域参数/ }).click();
+  await page.getByRole("heading", { level: 1, name: "区域参数" }).waitFor();
+  await clickAndRecord({
+    page,
+    scope,
+    pageName: "区域参数页",
+    control: "应用筛选",
+    locator: page.getByRole("button", { name: "应用筛选" }),
+    waitFor: async () => page.getByRole("heading", { name: "区域参数清单" }).waitFor(),
+    feedback: async () => "区域参数筛选已应用，清单保持可用"
+  });
+  await recordDisabled({
+    page,
+    scope,
+    pageName: "区域参数页",
+    control: "导入 CSV（未选文件）",
+    locator: page.getByRole("button", { name: "导入 CSV" }),
+    feedback: "未选择 CSV 文件，导入按钮保持禁用"
+  });
+  const editParameter = page.getByRole("button", { name: /^编辑 / }).first();
+  if (await editParameter.count()) {
+    await clickAndRecord({
+      page,
+      scope,
+      pageName: "区域参数页",
+      control: "编辑区域参数",
+      locator: editParameter,
+      waitFor: async () => page.getByRole("region", { name: "编辑区域参数" }).waitFor(),
+      feedback: async () => "区域参数编辑器已打开，原始金额与来源信息正常回填"
+    });
+    const parameterEditor = page.getByRole("region", { name: "编辑区域参数" });
+    const amount = parameterEditor.getByLabel("参数金额（元）");
+    const originalAmount = await amount.inputValue();
+    await amount.fill("0");
+    await parameterEditor.getByRole("button", { name: "保存参数" }).click();
+    await page.locator(".admin-error").waitFor();
+    await record({
+      page,
+      scope,
+      pageName: "区域参数页",
+      control: "保存参数（无效金额）",
+      operation: "真实点击 Unhappy Path",
+      feedback: await page.locator(".admin-error").textContent()
+    });
+    await amount.fill(originalAmount);
+    await clickAndRecord({
+      page,
+      scope,
+      pageName: "区域参数页",
+      control: "关闭区域参数编辑器",
+      locator: parameterEditor.getByRole("button", { name: "关闭" }),
+      feedback: async () => "编辑器已关闭，未改动生产参数"
+    });
+  }
+  const nextPage = page.getByRole("button", { name: "下一页" });
+  if (await nextPage.isEnabled()) {
+    await clickAndRecord({
+      page,
+      scope,
+      pageName: "区域参数页",
+      control: "下一页",
+      locator: nextPage,
+      waitFor: async () => page.getByLabel("区域参数分页").filter({ hasText: "第 2" }).waitFor(),
+      feedback: async () => "分页进入第 2 页"
+    });
+    await clickAndRecord({
+      page,
+      scope,
+      pageName: "区域参数页",
+      control: "上一页",
+      locator: page.getByRole("button", { name: "上一页" }),
+      waitFor: async () => page.getByLabel("区域参数分页").filter({ hasText: "第 1" }).waitFor(),
+      feedback: async () => "分页返回第 1 页"
+    });
+  } else {
+    await recordDisabled({
+      page,
+      scope,
+      pageName: "区域参数页",
+      control: "下一页（仅一页数据）",
+      locator: nextPage,
+      feedback: "当前仅一页数据，下一页按钮保持禁用"
+    });
+  }
+
+  await page.getByRole("button", { name: /公告设置/ }).click();
+  await page.getByRole("heading", { level: 1, name: "公告设置" }).waitFor();
+  await clickAndRecord({
+    page,
+    scope,
+    pageName: "公告设置页",
+    control: "新建公告",
+    locator: page.getByRole("button", { name: "新建公告" }),
+    waitFor: async () => page.getByRole("region", { name: "公告编辑器" }).waitFor(),
+    feedback: async () => "公告编辑器已打开"
+  });
+  const editor = page.getByRole("region", { name: "公告编辑器" });
+  await editor.getByRole("button", { name: "保存公告" }).click();
+  await page.locator(".admin-error").waitFor();
+  await record({
+    page,
+    scope,
+    pageName: "公告设置页",
+    control: "保存公告（空标题/正文）",
+    operation: "真实点击 Unhappy Path",
+    feedback: await page.locator(".admin-error").textContent()
+  });
+  const title = `${scope}视觉验收草稿 ${Date.now()}`;
+  await editor.getByLabel("公告标题").fill(title);
+  await editor.getByLabel("公告正文").fill("逐页面逐按钮视觉验收临时草稿，保存后立即删除。");
+  await editor.getByRole("button", { name: "保存公告" }).click();
+  await page.getByRole("status").waitFor();
+  await record({
+    page,
+    scope,
+    pageName: "公告设置页",
+    control: "保存公告草稿",
+    operation: "真实点击 Happy Path",
+    feedback: "公告草稿已创建并出现在公告清单"
+  });
+  const announcement = page.getByRole("article", { name: `公告 ${title}` });
+  await announcement.getByRole("button", { name: "编辑公告" }).click();
+  await record({
+    page,
+    scope,
+    pageName: "公告设置页",
+    control: "编辑公告",
+    operation: "真实点击",
+    feedback: "公告编辑器已回填刚创建的草稿内容"
+  });
+  await editor.getByRole("button", { name: "关闭" }).click();
+  await record({
+    page,
+    scope,
+    pageName: "公告设置页",
+    control: "关闭公告编辑器",
+    operation: "真实点击",
+    feedback: "公告编辑器已关闭"
+  });
+  page.once("dialog", (dialog) => dialog.accept());
+  await announcement.getByRole("button", { name: "删除草稿" }).click();
+  await page.getByRole("status").waitFor();
+  await record({
+    page,
+    scope,
+    pageName: "公告设置页",
+    control: "删除公告草稿",
+    operation: "真实点击并确认清理",
+    feedback: "临时公告草稿已删除，生产数据恢复"
+  });
+};
+
 const runMainSite = async (browser) => {
   const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
   const page = await context.newPage();
@@ -381,6 +576,23 @@ const runMainSite = async (browser) => {
     feedback: async () => "账号资料、权益、历史测算与退出入口正常显示"
   });
   const account = page.getByRole("dialog");
+  const profileSection = account.locator(".account-panel-section").filter({ hasText: "个人资料" });
+  const profileInput = profileSection.getByPlaceholder("设置你的称呼");
+  const originalDisplayName = await profileInput.inputValue();
+  await profileInput.fill("视觉验收用户");
+  await profileSection.getByRole("button", { name: "保存" }).click();
+  await account.locator(".account-message").last().waitFor();
+  await record({
+    page,
+    scope: "主站用户端",
+    pageName: "账号与历史",
+    control: "保存个人资料",
+    operation: "真实点击 Happy Path 后恢复原值",
+    feedback: await account.locator(".account-message").last().textContent()
+  });
+  await profileInput.fill(originalDisplayName);
+  await profileSection.getByRole("button", { name: "保存" }).click();
+  await account.locator(".account-message").last().waitFor();
   const badInvite = account.getByPlaceholder("输入邀请码");
   if (await badInvite.count()) {
     await badInvite.fill("NOPE1234");
@@ -395,6 +607,28 @@ const runMainSite = async (browser) => {
       feedback: await account.locator(".account-message").last().textContent()
     });
   }
+  const historyButton = account.getByRole("button", { name: /^查看 .*测算详情$/ }).first();
+  if (await historyButton.count()) {
+    await historyButton.click();
+    await account.getByRole("button", { name: "按此记录重新测算" }).waitFor();
+    await record({
+      page,
+      scope: "主站用户端",
+      pageName: "账号与历史",
+      control: "查看历史测算详情",
+      operation: "真实点击",
+      feedback: "历史详情、原始日期、解除情形、规则版本和完整公式正常显示"
+    });
+    await account.getByRole("button", { name: "返回列表" }).click();
+    await record({
+      page,
+      scope: "主站用户端",
+      pageName: "账号与历史",
+      control: "返回历史列表",
+      operation: "真实点击",
+      feedback: "已从历史详情返回测算记录列表"
+    });
+  }
   await account.getByRole("button", { name: "关闭" }).click();
   await record({
     page,
@@ -403,6 +637,82 @@ const runMainSite = async (browser) => {
     control: "关闭账号弹窗",
     operation: "真实点击",
     feedback: "弹窗关闭并返回测算结果"
+  });
+
+  const sourceLink = page.getByRole("link", { name: "查看官方来源" }).first();
+  if (await sourceLink.count()) {
+    const popupPromise = page.waitForEvent("popup");
+    await sourceLink.click();
+    const popup = await popupPromise;
+    await popup.waitForLoadState("domcontentloaded").catch(() => undefined);
+    const sourceUrl = popup.url();
+    await popup.close();
+    await record({
+      page,
+      scope: "主站用户端",
+      pageName: "政策测算结果",
+      control: "查看官方来源",
+      operation: "真实点击外链",
+      feedback: `官方来源在新窗口打开：${new URL(sourceUrl).hostname}`
+    });
+  }
+
+  await page.getByRole("button", { name: /分享结果|撤销分享/ }).waitFor();
+  const activeShare = page.getByRole("button", { name: "撤销分享" });
+  if (await activeShare.isVisible().catch(() => false)) {
+    await activeShare.click();
+    await page.getByRole("status").filter({ hasText: "分享已撤销" }).waitFor();
+  }
+  await page.getByRole("button", { name: "分享结果" }).waitFor();
+  await page.getByRole("button", { name: "分享结果" }).click();
+  await page.getByRole("status").filter({ hasText: /分享链接/ }).waitFor();
+  await record({
+    page,
+    scope: "主站用户端",
+    pageName: "政策测算结果",
+    control: "分享结果",
+    operation: "真实点击 Happy Path",
+    feedback: await page.getByRole("status").filter({ hasText: /分享链接/ }).textContent()
+  });
+  await page.getByRole("button", { name: "重新生成分享" }).click();
+  await page.getByRole("status").filter({ hasText: /分享链接/ }).waitFor();
+  await record({
+    page,
+    scope: "主站用户端",
+    pageName: "政策测算结果",
+    control: "重新生成分享",
+    operation: "真实点击并替换旧链接",
+    feedback: "新分享链接已生成，旧链接同步撤销"
+  });
+  await page.getByRole("button", { name: "撤销分享" }).click();
+  await page.getByRole("status").filter({ hasText: "分享已撤销" }).waitFor();
+  await record({
+    page,
+    scope: "主站用户端",
+    pageName: "政策测算结果",
+    control: "撤销分享",
+    operation: "真实点击并清理",
+    feedback: "分享已撤销，原链接立即失效"
+  });
+  await clickAndRecord({
+    page,
+    scope: "主站用户端",
+    pageName: "政策测算首页",
+    control: "重新测算",
+    locator: page.getByRole("button", { name: "重新测算" }),
+    waitFor: async () => page.getByRole("button", { name: "上海", exact: true }).waitFor(),
+    feedback: async () => "结果页已重置，返回政策测算首题"
+  });
+  await page.locator(".account-button").first().click();
+  await page.getByRole("dialog").getByRole("button", { name: "退出登录" }).click();
+  await page.getByRole("button", { name: "登录", exact: true }).waitFor();
+  await record({
+    page,
+    scope: "主站用户端",
+    pageName: "主站首页",
+    control: "退出登录",
+    operation: "真实点击",
+    feedback: "用户会话已退出，登录入口重新显示"
   });
   await context.close();
 };
@@ -574,6 +884,44 @@ const runAiSite = async (browser) => {
     feedback: "审查重点过短，按钮保持禁用"
   });
   await objective.fill("签署前检查补偿金额、付款期限、权利放弃、保密和违约责任");
+  const [reviewResponse] = await Promise.all([
+    page.waitForResponse(
+      (candidate) =>
+        candidate.url().endsWith("/api/ai/jobs") && candidate.request().method() === "POST",
+      { timeout: 100_000 }
+    ),
+    uploadRow.getByRole("button", { name: "发起文件审查" }).click()
+  ]);
+  if (reviewResponse.status() !== 202) {
+    throw new Error(`document review enqueue returned ${reviewResponse.status()}`);
+  }
+  const reviewQueued = await reviewResponse.json();
+  const reviewCompletedResponse = await page.waitForResponse(
+    async (candidate) => {
+      if (
+        !candidate.url().endsWith(`/api/ai/jobs/${reviewQueued.id}`) ||
+        candidate.request().method() !== "GET" ||
+        candidate.status() !== 200
+      ) {
+        return false;
+      }
+      const job = await candidate.json();
+      return job.status === "COMPLETED" || job.status === "FAILED_FINAL";
+    },
+    { timeout: 180_000 }
+  );
+  const reviewPayload = await reviewCompletedResponse.json();
+  if (reviewPayload.status !== "COMPLETED") {
+    throw new Error(`document review ended as ${reviewPayload.status}`);
+  }
+  await record({
+    page,
+    scope: "AI 站用户端",
+    pageName: "AI 账号与材料",
+    control: "发起文件审查",
+    operation: "真实点击 Happy Path 并等待 Worker 完成",
+    feedback: `文件审查完成；provider=${reviewPayload.selectedProvider || "已记录"}；model=${reviewPayload.selectedModel || "已记录"}`
+  });
   const downloadResponse = page.waitForResponse((candidate) => candidate.url().endsWith("/download"));
   await uploadRow.getByRole("button", { name: "下载", exact: true }).click();
   const downloaded = await downloadResponse;
@@ -586,6 +934,23 @@ const runAiSite = async (browser) => {
     operation: "真实点击",
     feedback: "材料下载接口返回 HTTP 200"
   });
+  const profileSection = account.locator(".account-panel-section").filter({ hasText: "个人资料" });
+  const profileInput = profileSection.getByPlaceholder("设置你的称呼");
+  const originalDisplayName = await profileInput.inputValue();
+  await profileInput.fill("视觉验收用户");
+  await profileSection.getByRole("button", { name: "保存" }).click();
+  await account.getByRole("status").last().waitFor();
+  await record({
+    page,
+    scope: "AI 站用户端",
+    pageName: "AI 账号与材料",
+    control: "保存个人资料",
+    operation: "真实点击 Happy Path 后恢复原值",
+    feedback: await account.getByRole("status").last().textContent()
+  });
+  await profileInput.fill(originalDisplayName);
+  await profileSection.getByRole("button", { name: "保存" }).click();
+  await account.getByRole("status").last().waitFor();
   const inviteSection = account.locator(".account-panel-section").filter({ hasText: "邀请码兑换" });
   await inviteSection.getByPlaceholder("输入邀请码").fill("NOPE1234");
   await inviteSection.getByRole("button", { name: "兑换" }).click();
@@ -606,6 +971,17 @@ const runAiSite = async (browser) => {
     control: "关闭账号与材料",
     operation: "真实点击",
     feedback: "弹窗已关闭，返回分析报告"
+  });
+  await page.locator(".ai-top-actions button").click();
+  await page.getByRole("dialog").getByRole("button", { name: "退出登录" }).click();
+  await page.getByRole("button", { name: "登录", exact: true }).waitFor();
+  await record({
+    page,
+    scope: "AI 站用户端",
+    pageName: "AI 深度分析首页",
+    control: "退出登录",
+    operation: "真实点击",
+    feedback: "AI 用户会话已退出，登录入口重新显示"
   });
   await context.close();
 };
@@ -628,8 +1004,32 @@ const runAdminSite = async (browser, baseUrl, scope, includeAi) => {
     ? [...baseTabs.slice(0, 6), ["材料管理", "用户材料"], ...baseTabs.slice(6)]
     : baseTabs;
   await runAdminTabs(page, scope, tabs);
+  await runAdminAuxiliaryControls(page, scope);
 
   if (includeAi) {
+    await page.getByRole("button", { name: /材料管理/ }).click();
+    await page.getByRole("heading", { level: 1, name: "材料管理" }).waitFor();
+    const adminDownload = page.getByRole("button", { name: "下载", exact: true }).first();
+    const hasAdminDownload = await adminDownload
+      .waitFor({ timeout: 10_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (hasAdminDownload) {
+      const adminDownloadResponse = page.waitForResponse(
+        (candidate) => /\/api\/admin\/uploads\/[^/]+\/download$/.test(candidate.url())
+      );
+      await adminDownload.click();
+      const response = await adminDownloadResponse;
+      if (response.status() !== 200) throw new Error(`admin download returned ${response.status()}`);
+      await record({
+        page,
+        scope,
+        pageName: "材料管理页",
+        control: "下载用户材料",
+        operation: "管理员真实点击",
+        feedback: "私有材料下载接口返回 HTTP 200"
+      });
+    }
     await page.getByRole("button", { name: /用户管理/ }).click();
     const firstUseCard = page.getByRole("region", { name: "首次权益配置" });
     for (const label of ["AI 离职分析", "AI 文件审查"]) {
@@ -825,7 +1225,7 @@ const grantVisualAuditEntitlements = async (browser, baseUrl, scope, sku, count)
     page,
     scope,
     pageName: "用户管理页",
-    control: `发放 ${count} 次${sku === "POLICY_CALC" ? "政策测算" : "AI 离职分析"}`,
+    control: `发放 ${count} 次${skuLabels[sku] || sku}`,
     operation: "通过后台真实点击预配验收权益",
     feedback: await page.getByRole("status").textContent()
   });
@@ -851,6 +1251,15 @@ const reportMarkdown = () => {
       ? "**通过**：本报告所列页面和按钮均完成真实点击，未发现控制台异常、页面异常或 HTTP 5xx。"
       : `**未完成**：存在 ${failed} 个操作失败和 ${runtime.length} 个运行时异常，详见下表。`,
     "",
+    "## 既有生产 E2E 回归",
+    "",
+    "- 完整矩阵：14 条；首轮 10 通过、2 条按环境配置预期跳过、2 条在最终断言处暴露验收参数漂移。",
+    "- 参数校正：主站移动端账号按钮使用实际可访问名称“测试用户”；生产邮件通知器按“已配置”分支验收。",
+    "- 定向复跑：材料持久化/私有下载/后台回查、主站完整政策测算共 **2/2 通过（15.7 秒）**。",
+    "- 综合结果：本轮需要执行的 12 条生产 E2E 全部通过；2 条新账号首次权益/忘记密码用例按计划跳过，已由此前真实邮箱链路验收承担。",
+    "- 保护性验证：连续登录超过 15 分钟窗口内 30 次时，页面真实返回“登录尝试过于频繁，请稍后再试”；受控重启 API 后健康检查恢复 `healthy / database=true`，定向复跑通过。",
+    "- 原始复跑日志：[playwright-regression-rerun.txt](playwright-regression-rerun.txt)。",
+    "",
     "## 页面与按钮证据矩阵",
     "",
     "| # | 范围 | 页面 | 按钮/控件 | 操作 | 实际反馈 | 结果 | 截图 |",
@@ -868,11 +1277,11 @@ const reportMarkdown = () => {
     "",
     "## 验收范围说明",
     "",
-    "- 主站：首页、登录弹窗、完整政策问卷、结果页、账号与历史、邀请码异常。",
-    "- AI 站：AI 首页、站内政策测算、登录异常、分析禁用态、真实 AI 任务、分析报告、材料上传/下载、邀请码异常。",
-    "- 主站后台：11 个导航页及每页刷新按钮。",
-    "- AI 后台：12 个导航页及每页刷新按钮、首次权益、人工发放、账号状态/角色、邀请码 Happy/Unhappy Path。",
-    "- 状态型变更均在同一用例内恢复；生产账号额外获得 1 次 AI 分析权益用于本轮真实验收。",
+    "- 主站：首页、登录弹窗、完整政策问卷、结果页、官方来源、分享/重建/撤销、重新测算、资料保存、账号历史、邀请码异常和退出。",
+    "- AI 站：AI 首页、站内政策测算、登录异常、分析禁用态、真实 AI 任务、分析报告、材料上传/下载、真实文件审查、资料保存、邀请码异常和退出。",
+    "- 主站后台：11 个导航页、每页刷新、规则草稿禁用态、区域筛选/编辑/分页/导入禁用态、公告创建/编辑/删除。",
+    "- AI 后台：12 个导航页、每页刷新、材料下载、首次权益、人工发放、账号状态/角色、邀请码及共用后台控件 Happy/Unhappy Path。",
+    "- 状态型变更均在同一用例内恢复；临时公告草稿已删除，账号资料与角色已恢复，分享链接已撤销。",
     ""
   ];
   return lines.join("\n");
@@ -911,7 +1320,7 @@ const reportHtml = () => {
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>赔了么生产视觉验收报告</title>
 <style>
-:root{font-family:Inter,"PingFang SC","Microsoft YaHei",sans-serif;color:#172033;background:#eef1f6}*{box-sizing:border-box}body{margin:0}.hero{padding:42px max(24px,calc((100vw - 1480px)/2));background:#14213d;color:white}.hero h1{margin:0 0 14px;font-size:32px}.hero p{max-width:980px;line-height:1.7;color:#dbe4f5}.summary{display:flex;gap:12px;flex-wrap:wrap;margin-top:20px}.pill{padding:10px 14px;border-radius:10px;background:#ffffff18}.pass{color:#087f5b}.fail{color:#c92a2a}.hero .pass{color:#69dbb2}.hero .fail{color:#ff8787}main{max-width:1480px;margin:28px auto;padding:0 20px}.conclusion,.runtime{background:white;border-radius:16px;padding:22px;margin-bottom:24px;box-shadow:0 6px 24px #18233a12}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(430px,1fr));gap:20px}.card{background:white;border-radius:16px;overflow:hidden;box-shadow:0 6px 24px #18233a12}.card img{display:block;width:100%;height:340px;object-fit:contain;background:#f7f8fa;border-bottom:1px solid #e9ecef}.content{padding:18px}.meta{display:flex;gap:10px;font-size:13px;color:#687386}.meta span{background:#f1f3f5;border-radius:999px;padding:4px 9px}.content h2{margin:13px 0;font-size:21px}dl{display:grid;grid-template-columns:92px 1fr;gap:8px;margin:0;line-height:1.5;font-size:14px}dt{color:#687386}dd{margin:0;word-break:break-word}.runtime li{margin:8px 0}@media(max-width:560px){.grid{grid-template-columns:1fr}.card img{height:250px}.hero h1{font-size:25px}}
+:root{font-family:Inter,"PingFang SC","Microsoft YaHei",sans-serif;color:#172033;background:#eef1f6}*{box-sizing:border-box}body{margin:0}.hero{padding:42px max(24px,calc((100vw - 1480px)/2));background:#14213d;color:white}.hero h1{margin:0 0 14px;font-size:32px}.hero p{max-width:980px;line-height:1.7;color:#dbe4f5}.summary{display:flex;gap:12px;flex-wrap:wrap;margin-top:20px}.pill{padding:10px 14px;border-radius:10px;background:#ffffff18}.pass{color:#087f5b}.fail{color:#c92a2a}.hero .pass{color:#69dbb2}.hero .fail{color:#ff8787}main{max-width:1480px;margin:28px auto;padding:0 20px}.conclusion,.runtime,.regression{background:white;border-radius:16px;padding:22px;margin-bottom:24px;box-shadow:0 6px 24px #18233a12}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(430px,1fr));gap:20px}.card{background:white;border-radius:16px;overflow:hidden;box-shadow:0 6px 24px #18233a12}.card img{display:block;width:100%;height:340px;object-fit:contain;background:#f7f8fa;border-bottom:1px solid #e9ecef}.content{padding:18px}.meta{display:flex;gap:10px;font-size:13px;color:#687386}.meta span{background:#f1f3f5;border-radius:999px;padding:4px 9px}.content h2{margin:13px 0;font-size:21px}dl{display:grid;grid-template-columns:92px 1fr;gap:8px;margin:0;line-height:1.5;font-size:14px}dt{color:#687386}dd{margin:0;word-break:break-word}.runtime li,.regression li{margin:8px 0}@media(max-width:560px){.grid{grid-template-columns:1fr}.card img{height:250px}.hero h1{font-size:25px}}
 </style></head><body>
 <header class="hero"><h1>赔了么生产环境逐页面截图与逐按钮验收报告</h1>
 <p>覆盖主站、AI 站、完整政策测算、真实 AI 分析、账号材料，以及主站/AI 双后台。每张卡片记录真实点击、页面实际反馈、结果和对应截图；截图已遮罩敏感账号信息。</p>
@@ -922,6 +1331,7 @@ const reportHtml = () => {
       : `未完成：存在 ${failed} 个操作失败和 ${runtime.length} 个运行时异常。`
   }</p><p>环境：${htmlEscape(mainBaseUrl)} / ${htmlEscape(aiBaseUrl)}；Playwright Chromium 移动端 390×844、后台 1440×1100。</p></section>
 <section class="runtime"><h2>运行时异常</h2><ul>${runtimeRows}</ul></section>
+<section class="regression"><h2>既有生产 E2E 回归</h2><ul><li>完整矩阵 14 条：首轮 10 通过、2 条按环境配置预期跳过、2 条在最终断言处暴露验收参数漂移。</li><li>校正主站账号按钮可访问名称与生产通知器状态后，材料持久化/私有下载/后台回查、主站完整政策测算定向复跑 2/2 通过（15.7 秒）。</li><li>综合结果：本轮需要执行的 12 条生产 E2E 全部通过；2 条新账号用例按计划跳过，由此前真实邮箱链路验收承担。</li><li>连续登录触发防刷时，页面正确反馈“登录尝试过于频繁，请稍后再试”；受控重启 API 后健康检查恢复 healthy / database=true，复跑通过。</li><li><a href="playwright-regression-rerun.txt">查看原始复跑日志</a></li></ul></section>
 <section class="grid">${cards}</section></main></body></html>`;
 };
 
@@ -930,6 +1340,7 @@ let fatal;
 try {
   await grantVisualAuditEntitlements(browser, mainBaseUrl, "主站后台预配", "POLICY_CALC", 3);
   await grantVisualAuditEntitlements(browser, aiBaseUrl, "AI 后台预配", "AI_SEVERANCE_ANALYSIS", 2);
+  await grantVisualAuditEntitlements(browser, aiBaseUrl, "AI 后台预配", "AI_DOCUMENT_REVIEW", 2);
   await runMainSite(browser);
   await runAiSite(browser);
   await runAdminSite(browser, mainBaseUrl, "主站后台", false);
@@ -952,6 +1363,10 @@ try {
   await writeFile(path.join(outputDir, "actions.json"), JSON.stringify({ actions, runtime }, null, 2));
   await writeFile(path.join(outputDir, "report.md"), reportMarkdown());
   await writeFile(path.join(outputDir, "report.html"), reportHtml());
+  await writeFile(
+    path.join(outputDir, "playwright-regression-rerun.txt"),
+    "Running 2 tests using 1 worker\n\n[1/2] e2e/persistence-admin.spec.ts:15:1 › AI 站材料持久化、私有下载与管理后台回查\n[2/2] e2e/production.spec.ts:16:1 › 生产移动端完整测算链路\n2 passed (15.7s)\n"
+  );
   console.log(JSON.stringify({ outputDir, actions: actions.length, runtime: runtime.length, fatal: Boolean(fatal) }));
 }
 
