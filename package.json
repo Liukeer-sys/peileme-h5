@@ -24,6 +24,7 @@
     "test:api": "node scripts/run-api-tests.mjs",
     "test:watch": "vitest",
     "test:e2e:production": "playwright test",
+    "test:e2e:visual-production": "node scripts/run-production-visual-audit.mjs",
     "test:e2e:dual-compose": "node scripts/run-dual-web-compose-e2e.mjs",
     "preview": "vite preview --config vite.main.config.ts",
     "preview:web:ai": "vite preview --config vite.ai.config.ts"
