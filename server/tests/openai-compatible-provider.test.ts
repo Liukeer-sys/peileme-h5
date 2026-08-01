@@ -177,6 +177,125 @@ describe("OpenAI-compatible AI provider", () => {
     expect(body.messages[1].content).toContain("公司口头通知解除劳动合同");
   });
 
+  it("parses split upstream SSE frames and emits every content delta", async () => {
+    const encodedReport = JSON.stringify(report);
+    const encoder = new TextEncoder();
+    const frames = [
+      `data: ${JSON.stringify({ choices: [{ delta: { content: encodedReport.slice(0, 31) } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: { content: encodedReport.slice(31, 79) } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: { content: encodedReport.slice(79) } }] })}\n\n`,
+      "data: [DONE]\n\n"
+    ];
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          const wire = frames.join("");
+          controller.enqueue(encoder.encode(wire.slice(0, 47)));
+          controller.enqueue(encoder.encode(wire.slice(47, 123)));
+          controller.enqueue(encoder.encode(wire.slice(123)));
+          controller.close();
+        }
+      }),
+      { status: 200, headers: { "content-type": "text/event-stream" } }
+    );
+    const fetchImpl = vi.fn().mockResolvedValue(response);
+    const provider = createOpenAiCompatibleProvider(
+      {
+        key: "tuzi",
+        baseUrl: "https://api.tu-zi.com",
+        apiKey: "provider-secret",
+        model: "gpt-5.6-sol",
+        priority: 1,
+        maxRetries: 1,
+        retryBackoffMs: 0,
+        requestTimeoutMs: 2_000
+      },
+      { fetchImpl, sleep: vi.fn() }
+    );
+    const received: string[] = [];
+
+    await expect(
+      provider.analyzeStream?.(request, (token) => received.push(token))
+    ).resolves.toEqual(report);
+    expect(received.join("")).toBe(encodedReport);
+    expect(JSON.parse(String(fetchImpl.mock.calls[0][1].body))).toMatchObject({
+      model: "gpt-5.6-sol",
+      stream: true
+    });
+  });
+
+  it("falls back when a streaming provider fails before its first token", async () => {
+    const fallback = vi.fn();
+    const streamed: string[] = [];
+    const result = await runProviderChain(
+      [
+        {
+          key: "tuzi",
+          model: "gpt-5.6-sol",
+          priority: 1,
+          analyze: vi.fn(),
+          analyzeStream: async () => {
+            throw new Error("upstream unavailable");
+          }
+        },
+        {
+          key: "dataeyes",
+          model: "gpt-5.6-sol",
+          priority: 2,
+          analyze: vi.fn(),
+          analyzeStream: async (_providerRequest, onToken) => {
+            fallback();
+            await onToken(JSON.stringify(report));
+            return report;
+          }
+        }
+      ],
+      request,
+      { onToken: ({ text }) => streamed.push(text) }
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.providerKey).toBe("dataeyes");
+    expect(fallback).toHaveBeenCalledTimes(1);
+    expect(streamed.join("")).toBe(JSON.stringify(report));
+  });
+
+  it("stops the chain when a streaming provider fails after its first token", async () => {
+    const fallback = vi.fn();
+    const result = await runProviderChain(
+      [
+        {
+          key: "tuzi",
+          model: "gpt-5.6-sol",
+          priority: 1,
+          analyze: vi.fn(),
+          analyzeStream: async (_providerRequest, onToken) => {
+            await onToken("{");
+            throw new Error("connection reset");
+          }
+        },
+        {
+          key: "dataeyes",
+          model: "gpt-5.6-sol",
+          priority: 2,
+          analyze: vi.fn(),
+          analyzeStream: async () => {
+            fallback();
+            return report;
+          }
+        }
+      ],
+      request,
+      { onToken: vi.fn() }
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      failureCode: "AI_PROVIDER_STREAM_INTERRUPTED"
+    });
+    expect(fallback).not.toHaveBeenCalled();
+  });
+
   it("switches provider immediately after a permanent upstream rejection", async () => {
     const firstFetch = vi.fn().mockResolvedValue(
       new Response("unauthorized", { status: 401 })

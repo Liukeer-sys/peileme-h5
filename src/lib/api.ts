@@ -173,6 +173,103 @@ export async function api<T>(path: string, options: ApiOptions = {}): Promise<T>
   return (await response.json()) as T;
 }
 
+type AiJobStreamOptions = {
+  signal?: AbortSignal;
+  onChunk: (text: string) => void;
+};
+
+const waitBeforeStreamReconnect = (signal?: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    const timeout = window.setTimeout(resolve, 400);
+    signal?.addEventListener("abort", () => {
+      window.clearTimeout(timeout);
+      reject(new DOMException("Aborted", "AbortError"));
+    }, { once: true });
+  });
+
+export async function streamAiJob<T>(
+  jobId: string,
+  options: AiJobStreamOptions
+): Promise<T> {
+  if (!accessToken) await refreshSession();
+  let after = 0;
+  let reconnects = 0;
+
+  while (reconnects <= 8) {
+    if (options.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    const makeRequest = () => fetch(
+      `/api/ai/jobs/${encodeURIComponent(jobId)}/stream?after=${after}`,
+      {
+        credentials: "include",
+        signal: options.signal,
+        headers: {
+          Accept: "text/event-stream",
+          "x-visitor-id": visitorId,
+          "x-session-id": sessionId,
+          ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {})
+        }
+      }
+    );
+    let response = await makeRequest();
+    if (response.status === 401 && await refreshSession()) {
+      response = await makeRequest();
+    }
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({})) as {
+        error?: string;
+        message?: string;
+      };
+      throw new ApiError(
+        response.status,
+        error.error || "AI_STREAM_FAILED",
+        error.message || "AI 回复连接失败，请稍后重试"
+      );
+    }
+    if (!response.body) {
+      throw new ApiError(502, "AI_STREAM_EMPTY", "AI 回复连接未返回内容");
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      while (true) {
+        const next = await reader.read();
+        buffer += decoder.decode(next.value, { stream: !next.done }).replace(/\r\n/g, "\n");
+        const blocks = buffer.split("\n\n");
+        buffer = blocks.pop() ?? "";
+        for (const block of blocks) {
+          if (!block || block.startsWith(":")) continue;
+          const lines = block.split("\n");
+          const event = lines.find((line) => line.startsWith("event:"))?.slice(6).trim();
+          const id = lines.find((line) => line.startsWith("id:"))?.slice(3).trim();
+          const data = lines
+            .filter((line) => line.startsWith("data:"))
+            .map((line) => line.slice(5).trimStart())
+            .join("\n");
+          if (id && /^\d+$/.test(id)) after = Math.max(after, Number(id));
+          if (event === "chunk" && data) {
+            const payload = JSON.parse(data) as { text?: unknown };
+            if (typeof payload.text === "string") options.onChunk(payload.text);
+          }
+          if (event === "done" && data) return JSON.parse(data) as T;
+        }
+        if (next.done) break;
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") throw error;
+    }
+    reconnects += 1;
+    if (reconnects > 8) break;
+    await waitBeforeStreamReconnect(options.signal);
+  }
+  throw new ApiError(
+    504,
+    "AI_STREAM_RECONNECT_EXHAUSTED",
+    "AI 回复连接中断，任务仍会在后台保存，请从历史记录查看"
+  );
+}
+
 type PolicyApiWireResult = Omit<PolicyApiResult, "accuracyLevel"> & {
   accuracy?: PolicyApiResult["accuracyLevel"];
   accuracyLevel?: PolicyApiResult["accuracyLevel"];

@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useAuth, type GrantModule } from "../auth/AuthContext";
 import { useDialogFocus } from "../hooks/useDialogFocus";
-import { api, ApiError, downloadFromApi, track } from "../lib/api";
+import { api, ApiError, downloadFromApi, streamAiJob, track } from "../lib/api";
 import {
   AiPanelLifecycleGuard,
   type AiPanelLifecycle
 } from "./AiPanelLifecycle";
-import AiJobProgress from "./AiJobProgress";
+import { extractStreamingSummary } from "./stream-preview";
 
 const documentReviewSku = "AI_DOCUMENT_REVIEW" as const;
 
@@ -29,32 +29,6 @@ type AiJob = {
     progress: number;
     detail?: { stage?: string };
   }>;
-};
-
-const waitForTerminalJob = async (
-  initial: AiJob,
-  signal: AbortSignal,
-  onProgress: (job: AiJob) => void
-) => {
-  let current = initial;
-  for (let attempt = 0; attempt < 600; attempt += 1) {
-    if (current.status === "COMPLETED" || current.status === "FAILED_FINAL") {
-      return current;
-    }
-    await new Promise<void>((resolve, reject) => {
-      const timeout = window.setTimeout(resolve, 1_000);
-      signal.addEventListener("abort", () => {
-        window.clearTimeout(timeout);
-        reject(new DOMException("Aborted", "AbortError"));
-      }, { once: true });
-    });
-    current = await api<AiJob>(`/api/ai/jobs/${initial.id}`, {
-      auth: true,
-      signal
-    });
-    onProgress(current);
-  }
-  throw new ApiError(504, "AI_JOB_POLL_TIMEOUT", "审查仍在后台进行，请稍后从历史记录查看");
 };
 
 type AiAccountPanelProps = {
@@ -84,7 +58,7 @@ export default function AiAccountPanel({
     "签署前检查放弃权利、补偿金额、付款时间、保密和违约责任"
   );
   const [reviewingUploadId, setReviewingUploadId] = useState<string | null>(null);
-  const [reviewJob, setReviewJob] = useState<AiJob | null>(null);
+  const [reviewStreamRaw, setReviewStreamRaw] = useState("");
   const [busy, setBusy] = useState(false);
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const displayNameRef = useRef<HTMLInputElement | null>(null);
@@ -106,7 +80,7 @@ export default function AiAccountPanel({
     setUploadMessage("");
     setDocumentObjective("签署前检查放弃权利、补偿金额、付款时间、保密和违约责任");
     setReviewingUploadId(null);
-    setReviewJob(null);
+    setReviewStreamRaw("");
     setBusy(false);
     if (fileInputRef.current) fileInputRef.current.value = "";
   }, []);
@@ -288,6 +262,7 @@ export default function AiAccountPanel({
     const controller = guard.beginRequest("upload", lifecycle);
     setReviewingUploadId(item.id);
     setUploadMessage("");
+    setReviewStreamRaw("");
     try {
       const queuedJob = await api<AiJob>("/api/ai/jobs", {
         method: "POST",
@@ -302,23 +277,16 @@ export default function AiAccountPanel({
       });
       if (!guard.isCurrent(lifecycle) || controller.signal.aborted) return;
       onJobCreated?.(queuedJob.id);
-      setReviewJob(queuedJob);
-      setUploadMessage("文件审查已排队，正在等待 AI Worker");
-      const job = await waitForTerminalJob(
-        queuedJob,
-        controller.signal,
-        (current) => {
+      const job = await streamAiJob<AiJob>(queuedJob.id, {
+        signal: controller.signal,
+        onChunk: (text) => {
           if (!guard.isCurrent(lifecycle) || controller.signal.aborted) return;
-          setReviewJob(current);
-          setUploadMessage(
-            current.status === "RUNNING"
-              ? "AI 正在审查文件，进度会随后台阶段实时更新"
-              : "文件审查已排队，正在等待 AI Worker"
-          );
+          setReviewStreamRaw((current) => current + text);
         }
-      );
+      });
       if (!guard.isCurrent(lifecycle) || controller.signal.aborted) return;
       onJobCreated?.(job.id);
+      setReviewStreamRaw("");
       setUploadMessage(
         job.report?.summary ||
           (job.failureCode === "AI_PROVIDER_NOT_CONFIGURED"
@@ -333,6 +301,7 @@ export default function AiAccountPanel({
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
       if (guard.isCurrent(lifecycle) && !controller.signal.aborted) {
+        setReviewStreamRaw("");
         setUploadMessage(explainError(error, "文件审查提交失败"));
       }
     } finally {
@@ -340,6 +309,8 @@ export default function AiAccountPanel({
       if (guard.isCurrent(lifecycle)) setReviewingUploadId(null);
     }
   };
+
+  const reviewStreamSummary = extractStreamingSummary(reviewStreamRaw);
 
   return (
     <div
@@ -409,8 +380,11 @@ export default function AiAccountPanel({
               {uploadMessage}
             </div>
           )}
-          {reviewJob && (
-            <AiJobProgress job={reviewJob} compact />
+          {reviewingUploadId && (
+            <article className="ai-stream-card is-compact" aria-live="polite" aria-label="AI 文件审查实时回复">
+              <span>AI 实时审查</span>
+              <p>{reviewStreamSummary || "正在读取材料并组织审查结论…"}<i aria-hidden="true" /></p>
+            </article>
           )}
         </div>
 

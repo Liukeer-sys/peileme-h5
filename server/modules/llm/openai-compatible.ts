@@ -117,6 +117,67 @@ const readErrorBody = async (response: Response) => {
   }
 };
 
+const readStreamingContent = async (
+  response: Response,
+  onToken: (token: string) => void | Promise<void>
+) => {
+  if (!response.body) {
+    throw new UpstreamProviderError("provider returned an empty stream", true);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let content = "";
+
+  const consumeLine = async (rawLine: string) => {
+    const line = rawLine.replace(/\r$/, "");
+    if (!line.startsWith("data:")) return false;
+    const data = line.slice(5).trimStart();
+    if (!data) return false;
+    if (data === "[DONE]") return true;
+    let payload: {
+      choices?: Array<{
+        delta?: { content?: unknown };
+        message?: { content?: unknown };
+      }>;
+    };
+    try {
+      payload = JSON.parse(data) as typeof payload;
+    } catch {
+      throw new UpstreamProviderError("provider returned invalid SSE data", true);
+    }
+    const delta = payload.choices?.[0]?.delta?.content
+      ?? payload.choices?.[0]?.message?.content;
+    if (typeof delta === "string" && delta) {
+      content += delta;
+      await onToken(delta);
+    }
+    return false;
+  };
+
+  let done = false;
+  while (!done) {
+    const next = await reader.read();
+    buffer += decoder.decode(next.value, { stream: !next.done });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      if (await consumeLine(line)) {
+        done = true;
+        break;
+      }
+    }
+    if (next.done) {
+      if (buffer && !done) await consumeLine(buffer);
+      break;
+    }
+  }
+  if (!content.trim()) {
+    throw new UpstreamProviderError("provider returned empty content", true);
+  }
+  return extractJson(content);
+};
+
 export const createOpenAiCompatibleProvider = (
   config: ProviderRuntime,
   dependencies: {
@@ -128,64 +189,82 @@ export const createOpenAiCompatibleProvider = (
   const sleep = dependencies.sleep ?? defaultSleep;
   const endpoint = completionUrl(config.baseUrl);
 
+  const requestCompletion = async (
+    request: AiProviderRequest,
+    stream: boolean,
+    onToken?: (token: string) => void | Promise<void>
+  ) => {
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < config.maxRetries; attempt += 1) {
+      let emittedThisAttempt = false;
+      try {
+        const response = await fetchImpl(endpoint, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${config.apiKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            model: config.model,
+            messages: [
+              { role: "system", content: systemPrompt },
+              { role: "user", content: userContent(request) }
+            ],
+            temperature: 0.2,
+            max_tokens: 4_096,
+            stream
+          }),
+          signal: AbortSignal.timeout(config.requestTimeoutMs)
+        });
+        if (!response.ok) {
+          const transient = isTransientStatus(response.status);
+          throw new UpstreamProviderError(
+            `${config.key} HTTP ${response.status}: ${await readErrorBody(response)}`,
+            transient
+          );
+        }
+        if (stream) {
+          return await readStreamingContent(response, async (token) => {
+            emittedThisAttempt = true;
+            await onToken?.(token);
+          });
+        }
+        const payload = await response.json() as {
+          choices?: Array<{ message?: { content?: unknown } }>;
+        };
+        const content = payload.choices?.[0]?.message?.content;
+        if (typeof content !== "string" || !content.trim()) {
+          throw new UpstreamProviderError(
+            `${config.key} returned empty content`,
+            true
+          );
+        }
+        return extractJson(content);
+      } catch (error) {
+        lastError = error;
+        const transient =
+          error instanceof UpstreamProviderError
+            ? error.transient
+            : true;
+        if (
+          emittedThisAttempt ||
+          !transient ||
+          attempt >= config.maxRetries - 1
+        ) break;
+        await sleep(config.retryBackoffMs * (attempt + 1));
+      }
+    }
+    if (lastError instanceof Error) throw lastError;
+    throw new UpstreamProviderError(`${config.key} request failed`, true);
+  };
+
   return {
     key: config.key,
     model: config.model,
     priority: config.priority,
     materialMode: "content",
-    analyze: async (request) => {
-      let lastError: unknown = null;
-      for (let attempt = 0; attempt < config.maxRetries; attempt += 1) {
-        try {
-          const response = await fetchImpl(endpoint, {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${config.apiKey}`,
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-              model: config.model,
-              messages: [
-                { role: "system", content: systemPrompt },
-                { role: "user", content: userContent(request) }
-              ],
-              temperature: 0.2,
-              max_tokens: 4_096,
-              stream: false
-            }),
-            signal: AbortSignal.timeout(config.requestTimeoutMs)
-          });
-          if (!response.ok) {
-            const transient = isTransientStatus(response.status);
-            throw new UpstreamProviderError(
-              `${config.key} HTTP ${response.status}: ${await readErrorBody(response)}`,
-              transient
-            );
-          }
-          const payload = await response.json() as {
-            choices?: Array<{ message?: { content?: unknown } }>;
-          };
-          const content = payload.choices?.[0]?.message?.content;
-          if (typeof content !== "string" || !content.trim()) {
-            throw new UpstreamProviderError(
-              `${config.key} returned empty content`,
-              true
-            );
-          }
-          return extractJson(content);
-        } catch (error) {
-          lastError = error;
-          const transient =
-            error instanceof UpstreamProviderError
-              ? error.transient
-              : true;
-          if (!transient || attempt >= config.maxRetries - 1) break;
-          await sleep(config.retryBackoffMs * (attempt + 1));
-        }
-      }
-      if (lastError instanceof Error) throw lastError;
-      throw new UpstreamProviderError(`${config.key} request failed`, true);
-    }
+    analyze: (request) => requestCompletion(request, false),
+    analyzeStream: (request, onToken) => requestCompletion(request, true, onToken)
   };
 };
 

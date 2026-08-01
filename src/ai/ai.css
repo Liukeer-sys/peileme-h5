@@ -230,82 +230,57 @@
   line-height: 1.55;
 }
 
-.ai-job-progress {
+.ai-stream-card {
   display: grid;
-  gap: 10px;
+  gap: 8px;
   margin-top: 14px;
-  padding: 13px;
-  border: 1px solid rgba(102, 84, 170, 0.16);
+  padding: 14px;
+  border: 1px solid rgba(102, 84, 170, 0.17);
   border-radius: 16px;
   background:
-    radial-gradient(circle at 100% 0, rgba(188, 168, 240, 0.24), transparent 45%),
-    rgba(250, 247, 255, 0.9);
+    radial-gradient(circle at 100% 0, rgba(188, 168, 240, 0.22), transparent 45%),
+    rgba(250, 247, 255, 0.92);
 }
 
-.ai-job-progress-copy {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  align-items: baseline;
-  gap: 3px 10px;
-}
-
-.ai-job-progress-copy > span {
-  grid-column: 1 / -1;
+.ai-stream-card > span {
   color: #806dbd;
   font-size: 10px;
   font-weight: 900;
   letter-spacing: 0.08em;
 }
 
-.ai-job-progress-copy strong {
+.ai-stream-card > p {
+  min-height: 24px;
+  margin: 0;
   color: #40364a;
   font-size: 13px;
+  line-height: 1.7;
+  white-space: pre-wrap;
 }
 
-.ai-job-progress-copy small {
-  color: #8d8195;
-  font-size: 10px;
+.ai-stream-card i {
+  display: inline-block;
+  width: 2px;
+  height: 1.05em;
+  margin-left: 3px;
+  border-radius: 2px;
+  background: #7d6ac7;
+  vertical-align: -0.14em;
+  animation: ai-stream-caret 900ms steps(1) infinite;
 }
 
-.ai-progress-track {
-  height: 8px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: rgba(102, 84, 170, 0.11);
-}
-
-.ai-progress-track > span {
-  position: relative;
-  display: block;
-  height: 100%;
-  border-radius: inherit;
-  background: linear-gradient(90deg, #8ac89b, #7d6ac7 58%, #bca8f0);
-  transition: width 500ms ease;
-}
-
-.ai-progress-track > span::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(100deg, transparent 20%, rgba(255,255,255,.55) 48%, transparent 75%);
-  transform: translateX(-100%);
-  animation: ai-progress-shimmer 1.8s ease-in-out infinite;
-}
-
-.ai-job-progress.is-compact {
+.ai-stream-card.is-compact {
   margin-top: 10px;
   padding: 11px;
 }
 
-@keyframes ai-progress-shimmer {
-  to { transform: translateX(100%); }
+@keyframes ai-stream-caret {
+  50% { opacity: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .ai-progress-track > span,
-  .ai-progress-track > span::after {
+  .ai-stream-card i {
     animation: none;
-    transition: none;
   }
 }
 

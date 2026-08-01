@@ -1,4 +1,10 @@
-import { expect, request as playwrightRequest, test, type Page } from "@playwright/test";
+import {
+  expect,
+  request as playwrightRequest,
+  test,
+  type Page,
+  type Response as PlaywrightResponse
+} from "@playwright/test";
 
 const aiBaseUrl = process.env.E2E_AI_BASE_URL?.trim().replace(/\/$/, "");
 const userEmail = process.env.E2E_USER_EMAIL;
@@ -59,22 +65,11 @@ type CompletedAiJob = {
   report: { summary: string; findings?: unknown[]; actions?: unknown[] } | null;
 };
 
-const waitForCompletedJob = async (page: Page, jobId: string) => {
-  const response = await page.waitForResponse(
-    async (candidate) => {
-      if (
-        !candidate.url().endsWith(`/api/ai/jobs/${jobId}`) ||
-        candidate.request().method() !== "GET" ||
-        candidate.status() !== 200
-      ) {
-        return false;
-      }
-      const job = (await candidate.json()) as CompletedAiJob;
-      return job.status === "COMPLETED" || job.status === "FAILED_FINAL";
-    },
-    { timeout: 100_000 }
-  );
-  return (await response.json()) as CompletedAiJob;
+const completedJobFromStream = async (response: PlaywrightResponse) => {
+  const body = await response.text();
+  const done = [...body.matchAll(/event: done\ndata: (.+)(?:\n|$)/g)].at(-1)?.[1];
+  if (!done) throw new Error("AI SSE stream closed without a done event");
+  return JSON.parse(done) as CompletedAiJob;
 };
 
 test.describe.configure({ mode: "serial", timeout: 120_000 });
@@ -141,11 +136,17 @@ test("真实用户完成 AI 分析、PDF 审查、历史、下载、资料与邀
   await situation.fill(
     "公司提出协商解除，我工作三年，月工资一万元，有劳动合同、工资流水和解除通知，请分析补偿与证据风险。"
   );
-  const [analysisResponse] = await Promise.all([
+  const [analysisResponse, analysisStream] = await Promise.all([
     page.waitForResponse(
       (candidate) =>
         candidate.url().endsWith("/api/ai/jobs") &&
         candidate.request().method() === "POST",
+      { timeout: 100_000 }
+    ),
+    page.waitForResponse(
+      (candidate) =>
+        /\/api\/ai\/jobs\/[^/]+\/stream\?/.test(candidate.url()) &&
+        candidate.status() === 200,
       { timeout: 100_000 }
     ),
     analyzeButton.click()
@@ -153,13 +154,10 @@ test("真实用户完成 AI 分析、PDF 审查、历史、下载、资料与邀
   expect(analysisResponse.status()).toBe(202);
   const queuedAnalysis = (await analysisResponse.json()) as CompletedAiJob;
   expect(queuedAnalysis.status).toBe("QUEUED");
-  const progress = page.getByRole("progressbar", { name: "AI 分析进度" });
-  await expect(progress).toBeVisible();
-  await expect(page.getByText("真实阶段", { exact: true })).toBeVisible();
-  await expect.poll(async () => Number(await progress.getAttribute("aria-valuenow")), {
-    timeout: 30_000
-  }).toBeGreaterThanOrEqual(20);
-  const analysis = await waitForCompletedJob(page, queuedAnalysis.id);
+  expect(analysisStream.url()).toContain(`/api/ai/jobs/${queuedAnalysis.id}/stream`);
+  await expect(page.getByLabel("AI 实时回复")).toBeVisible();
+  await expect(page.getByRole("progressbar")).toHaveCount(0);
+  const analysis = await completedJobFromStream(analysisStream);
   expect(analysis.status).toBe("COMPLETED");
   expect(["tuzi", "dataeyes"]).toContain(analysis.selectedProvider);
   expect(
@@ -175,7 +173,7 @@ test("真实用户完成 AI 分析、PDF 审查、历史、下载、资料与邀
   await expect(page.getByRole("heading", { name: "分析报告" })).toBeVisible();
   await expect(page.getByText("下一步建议", { exact: true })).toBeVisible();
 
-  await page.reload();
+  if (new URL(aiBaseUrl!).protocol === "https:") await page.reload();
   await expect(page.getByRole("heading", { name: "离职补偿深度分析" })).toBeVisible();
   const recentAnalysis = page.locator(".ai-job-list button").filter({
     hasText: "离职补偿分析"
@@ -228,11 +226,17 @@ test("真实用户完成 AI 分析、PDF 审查、历史、下载、资料与邀
   await objective.fill("太短");
   await expect(uploadRow.getByRole("button", { name: "发起文件审查" })).toBeDisabled();
   await objective.fill("签署前检查补偿金额、付款期限、权利放弃、保密和违约责任");
-  const [reviewResponse] = await Promise.all([
+  const [reviewResponse, reviewStream] = await Promise.all([
     page.waitForResponse(
       (candidate) =>
         candidate.url().endsWith("/api/ai/jobs") &&
         candidate.request().method() === "POST",
+      { timeout: 100_000 }
+    ),
+    page.waitForResponse(
+      (candidate) =>
+        /\/api\/ai\/jobs\/[^/]+\/stream\?/.test(candidate.url()) &&
+        candidate.status() === 200,
       { timeout: 100_000 }
     ),
     uploadRow.getByRole("button", { name: "发起文件审查" }).click()
@@ -240,7 +244,10 @@ test("真实用户完成 AI 分析、PDF 审查、历史、下载、资料与邀
   expect(reviewResponse.status()).toBe(202);
   const queuedReview = (await reviewResponse.json()) as CompletedAiJob;
   expect(queuedReview.status).toBe("QUEUED");
-  const review = await waitForCompletedJob(page, queuedReview.id);
+  expect(reviewStream.url()).toContain(`/api/ai/jobs/${queuedReview.id}/stream`);
+  await expect(account.getByLabel("AI 文件审查实时回复")).toBeVisible();
+  await expect(account.getByRole("progressbar")).toHaveCount(0);
+  const review = await completedJobFromStream(reviewStream);
   expect(review.status).toBe("COMPLETED");
   await expect(account.locator(".account-message").first()).toContainText(
     review.report!.summary.slice(0, 12)
@@ -296,17 +303,19 @@ test("新用户两项 AI 首次权益各成功一次且第二次进入次数不�
   await page.getByLabel("把你的情况说具体一些").fill(
     "公司要求立即离职，没有书面通知，我工作两年，月工资八千元，需要分析补偿。"
   );
-  const [firstAnalysisResponse] = await Promise.all([
+  const [firstAnalysisResponse, firstAnalysisStream] = await Promise.all([
     page.waitForResponse(
       (candidate) =>
         candidate.url().endsWith("/api/ai/jobs") &&
         candidate.request().method() === "POST"
     ),
+    page.waitForResponse((candidate) => /\/api\/ai\/jobs\/[^/]+\/stream\?/.test(candidate.url())),
     page.getByRole("button", { name: "开始 AI 分析" }).click()
   ]);
   expect(firstAnalysisResponse.status()).toBe(202);
   const firstQueued = (await firstAnalysisResponse.json()) as CompletedAiJob;
-  const firstCompleted = await waitForCompletedJob(page, firstQueued.id);
+  expect(firstAnalysisStream.url()).toContain(`/api/ai/jobs/${firstQueued.id}/stream`);
+  const firstCompleted = await completedJobFromStream(firstAnalysisStream);
   expect(firstCompleted.status).toBe("COMPLETED");
   await expect(page.getByRole("heading", { name: "分析报告" })).toBeVisible();
 
@@ -334,17 +343,19 @@ test("新用户两项 AI 首次权益各成功一次且第二次进入次数不�
   await account.getByRole("button", { name: "上传并保存" }).click();
   const uploadRow = account.getByRole("article").filter({ hasText: uploadName }).first();
   await expect(uploadRow).toBeVisible();
-  const [firstReviewResponse] = await Promise.all([
+  const [firstReviewResponse, firstReviewStream] = await Promise.all([
     page.waitForResponse(
       (candidate) =>
         candidate.url().endsWith("/api/ai/jobs") &&
         candidate.request().method() === "POST"
     ),
+    page.waitForResponse((candidate) => /\/api\/ai\/jobs\/[^/]+\/stream\?/.test(candidate.url())),
     uploadRow.getByRole("button", { name: "发起文件审查" }).click()
   ]);
   expect(firstReviewResponse.status()).toBe(202);
   const firstReviewQueued = (await firstReviewResponse.json()) as CompletedAiJob;
-  const firstReviewCompleted = await waitForCompletedJob(page, firstReviewQueued.id);
+  expect(firstReviewStream.url()).toContain(`/api/ai/jobs/${firstReviewQueued.id}/stream`);
+  const firstReviewCompleted = await completedJobFromStream(firstReviewStream);
   expect(firstReviewCompleted.status).toBe("COMPLETED");
   await expect(account.locator(".account-message").first()).toContainText(
     firstReviewCompleted.report!.summary.slice(0, 12)

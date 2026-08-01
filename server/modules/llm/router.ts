@@ -72,7 +72,8 @@ export type ProviderChainResult =
       ok: false;
       failureCode:
         | "AI_PROVIDER_NOT_CONFIGURED"
-        | "AI_PROVIDER_CHAIN_EXHAUSTED";
+        | "AI_PROVIDER_CHAIN_EXHAUSTED"
+        | "AI_PROVIDER_STREAM_INTERRUPTED";
       attempts: AiProviderAttempt[];
     };
 
@@ -95,6 +96,11 @@ export type ProviderChainEvent =
 
 type ProviderChainOptions = {
   onEvent?: (event: ProviderChainEvent) => void | Promise<void>;
+  onToken?: (event: {
+    providerKey: string;
+    model: string;
+    text: string;
+  }) => void | Promise<void>;
 };
 
 export const runProviderChain = async (
@@ -121,8 +127,20 @@ export const runProviderChain = async (
     });
     const startedAt = performance.now();
     let report: AiReport;
+    let emittedAnyToken = false;
     try {
-      report = aiReportSchema.parse(await provider.analyze(request));
+      const rawReport = provider.analyzeStream && options.onToken
+        ? await provider.analyzeStream(request, async (text) => {
+            if (!text) return;
+            emittedAnyToken = true;
+            await options.onToken?.({
+              providerKey: provider.key,
+              model: provider.model,
+              text
+            });
+          })
+        : await provider.analyze(request);
+      report = aiReportSchema.parse(rawReport);
     } catch (error) {
       const attempt: AiProviderAttempt = {
         ordinal: index + 1,
@@ -136,8 +154,15 @@ export const runProviderChain = async (
       await options.onEvent?.({
         type: "attempt_failed",
         attempt,
-        hasFallback: index + 1 < chain.length
+        hasFallback: !emittedAnyToken && index + 1 < chain.length
       });
+      if (emittedAnyToken) {
+        return {
+          ok: false,
+          failureCode: "AI_PROVIDER_STREAM_INTERRUPTED",
+          attempts
+        };
+      }
       continue;
     }
     const attempt: AiProviderAttempt = {

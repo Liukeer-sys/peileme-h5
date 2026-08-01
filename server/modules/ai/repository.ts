@@ -383,6 +383,41 @@ export const setAiJobProgress = async (input: {
     return true;
   });
 
+export const appendAiJobStreamChunk = async (input: {
+  jobId: string;
+  workerId: string;
+  jobAttempt: number;
+  ordinal: number;
+  providerKey: string;
+  model: string;
+  text: string;
+}) => {
+  if (!input.text) return false;
+  const inserted = await query(
+    `INSERT INTO ai_job_events(job_id, from_status, to_status, progress, detail)
+     SELECT id, 'RUNNING', 'RUNNING', progress, $4
+       FROM ai_jobs
+      WHERE id = $1
+        AND status = 'RUNNING'
+        AND claimed_by = $2
+        AND attempt_count = $3
+     RETURNING id`,
+    [
+      input.jobId,
+      input.workerId,
+      input.jobAttempt,
+      {
+        stage: "stream_chunk",
+        ordinal: input.ordinal,
+        provider: input.providerKey,
+        model: input.model,
+        text: input.text
+      }
+    ]
+  );
+  return inserted.rowCount === 1;
+};
+
 export const advanceAiJobProgress = async (input: {
   jobId: string;
   workerId: string;
@@ -679,6 +714,32 @@ export const getOwnedAiJobDetail = async (userId: string, jobId: string) => {
       createdAt: event.created_at
     }))
   };
+};
+
+export const listOwnedAiJobStreamEvents = async (
+  userId: string,
+  jobId: string,
+  afterId: number
+) => {
+  const job = await getOwnedAiJob(userId, jobId);
+  const events = await query<{
+    id: string;
+    text: string;
+    ordinal: number;
+  }>(
+    `SELECT
+       id::text AS id,
+       detail->>'text' AS text,
+       (detail->>'ordinal')::integer AS ordinal
+     FROM ai_job_events
+     WHERE job_id = $1
+       AND id > $2
+       AND detail->>'stage' = 'stream_chunk'
+     ORDER BY id
+     LIMIT 200`,
+    [jobId, afterId]
+  );
+  return { job, events: events.rows };
 };
 
 export const listOwnedAiJobs = async (

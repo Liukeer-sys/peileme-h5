@@ -4,6 +4,7 @@ import { requireAuth } from "../../security.js";
 import { commerceApiError } from "../commerce/routes.js";
 import {
   getOwnedAiJobDetail,
+  listOwnedAiJobStreamEvents,
   listOwnedAiJobs
 } from "./repository.js";
 import { createAiAnalysisService } from "./service.js";
@@ -58,6 +59,13 @@ const listSchema = z.object({
   pageSize: z.coerce.number().int().min(1).max(50).default(20)
 });
 
+const streamCursorSchema = z.object({
+  after: z.coerce.number().int().min(0).default(0)
+});
+
+const waitForStreamPoll = () =>
+  new Promise<void>((resolve) => setTimeout(resolve, 250));
+
 export const createAiRouter = () => {
   const router = Router();
   const service = createAiAnalysisService();
@@ -92,6 +100,63 @@ export const createAiRouter = () => {
   router.get("/jobs/:id", async (request, response) => {
     const id = z.string().uuid().parse(request.params.id);
     response.json(await getOwnedAiJobDetail(request.authUser!.id, id));
+  });
+
+  router.get("/jobs/:id/stream", async (request, response, next) => {
+    try {
+      const id = z.string().uuid().parse(request.params.id);
+      let cursor = streamCursorSchema.parse(request.query).after;
+      let snapshot = await listOwnedAiJobStreamEvents(
+        request.authUser!.id,
+        id,
+        cursor
+      );
+      let closed = false;
+      let heartbeatAt = Date.now();
+      request.on("close", () => {
+        closed = true;
+      });
+      response.status(200);
+      response.set({
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "Content-Encoding": "identity",
+        "X-Accel-Buffering": "no"
+      });
+      response.flushHeaders();
+
+      while (!closed) {
+        const { job, events } = snapshot;
+        for (const event of events) {
+          cursor = Number(event.id);
+          response.write(`id: ${event.id}\n`);
+          response.write("event: chunk\n");
+          response.write(`data: ${JSON.stringify({
+            ordinal: event.ordinal,
+            text: event.text
+          })}\n\n`);
+        }
+        if (job.status === "COMPLETED" || job.status === "FAILED_FINAL") {
+          response.write(`event: done\ndata: ${JSON.stringify(job)}\n\n`);
+          response.end();
+          return;
+        }
+        if (Date.now() - heartbeatAt >= 15_000) {
+          response.write(": heartbeat\n\n");
+          heartbeatAt = Date.now();
+        }
+        await waitForStreamPoll();
+        snapshot = await listOwnedAiJobStreamEvents(
+          request.authUser!.id,
+          id,
+          cursor
+        );
+      }
+    } catch (error) {
+      if (!response.headersSent) next(commerceApiError(error));
+      else response.end();
+    }
   });
 
   return router;

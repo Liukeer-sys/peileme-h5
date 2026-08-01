@@ -8,7 +8,7 @@
 | 双站边界 | 根域、AI 子域、SPA 刷新、共享会话 | 主站只含政策能力，AI 站含分析与文件审查 | 跨 Host API、材料和商品访问返回受控错误 | `e2e/dual-web-compose.spec.ts`、`e2e/web-artifacts.spec.ts` |
 | 账号与邮箱 | 登录/注册弹窗、获取验证码、密码、刷新、退出 | 外部邮箱真实收件，正确验证码注册，跨站会话可用 | 错误验证码失败；生产响应无调试验证码 | `e2e/real-email-otp.spec.ts`、`e2e/registration.spec.ts` |
 | AI 首次权益 | 离职分析、文件审查、开始分析、历史 | 每个 AI SKU 首次各可用一次，报告与历史持久化 | 第二次无余额返回 402；无效文件/越权材料拒绝 | `e2e/ai-core.spec.ts`、`e2e/real-email-otp.spec.ts` |
-| AI 异步 Worker | 创建任务、状态轮询、报告、系统状态卡 | API 返回 202，Worker 完成，报告和 Provider 尝试入库 | Provider 1 不可达后 Provider 2 接管；过期租约恢复 | `e2e/ai-worker-fallback.spec.ts`、`server/tests/ai-recovery.test.ts` |
+| AI 流式 Worker | 创建任务、SSE 实时回复、报告、系统状态卡 | API 返回 202，两类 AI 任务直接流式回复，片段与报告持久化 | 首 Token 前 Provider 1 失败后 Provider 2 接管；首 Token 后中断终止并退回次数；越权流返回 404 | `e2e/ai-core.spec.ts`、`server/tests/ai-analysis-api.test.ts`、`server/tests/ai-recovery.test.ts` |
 | 材料与用户历史 | 上传、下载、材料列表、AI 历史 | PDF 上传、本人下载、管理员回查，任务完成后历史刷新 | 伪造文件、跨用户材料和主站材料接口拒绝 | `e2e/persistence-admin.spec.ts`、`e2e/ai-core.spec.ts` |
 | 城市参数 | 省市选择、区域参数后台、政策计算 | 364 个行政区域均可由城市精确值或省级回退完成计算 | 无任何可用参数的测试区域显示人工复核提示 | `e2e/main-policy.spec.ts`、`server/tests/policy.api.test.ts` |
 | 主站后台矩阵 | 11 个导航、刷新、退出、首次政策权益 | 每个页面可进入、刷新并展示对应标题 | AI 权益与材料能力保持隐藏 | `e2e/admin-button-matrix.spec.ts` |

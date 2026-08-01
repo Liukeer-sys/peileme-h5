@@ -4,6 +4,7 @@ import { runProviderChain } from "../llm/router.js";
 import type { AiProvider, AiProviderAttempt } from "../llm/types.js";
 import { loadOwnedProviderMaterials } from "./materials.js";
 import {
+  appendAiJobStreamChunk,
   advanceAiJobProgress,
   claimNextAiJob,
   completeAiJob,
@@ -98,6 +99,26 @@ export const processNextAiJob = async (
           sizeBytes: "0"
         }));
     await publishProgress(35, "materials_ready");
+    let streamBuffer = "";
+    let streamOrdinal = 0;
+    let streamProviderKey = "";
+    let streamModel = "";
+    const flushStream = async () => {
+      if (!streamBuffer) return;
+      const text = streamBuffer;
+      streamBuffer = "";
+      streamOrdinal += 1;
+      const persisted = await appendAiJobStreamChunk({
+        jobId: job.id,
+        workerId: options.workerId,
+        jobAttempt: job.attemptCount,
+        ordinal: streamOrdinal,
+        providerKey: streamProviderKey,
+        model: streamModel,
+        text
+      });
+      if (!persisted) throw new Error("AI stream lost its Worker lease");
+    };
     let routed;
     try {
       routed = await runProviderChain(providers, {
@@ -106,6 +127,12 @@ export const processNextAiJob = async (
         input: job.input,
         uploads
       }, {
+        onToken: async (event) => {
+          streamProviderKey = event.providerKey;
+          streamModel = event.model;
+          streamBuffer += event.text;
+          if (streamBuffer.length >= 48) await flushStream();
+        },
         onEvent: async (event) => {
           if (event.type === "attempt_started") {
             const progress = event.ordinal === 1
@@ -151,6 +178,7 @@ export const processNextAiJob = async (
           }
         }
       });
+      await flushStream();
     } catch {
       const failureCode = "AI_PROVIDER_CONFIGURATION_ERROR";
       await failAiJob({

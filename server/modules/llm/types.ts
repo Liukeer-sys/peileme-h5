@@ -21,6 +21,10 @@ export type AiProvider = {
   enabled?: boolean;
   materialMode?: "metadata" | "content";
   analyze: (request: AiProviderRequest) => Promise<unknown>;
+  analyzeStream?: (
+    request: AiProviderRequest,
+    onToken: (token: string) => void | Promise<void>
+  ) => Promise<unknown>;
 };
 
 export type AiProviderAttempt = {

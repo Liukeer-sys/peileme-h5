@@ -15,8 +15,9 @@ describe("AI site analysis UI integration", () => {
     expect(workspace).toContain('api<AiJobList>("/api/ai/jobs"');
     expect(workspace).toContain("分析报告");
     expect(shell).toContain("refreshKey={workspaceRevision}");
-    expect(workspace).toContain("AiJobProgress");
-    expect(workspace).toContain("真实阶段");
+    expect(workspace).toContain("streamAiJob<AiJob>");
+    expect(workspace).toContain("AI 实时回复");
+    expect(workspace).not.toContain("AiJobProgress");
   });
 
   it("keeps the full policy calculator inside the AI product navigation", () => {

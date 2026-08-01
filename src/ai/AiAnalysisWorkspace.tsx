@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, ApiError, track } from "../lib/api";
-import AiJobProgress from "./AiJobProgress";
+import { api, ApiError, streamAiJob, track } from "../lib/api";
+import { extractStreamingSummary } from "./stream-preview";
 
 type AiFinding = {
   title: string;
@@ -58,36 +58,10 @@ export default function AiAnalysisWorkspace({
   const [activeJob, setActiveJob] = useState<AiJob | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+  const [streamRaw, setStreamRaw] = useState("");
   const activeRequestRef = useRef<AbortController | null>(null);
 
   useEffect(() => () => activeRequestRef.current?.abort(), []);
-
-  const waitForTerminalJob = async (job: AiJob, signal: AbortSignal) => {
-    let current = job;
-    for (let attempt = 0; attempt < 600; attempt += 1) {
-      if (current.status === "COMPLETED" || current.status === "FAILED_FINAL") {
-        return current;
-      }
-      await new Promise<void>((resolve, reject) => {
-        const timeout = window.setTimeout(resolve, 1_000);
-        signal.addEventListener("abort", () => {
-          window.clearTimeout(timeout);
-          reject(new DOMException("Aborted", "AbortError"));
-        }, { once: true });
-      });
-      current = await api<AiJob>(`/api/ai/jobs/${job.id}`, {
-        auth: true,
-        signal
-      });
-      setActiveJob(current);
-      setMessage(
-        current.status === "RUNNING"
-          ? "AI 正在处理，进度会随后台阶段实时更新"
-          : "任务已排队，正在等待 AI Worker"
-      );
-    }
-    throw new ApiError(504, "AI_JOB_POLL_TIMEOUT", "分析仍在后台进行，请稍后从历史记录查看");
-  };
 
   const loadHistory = useCallback(async (signal?: AbortSignal) => {
     try {
@@ -117,6 +91,7 @@ export default function AiAnalysisWorkspace({
     }
     setBusy(true);
     setMessage("");
+    setStreamRaw("");
     activeRequestRef.current?.abort();
     const controller = new AbortController();
     activeRequestRef.current = controller;
@@ -132,8 +107,13 @@ export default function AiAnalysisWorkspace({
         }
       });
       setActiveJob(queuedJob);
-      setMessage("任务已排队，正在等待 AI Worker");
-      const job = await waitForTerminalJob(queuedJob, controller.signal);
+      const job = await streamAiJob<AiJob>(queuedJob.id, {
+        signal: controller.signal,
+        onChunk: (text) => {
+          setMessage("");
+          setStreamRaw((current) => current + text);
+        }
+      });
       setActiveJob(job);
       await loadHistory();
       track("ai_analysis_completed", {
@@ -142,6 +122,7 @@ export default function AiAnalysisWorkspace({
         failureCode: job.failureCode
       });
       if (job.status === "FAILED_FINAL") {
+        setStreamRaw("");
         setMessage(
           job.failureCode === "AI_PROVIDER_NOT_CONFIGURED"
             ? "分析服务尚未配置模型通道，请联系管理员"
@@ -158,6 +139,7 @@ export default function AiAnalysisWorkspace({
   };
 
   const report = activeJob?.report;
+  const streamSummary = extractStreamingSummary(streamRaw);
 
   return (
     <section className="ai-analysis-workspace" aria-labelledby="ai-workspace-title">
@@ -183,11 +165,14 @@ export default function AiAnalysisWorkspace({
           disabled={busy || situation.trim().length < 10}
           onClick={() => void analyze()}
         >
-          {busy ? "AI Worker 处理中…" : "开始 AI 分析"}
+          {busy ? "AI 正在回复…" : "开始 AI 分析"}
         </button>
         {message && <p className="ai-workspace-message" role="status">{message}</p>}
-        {activeJob && (
-          <AiJobProgress job={activeJob} eyebrow="真实阶段" />
+        {busy && !report && (
+          <article className="ai-stream-card" aria-live="polite" aria-label="AI 实时回复">
+            <span>AI 实时回复</span>
+            <p>{streamSummary || "正在读取你的情况并组织分析结论…"}<i aria-hidden="true" /></p>
+          </article>
         )}
       </div>
 
@@ -222,7 +207,10 @@ export default function AiAnalysisWorkspace({
         {jobs.length ? (
           <div className="ai-job-list">
             {jobs.slice(0, 8).map((job) => (
-              <button key={job.id} type="button" onClick={() => setActiveJob(job)}>
+              <button key={job.id} type="button" onClick={() => {
+                setStreamRaw("");
+                setActiveJob(job);
+              }}>
                 <span>
                   <strong>{jobKindLabel[job.kind]}</strong>
                   <small>{new Date(job.createdAt).toLocaleString("zh-CN")}</small>

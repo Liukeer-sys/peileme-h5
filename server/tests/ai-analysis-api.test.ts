@@ -227,6 +227,47 @@ describe("AI asynchronous API boundary", () => {
       await running;
     }
   });
+
+  it("streams durable model chunks to the owning user and closes with the final job", async () => {
+    const raw = JSON.stringify(report("流式分析已完成"));
+    const provider: AiProvider = {
+      key: "streaming",
+      model: "streaming-v1",
+      priority: 1,
+      analyze: async () => report("不应走非流式方法"),
+      analyzeStream: async (_providerRequest, onToken) => {
+        await onToken(raw.slice(0, 80));
+        await onToken(raw.slice(80));
+        return report("流式分析已完成");
+      }
+    };
+    const queued = await submit(tokenA, {
+      kind: "severance_analysis",
+      idempotencyKey: "durable-stream-boundary-1",
+      input: { situation: "公司通知解除劳动合同，需要验证流式内容持久化、鉴权和最终报告闭环。" }
+    });
+
+    await expect(
+      processNextAiJob([provider], workerOptions("durable-stream"))
+    ).resolves.toMatchObject({ status: "completed", provider: "streaming" });
+
+    const streamed = await request(createAiApp())
+      .get(`/api/ai/jobs/${queued.body.id}/stream`)
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${tokenA}`)
+      .expect("content-type", /text\/event-stream/)
+      .expect(200);
+    expect(streamed.text).toContain("event: chunk");
+    expect(streamed.text).toContain("event: done");
+    expect(streamed.text).toContain("流式分析已完成");
+    expect(JSON.stringify(streamed.body)).not.toContain("provider-secret");
+
+    await request(createAiApp())
+      .get(`/api/ai/jobs/${queued.body.id}/stream`)
+      .set("host", "ai.localhost")
+      .set("authorization", `Bearer ${tokenB}`)
+      .expect(404);
+  });
 });
 
 describe("AI Worker fallback, retry and entitlement settlement", () => {
@@ -335,6 +376,56 @@ describe("AI Worker fallback, retry and entitlement settlement", () => {
     );
     expect(usage.rows[0]).toMatchObject({ status: "released" });
     expect(usage.rows[0].remaining_uses).toBeGreaterThan(0);
+  });
+
+  it("fails final after an interrupted first token, skips fallback and restores the use", async () => {
+    let fallbackCalls = 0;
+    const providers: AiProvider[] = [
+      {
+        key: "interrupted-primary",
+        model: "stream-v1",
+        priority: 1,
+        analyze: async () => report("不应走非流式方法"),
+        analyzeStream: async (_providerRequest, onToken) => {
+          await onToken('{"schemaVersion":"1.0","summary":"已输出但尚未完成');
+          throw new Error("upstream stream interrupted");
+        }
+      },
+      {
+        key: "must-not-mix-fallback",
+        model: "fallback-v1",
+        priority: 2,
+        analyze: async () => report("不应混入的后备模型内容"),
+        analyzeStream: async () => {
+          fallbackCalls += 1;
+          return report("不应混入的后备模型内容");
+        }
+      }
+    ];
+    const queued = await submit(tokenA, {
+      kind: "severance_analysis",
+      idempotencyKey: "stream-interrupted-final-1",
+      input: { situation: "模型首段内容输出后连接中断时，需要终止任务、退回次数并避免混入后备模型内容。" }
+    });
+
+    await expect(
+      processNextAiJob(providers, workerOptions("stream-interrupted", 3))
+    ).resolves.toMatchObject({
+      status: "failed",
+      failureCode: "AI_PROVIDER_STREAM_INTERRUPTED"
+    });
+    expect(fallbackCalls).toBe(0);
+    const failed = await detail(tokenA, queued.body.id);
+    expect(failed.body).toMatchObject({
+      status: "FAILED_FINAL",
+      failureCode: "AI_PROVIDER_STREAM_INTERRUPTED"
+    });
+    const usage = await query<{ status: string }>(
+      "SELECT status FROM entitlement_usages WHERE business_id = $1",
+      [queued.body.id]
+    );
+    expect(usage.rows[0].status).toBe("released");
+    expect(JSON.stringify(failed.body)).not.toContain("不应混入的后备模型内容");
   });
 
   it("fails closed without providers and releases the reservation", async () => {

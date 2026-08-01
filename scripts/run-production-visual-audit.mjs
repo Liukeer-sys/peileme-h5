@@ -172,6 +172,13 @@ const recordDisabled = async ({ page, scope, pageName, control, locator, feedbac
   });
 };
 
+const completedJobFromStream = async (response) => {
+  const body = await response.text();
+  const done = [...body.matchAll(/event: done\ndata: (.+)(?:\n|$)/g)].at(-1)?.[1];
+  if (!done) throw new Error("AI SSE stream closed without a done event");
+  return JSON.parse(done);
+};
+
 const login = async (page, email, password, scope, pageName, admin = false) => {
   const openName = admin ? "管理员登录" : "登录";
   await clickAndRecord({
@@ -781,10 +788,16 @@ const runAiSite = async (browser) => {
   await situation.fill(
     "公司提出协商解除，我工作三年，月工资一万元，有劳动合同、工资流水和解除通知，请分析补偿金额、谈判策略与证据风险。"
   );
-  const [jobResponse] = await Promise.all([
+  const [jobResponse, streamResponse] = await Promise.all([
     page.waitForResponse(
       (candidate) =>
         candidate.url().endsWith("/api/ai/jobs") && candidate.request().method() === "POST",
+      { timeout: 100_000 }
+    ),
+    page.waitForResponse(
+      (candidate) =>
+        /\/api\/ai\/jobs\/[^/]+\/stream\?/.test(candidate.url()) &&
+        candidate.status() === 200,
       { timeout: 100_000 }
     ),
     analyze.click()
@@ -793,32 +806,27 @@ const runAiSite = async (browser) => {
     throw new Error(`AI analysis enqueue returned ${jobResponse.status()}`);
   }
   const queued = await jobResponse.json();
-  await page.getByRole("progressbar", { name: "AI 分析进度" }).waitFor();
+  if (!streamResponse.url().includes(`/api/ai/jobs/${queued.id}/stream`)) {
+    throw new Error("AI stream does not belong to the queued analysis job");
+  }
+  const liveReply = page.getByLabel("AI 实时回复");
+  await liveReply.waitFor();
+  const liveText = (await liveReply.locator("p").textContent())?.trim() || "实时回复已连接";
+  if (await page.getByRole("progressbar").count()) {
+    throw new Error("AI analysis still renders a percentage progress bar");
+  }
   await record({
     page,
     scope: "AI 站用户端",
-    pageName: "AI 分析处理中",
+    pageName: "AI 分析实时回复",
     control: "开始 AI 分析",
-    operation: "真实点击并等待 202 入队",
-    feedback: `任务已入队；任务标识 ${String(queued.id).slice(0, 8)}…；真实进度组件可见`
+    operation: "真实点击并建立鉴权 SSE",
+    feedback: `任务已入队；任务标识 ${String(queued.id).slice(0, 8)}…；实时回复卡可见；进度条已移除；当前反馈：${liveText}`
   });
 
-  const completedResponse = await page.waitForResponse(
-    async (candidate) => {
-      if (
-        !candidate.url().endsWith(`/api/ai/jobs/${queued.id}`) ||
-        candidate.request().method() !== "GET" ||
-        candidate.status() !== 200
-      ) {
-        return false;
-      }
-      const job = await candidate.json();
-      return job.status === "COMPLETED" || job.status === "FAILED_FINAL";
-    },
-    { timeout: 180_000 }
-  );
-  const payload = await completedResponse.json();
+  const payload = await completedJobFromStream(streamResponse);
   if (payload.status !== "COMPLETED") throw new Error(`AI job ended as ${payload.status}`);
+  await page.getByRole("heading", { name: "分析报告" }).waitFor();
   await page.reload({ waitUntil: "networkidle" });
   const recent = page.locator(".ai-job-list button").filter({ hasText: "离职补偿分析" }).first();
   await recent.click();
@@ -884,10 +892,16 @@ const runAiSite = async (browser) => {
     feedback: "审查重点过短，按钮保持禁用"
   });
   await objective.fill("签署前检查补偿金额、付款期限、权利放弃、保密和违约责任");
-  const [reviewResponse] = await Promise.all([
+  const [reviewResponse, reviewStreamResponse] = await Promise.all([
     page.waitForResponse(
       (candidate) =>
         candidate.url().endsWith("/api/ai/jobs") && candidate.request().method() === "POST",
+      { timeout: 100_000 }
+    ),
+    page.waitForResponse(
+      (candidate) =>
+        /\/api\/ai\/jobs\/[^/]+\/stream\?/.test(candidate.url()) &&
+        candidate.status() === 200,
       { timeout: 100_000 }
     ),
     uploadRow.getByRole("button", { name: "发起文件审查" }).click()
@@ -896,21 +910,23 @@ const runAiSite = async (browser) => {
     throw new Error(`document review enqueue returned ${reviewResponse.status()}`);
   }
   const reviewQueued = await reviewResponse.json();
-  const reviewCompletedResponse = await page.waitForResponse(
-    async (candidate) => {
-      if (
-        !candidate.url().endsWith(`/api/ai/jobs/${reviewQueued.id}`) ||
-        candidate.request().method() !== "GET" ||
-        candidate.status() !== 200
-      ) {
-        return false;
-      }
-      const job = await candidate.json();
-      return job.status === "COMPLETED" || job.status === "FAILED_FINAL";
-    },
-    { timeout: 180_000 }
-  );
-  const reviewPayload = await reviewCompletedResponse.json();
+  if (!reviewStreamResponse.url().includes(`/api/ai/jobs/${reviewQueued.id}/stream`)) {
+    throw new Error("document stream does not belong to the queued review job");
+  }
+  const liveReview = account.getByLabel("AI 文件审查实时回复");
+  await liveReview.waitFor();
+  if (await account.getByRole("progressbar").count()) {
+    throw new Error("document review still renders a percentage progress bar");
+  }
+  await record({
+    page,
+    scope: "AI 站用户端",
+    pageName: "AI 文件实时审查",
+    control: "发起文件审查（流式回复）",
+    operation: "真实点击并建立鉴权 SSE",
+    feedback: `任务标识 ${String(reviewQueued.id).slice(0, 8)}…；实时审查卡可见；进度条已移除`
+  });
+  const reviewPayload = await completedJobFromStream(reviewStreamResponse);
   if (reviewPayload.status !== "COMPLETED") {
     throw new Error(`document review ended as ${reviewPayload.status}`);
   }
