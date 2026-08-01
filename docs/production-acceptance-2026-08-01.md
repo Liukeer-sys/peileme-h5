@@ -23,6 +23,16 @@
 
 ## 发布后记录
 
+### `b5a31f4` AI 直接流式回复与生产全量视觉验收
+
+- 运行版本：`b5a31f4`；生产备份：`/opt/1panel/backup/peileme/20260801T045610Z`；回滚镜像标签：`rollback-stream-20260801T045610Z`。生产环境继续使用 Tuzi `gpt-5.6-sol` 主路由和 DataEyes `gpt-5.6-sol` 降级路由。
+- 流式链路：离职分析和文件审查均通过鉴权 SSE 直接展示增量回复，支持游标重连和持久化分片；首 Token 前可切换 Provider，首 Token 后中断会终止任务并退回次数，避免拼接两个模型的内容。
+- 自动化证据：服务端非支付测试 41 个文件、`827/827` 通过；本地真实浏览器核心流式链路 `1/1`、AI 后台 `1/1`、受控 DataEyes 流式降级 `1/1` 通过。两个等待真实商户参数的支付 Provider 文件保留 29 条 RED 契约。
+- 生产视觉验收：Playwright Chromium 在两个用户站和两个管理后台完成 `183/183` 个真实操作，包含 Happy/Unhappy Path；生成 183 张逐步截图，逐项记录按钮、输入、点击和实际反馈。运行期间 console error、pageerror、HTTP 5xx 均为 `0`。
+- 生产数据证据：离职分析任务 `4d032057-8200-4518-9665-6c8d5c5d65ae` 使用 `tuzi / gpt-5.6-sol` 完成并持久化 33 个流式分片；文件审查任务 `b4c4bfc6-40c1-41c3-8136-305a5e567a3f` 使用同一路由完成并持久化 24 个流式分片。验收窗口产生 20 条后台审计日志和 27 条数据埋点，`app_errors=0`。
+- 运行恢复：四个应用服务受控重启后，五个容器全部 healthy；双站、双后台、双健康接口和 AI 站政策页 7 个公网入口均返回 200，健康接口显示 `version=b5a31f4`、`database=true`、`OTP_DEBUG=false`。重启后的完整生产 Playwright 验收通过。
+- 报告产物：`artifacts/production-visual-acceptance-2026-08-01-streaming/report.html`、`report.md`、`actions.json` 及 `screenshots/`。
+
 ### `51025ad` / `c55e966` / `5506953` AI 政策、进度、邮件与模型路由发布
 
 - 核心发布提交：`51025ad`；邮件主题补丁与最终生产版本：`c55e966`；最终一致性备份：`/opt/1panel/backup/peileme/20260801T011312Z`；回滚镜像标签：`rollback-20260801T010307Z`。

@@ -1259,7 +1259,7 @@ const reportMarkdown = () => {
     `- 浏览器：Playwright Chromium（移动端 390×844，后台 1440×1100）`,
     `- 真实操作：${actions.length} 项；通过 ${passed} 项；失败 ${failed} 项`,
     `- 运行时异常：${runtime.length} 项（console error / pageerror / HTTP 5xx）`,
-    "- 隐私：截图中的邮箱、手机号及敏感标识已遮罩。",
+    "- 隐私：密码和令牌不进入报告；输入框、表格与详情中的邮箱/手机号已遮罩，专用测试账号标识保留用于验收证据。",
     "",
     "## 验收结论",
     "",
@@ -1267,14 +1267,12 @@ const reportMarkdown = () => {
       ? "**通过**：本报告所列页面和按钮均完成真实点击，未发现控制台异常、页面异常或 HTTP 5xx。"
       : `**未完成**：存在 ${failed} 个操作失败和 ${runtime.length} 个运行时异常，详见下表。`,
     "",
-    "## 既有生产 E2E 回归",
+    "## 发布前自动化回归",
     "",
-    "- 完整矩阵：14 条；首轮 10 通过、2 条按环境配置预期跳过、2 条在最终断言处暴露验收参数漂移。",
-    "- 参数校正：主站移动端账号按钮使用实际可访问名称“测试用户”；生产邮件通知器按“已配置”分支验收。",
-    "- 定向复跑：材料持久化/私有下载/后台回查、主站完整政策测算共 **2/2 通过（15.7 秒）**。",
-    "- 综合结果：本轮需要执行的 12 条生产 E2E 全部通过；2 条新账号首次权益/忘记密码用例按计划跳过，已由此前真实邮箱链路验收承担。",
-    "- 保护性验证：连续登录超过 15 分钟窗口内 30 次时，页面真实返回“登录尝试过于频繁，请稍后再试”；受控重启 API 后健康检查恢复 `healthy / database=true`，定向复跑通过。",
-    "- 原始复跑日志：[playwright-regression-rerun.txt](playwright-regression-rerun.txt)。",
+    "- 服务端：41 个测试文件、**827/827** 通过；两个暂缓接入真实商户参数的支付 Provider 文件共 29 条 RED 契约单列。",
+    "- 构建：主站、AI 站隔离产物与 API TypeScript 构建通过。",
+    "- 本地真实浏览器：AI 核心流式链路 1/1、AI 管理后台 1/1、受控 DataEyes 流式降级 1/1 通过。",
+    "- 生产版本：`b5a31f4`；本报告继续验证生产域名上的逐页面、逐按钮、真实模型流式输出与后台操作。",
     "",
     "## 页面与按钮证据矩阵",
     "",
@@ -1339,7 +1337,7 @@ const reportHtml = () => {
 :root{font-family:Inter,"PingFang SC","Microsoft YaHei",sans-serif;color:#172033;background:#eef1f6}*{box-sizing:border-box}body{margin:0}.hero{padding:42px max(24px,calc((100vw - 1480px)/2));background:#14213d;color:white}.hero h1{margin:0 0 14px;font-size:32px}.hero p{max-width:980px;line-height:1.7;color:#dbe4f5}.summary{display:flex;gap:12px;flex-wrap:wrap;margin-top:20px}.pill{padding:10px 14px;border-radius:10px;background:#ffffff18}.pass{color:#087f5b}.fail{color:#c92a2a}.hero .pass{color:#69dbb2}.hero .fail{color:#ff8787}main{max-width:1480px;margin:28px auto;padding:0 20px}.conclusion,.runtime,.regression{background:white;border-radius:16px;padding:22px;margin-bottom:24px;box-shadow:0 6px 24px #18233a12}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(430px,1fr));gap:20px}.card{background:white;border-radius:16px;overflow:hidden;box-shadow:0 6px 24px #18233a12}.card img{display:block;width:100%;height:340px;object-fit:contain;background:#f7f8fa;border-bottom:1px solid #e9ecef}.content{padding:18px}.meta{display:flex;gap:10px;font-size:13px;color:#687386}.meta span{background:#f1f3f5;border-radius:999px;padding:4px 9px}.content h2{margin:13px 0;font-size:21px}dl{display:grid;grid-template-columns:92px 1fr;gap:8px;margin:0;line-height:1.5;font-size:14px}dt{color:#687386}dd{margin:0;word-break:break-word}.runtime li,.regression li{margin:8px 0}@media(max-width:560px){.grid{grid-template-columns:1fr}.card img{height:250px}.hero h1{font-size:25px}}
 </style></head><body>
 <header class="hero"><h1>赔了么生产环境逐页面截图与逐按钮验收报告</h1>
-<p>覆盖主站、AI 站、完整政策测算、真实 AI 分析、账号材料，以及主站/AI 双后台。每张卡片记录真实点击、页面实际反馈、结果和对应截图；截图已遮罩敏感账号信息。</p>
+<p>覆盖主站、AI 站、完整政策测算、真实 AI 分析、账号材料，以及主站/AI 双后台。每张卡片记录真实点击、页面实际反馈、结果和对应截图；密码和令牌不进入报告，专用测试账号标识保留用于验收证据。</p>
 <div class="summary"><span class="pill">真实操作 ${actions.length}</span><span class="pill pass">通过 ${passed}</span><span class="pill fail">失败 ${failed}</span><span class="pill ${runtime.length ? "fail" : "pass"}">运行时异常 ${runtime.length}</span></div></header>
 <main><section class="conclusion"><h2>验收结论</h2><p class="${resultClass}">${
     failed === 0 && runtime.length === 0
@@ -1347,7 +1345,7 @@ const reportHtml = () => {
       : `未完成：存在 ${failed} 个操作失败和 ${runtime.length} 个运行时异常。`
   }</p><p>环境：${htmlEscape(mainBaseUrl)} / ${htmlEscape(aiBaseUrl)}；Playwright Chromium 移动端 390×844、后台 1440×1100。</p></section>
 <section class="runtime"><h2>运行时异常</h2><ul>${runtimeRows}</ul></section>
-<section class="regression"><h2>既有生产 E2E 回归</h2><ul><li>完整矩阵 14 条：首轮 10 通过、2 条按环境配置预期跳过、2 条在最终断言处暴露验收参数漂移。</li><li>校正主站账号按钮可访问名称与生产通知器状态后，材料持久化/私有下载/后台回查、主站完整政策测算定向复跑 2/2 通过（15.7 秒）。</li><li>综合结果：本轮需要执行的 12 条生产 E2E 全部通过；2 条新账号用例按计划跳过，由此前真实邮箱链路验收承担。</li><li>连续登录触发防刷时，页面正确反馈“登录尝试过于频繁，请稍后再试”；受控重启 API 后健康检查恢复 healthy / database=true，复跑通过。</li><li><a href="playwright-regression-rerun.txt">查看原始复跑日志</a></li></ul></section>
+<section class="regression"><h2>发布前自动化回归</h2><ul><li>服务端 41 个测试文件、827/827 通过；两个暂缓接入真实商户参数的支付 Provider 文件共 29 条 RED 契约单列。</li><li>主站、AI 站隔离产物与 API TypeScript 构建通过。</li><li>本地真实浏览器：AI 核心流式链路 1/1、AI 管理后台 1/1、受控 DataEyes 流式降级 1/1 通过。</li><li>生产版本 b5a31f4；本报告继续验证生产域名上的逐页面、逐按钮、真实模型流式输出与后台操作。</li></ul></section>
 <section class="grid">${cards}</section></main></body></html>`;
 };
 
@@ -1379,10 +1377,6 @@ try {
   await writeFile(path.join(outputDir, "actions.json"), JSON.stringify({ actions, runtime }, null, 2));
   await writeFile(path.join(outputDir, "report.md"), reportMarkdown());
   await writeFile(path.join(outputDir, "report.html"), reportHtml());
-  await writeFile(
-    path.join(outputDir, "playwright-regression-rerun.txt"),
-    "Running 2 tests using 1 worker\n\n[1/2] e2e/persistence-admin.spec.ts:15:1 › AI 站材料持久化、私有下载与管理后台回查\n[2/2] e2e/production.spec.ts:16:1 › 生产移动端完整测算链路\n2 passed (15.7s)\n"
-  );
   console.log(JSON.stringify({ outputDir, actions: actions.length, runtime: runtime.length, fatal: Boolean(fatal) }));
 }
 
