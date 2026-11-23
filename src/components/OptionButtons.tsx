@@ -1,9 +1,9 @@
-﻿import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 type OptionButtonsProps = {
   options: string[];
   onChoose: (option: string) => void;
-  variant?: "default" | "city" | "bonus" | "work-schedule" | "wish" | "termination-root" | "forced-reason" | "dismiss-reason" | "no-fault-reason" | "contract-expired";
+  variant?: "default" | "city" | "bonus" | "work-schedule" | "wish" | "termination-root" | "forced-reason" | "dismiss-reason" | "fault-reason" | "fault-truth" | "no-fault-reason" | "contract-expired";
 };
 
 type StructuredOptionLabel = {
@@ -20,8 +20,8 @@ type WishOptionCopy = {
 const terminationRootLabels: StructuredOptionLabel[] = [
   { title: "我自己想离职", legalType: "", detail: "单纯因为个人原因不干了" },
   { title: "公司逼得我不得不走", legalType: "", detail: "比如公司欠薪、不交社保等，我只能被迫辞职" },
-  { title: "公司要我走", legalType: "", detail: "合同还没到期，公司就想提前让我离职" },
-  { title: "合同到期，不再续签", legalType: "", detail: "到期后，公司或我不准备继续签" },
+  { title: "劳动合同没到期，公司要我走", legalType: "", detail: "公司想提前让我离职，包括协商、犯错、客观变化等情况" },
+  { title: "劳动合同到期，不再续签", legalType: "", detail: "合同到期后，公司或我不准备继续签" },
   { title: "公司完全没有了", legalType: "", detail: "比如公司破产、解散、注销，没法继续雇人了" }
 ];
 
@@ -31,15 +31,32 @@ const forcedReasonLabels: StructuredOptionLabel[] = [
   { title: "工作条件没按约定提供", legalType: "", detail: "该有的工作条件、劳动保护，公司没给" },
   { title: "公司制度违法，还坑到了我", legalType: "", detail: "违法的规定实际损害了我的权益" },
   { title: "签劳动合同时被坑了", legalType: "", detail: "被骗、被逼着签，或者合同里有违法内容" },
-  { title: "公司威胁我，甚至限制我自由", legalType: "", detail: "暴力、威胁、不让我走，强迫我继续工作" },
-  { title: "公司逼我做危险的事", legalType: "", detail: "明知有危险，还强令我冒险作业" },
-  { title: "其他情况", legalType: "", detail: "上面都不太像，我自己描述" }
+  { title: "公司用暴力、威胁逼我工作", legalType: "", detail: "比如打人、威胁伤害或限制自由，不让我离开" },
+  { title: "公司逼我冒险作业", legalType: "", detail: "明知可能危及人身安全，仍违规命令我去做" },
+  { title: "其他情况", legalType: "", detail: "不属于以上情况，但公司的做法仍让我不得不离职" }
 ];
 
 const companyDismissReasonLabels: StructuredOptionLabel[] = [
+  { title: "公司找我协商解除劳动合同", legalType: "", detail: "公司主动和我谈补偿，希望双方同意后离职" },
   { title: "公司说是我的错", legalType: "", detail: "违纪、失职、试用不合格之类" },
   { title: "我没犯错，但公司说没法继续用我", legalType: "", detail: "身体、能力或岗位变化等原因" },
   { title: "公司要大规模裁员", legalType: "", detail: "裁员20人以上，或达到员工总数10%" }
+];
+
+const faultReasonLabels: StructuredOptionLabel[] = [
+  { title: "试用期没通过", legalType: "", detail: "公司说我不符合入职时约定的录用条件" },
+  { title: "严重违反公司制度", legalType: "", detail: "公司说我的行为已经达到严重违纪" },
+  { title: "严重失职，造成重大损失", legalType: "", detail: "公司说我犯了大错，给公司造成重大损失" },
+  { title: "还在其他单位工作", legalType: "", detail: "严重影响本职工作，或被要求改正后仍没改" },
+  { title: "入职时提供了虚假信息", legalType: "", detail: "公司说我用欺骗方式签订合同，导致合同无效" },
+  { title: "被依法追究刑事责任", legalType: "", detail: "不是只被调查，而是已经被追究刑事责任" },
+  { title: "其他问题或没说清楚", legalType: "", detail: "公司说的理由不在上面，或者只笼统说我不合适" }
+];
+
+const faultTruthLabels: StructuredOptionLabel[] = [
+  { title: "基本属实", legalType: "", detail: "公司说的情况大体没错" },
+  { title: "有这回事，但不确定严重程度", legalType: "", detail: "不知道是否严重到可以直接辞退我" },
+  { title: "公司在乱扣帽子", legalType: "", detail: "事情不存在，或者公司夸大其词" }
 ];
 
 const noFaultReasonLabels: StructuredOptionLabel[] = [
@@ -50,14 +67,14 @@ const noFaultReasonLabels: StructuredOptionLabel[] = [
 ];
 
 const contractExpiredLabels: StructuredOptionLabel[] = [
-  { title: "公司不续签", legalType: "通常参考 N", detail: "有眼无珠，不要续签我了" },
-  { title: "我不续签", legalType: "通常无补偿", detail: "老娘（老子）不干了" },
-  { title: "公司降低续签条件", legalType: "通常参考 N", detail: "原来的条件都不给，我不签了，我值得更好的" }
+  { title: "公司不愿意续签", legalType: "", detail: "合同到期后，公司明确不再和我签下一份合同" },
+  { title: "公司照旧续，是我不想续", legalType: "", detail: "公司愿意按原来或更好的条件续签，是我自己决定离开" },
+  { title: "公司降低续签条件，我没同意", legalType: "", detail: "公司愿意续签，但工资、岗位等条件比原来差" }
 ];
 
 const workScheduleLabels = [
-  { title: "双休，很少加班", detail: "基本到点走人" },
-  { title: "双休，但不定期加班", detail: "工作日有时晚下班，周末偶有“临时需求”" },
+  { title: "双休不加班", detail: "基本到点走人" },
+  { title: "双休偶尔加班", detail: "工作日有时晚下班，周末偶有“临时需求”" },
   { title: "大小周", detail: "隔周休一天" },
   { title: "单休", detail: "每周仅休一天" }
 ];
@@ -93,8 +110,8 @@ function WishOptionIcon({ index }: { index: number }) {
 export default function OptionButtons({ options, onChoose, variant = "default" }: OptionButtonsProps) {
   const [selectedOption, setSelectedOption] = useState<string | null>(null);
   const selectionTimerRef = useRef<number | null>(null);
-  const isStructuredTermination = variant === "termination-root" || variant === "forced-reason" || variant === "dismiss-reason" || variant === "no-fault-reason" || variant === "contract-expired";
-  const structuredLabels = variant === "contract-expired" ? contractExpiredLabels : variant === "forced-reason" ? forcedReasonLabels : variant === "dismiss-reason" ? companyDismissReasonLabels : variant === "no-fault-reason" ? noFaultReasonLabels : terminationRootLabels;
+  const isStructuredTermination = variant === "termination-root" || variant === "forced-reason" || variant === "dismiss-reason" || variant === "fault-reason" || variant === "fault-truth" || variant === "no-fault-reason" || variant === "contract-expired";
+  const structuredLabels = variant === "contract-expired" ? contractExpiredLabels : variant === "forced-reason" ? forcedReasonLabels : variant === "dismiss-reason" ? companyDismissReasonLabels : variant === "fault-reason" ? faultReasonLabels : variant === "fault-truth" ? faultTruthLabels : variant === "no-fault-reason" ? noFaultReasonLabels : terminationRootLabels;
   const gridClassName =
     variant === "city"
       ? "option-grid city-option-grid"
@@ -104,11 +121,9 @@ export default function OptionButtons({ options, onChoose, variant = "default" }
         ? "option-grid work-schedule-option-grid"
       : variant === "wish"
         ? "option-grid wish-option-grid"
-      : (variant === "termination-root" || variant === "forced-reason" || variant === "dismiss-reason" || variant === "no-fault-reason")
+      : (variant === "termination-root" || variant === "forced-reason" || variant === "dismiss-reason" || variant === "fault-reason" || variant === "fault-truth" || variant === "no-fault-reason" || variant === "contract-expired")
         ? "option-grid termination-root-option-grid"
-        : variant === "contract-expired"
-          ? "option-grid contract-expired-option-grid"
-          : "option-grid";
+        : "option-grid";
 
   useEffect(
     () => () => {
@@ -141,11 +156,9 @@ export default function OptionButtons({ options, onChoose, variant = "default" }
                   ? `option-button work-schedule-option-button work-schedule-option-${index + 1}${isSelectedOption ? " is-selected" : ""}`
                 : variant === "wish"
                   ? `option-button wish-option-button${isSelectedOption ? " is-selected" : ""}`
-                : (variant === "termination-root" || variant === "forced-reason" || variant === "dismiss-reason" || variant === "no-fault-reason")
+                : (variant === "termination-root" || variant === "forced-reason" || variant === "dismiss-reason" || variant === "fault-reason" || variant === "fault-truth" || variant === "no-fault-reason" || variant === "contract-expired")
                   ? `option-button termination-root-option${isSelectedOption ? " is-selected" : ""}`
-                  : variant === "contract-expired"
-                    ? `option-button termination-root-option contract-expired-option${isSelectedOption ? " is-selected" : ""}`
-                    : `option-button city-option-button standard-option-button${isSelectedOption ? " is-selected" : ""}`
+                  : `option-button city-option-button standard-option-button${isSelectedOption ? " is-selected" : ""}`
             }
             type="button"
             disabled={selectedOption !== null}
@@ -192,13 +205,18 @@ export default function OptionButtons({ options, onChoose, variant = "default" }
     </div>
   );
 
+  const pickerHeading = (detail: string) => (
+    <div className="city-picker-heading">
+      <span className="city-picker-heading-copy">
+        <small>{detail}</small>
+      </span>
+    </div>
+  );
+
   if (variant === "city") {
     return (
       <div className="city-picker">
-        <div className="city-picker-heading">
-          <strong>选择工作城市</strong>
-          <small>用于匹配当地工资与社保口径</small>
-        </div>
+        {pickerHeading("用于匹配当地工资与社保口径")}
         {optionGrid}
       </div>
     );
@@ -207,10 +225,7 @@ export default function OptionButtons({ options, onChoose, variant = "default" }
   if (variant === "work-schedule") {
     return (
       <div className="work-schedule-picker">
-        <div className="city-picker-heading">
-          <strong>选择工作节奏</strong>
-          <small>不用特别精确，按长期工作状态判断</small>
-        </div>
+        {pickerHeading("不用特别精确，按长期工作状态判断")}
         {optionGrid}
       </div>
     );
@@ -219,26 +234,25 @@ export default function OptionButtons({ options, onChoose, variant = "default" }
   if (variant === "bonus") {
     return (
       <div className="city-picker bonus-picker">
-        <div className="city-picker-heading">
-          <strong>选择年终奖情况</strong>
-          <small>按过去一年实际发放情况选择</small>
-        </div>
+        {pickerHeading("按过去一年实际发放情况选择")}
         {optionGrid}
       </div>
     );
   }
 
-  if (variant !== "default" && variant !== "forced-reason" && variant !== "dismiss-reason" && variant !== "no-fault-reason") return optionGrid;
+  if (variant === "wish") {
+    return (
+      <div className="city-picker wish-picker">
+        {pickerHeading("按你最想实现的愿望选择")}
+        {optionGrid}
+      </div>
+    );
+  }
 
   return (
     <div className="city-picker standard-option-picker">
-      <div className="city-picker-heading">
-        <strong>选择具体情况</strong>
-        <small>按实际情况选择最接近的一项</small>
-      </div>
+      {pickerHeading("按实际情况选择最接近的一项")}
       {optionGrid}
     </div>
   );
 }
-
-

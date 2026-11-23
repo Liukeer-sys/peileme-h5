@@ -23,6 +23,8 @@ export type CalculationResult = {
   baseCompensation: number;
   lowAmount: number;
   highAmount: number;
+  alternativeLowAmount?: number;
+  alternativeHighAmount?: number;
   ruleHint: string;
   ruleReason: string;
   salaryBaseFormula: string;
@@ -67,32 +69,6 @@ const bonusMultiplierMap: Record<string, number> = {
   "不固定 / 说不准": 0
 };
 
-const getOvertimeProfile = (workSchedule?: string) => {
-  switch (workSchedule) {
-    case "双休，但不定期加班":
-      return { hoursPerYear: 156, levelBoost: true, label: "不定期加班积攒的额外工时" };
-    case "双休，但工作日经常晚下班":
-      return { hoursPerYear: 312, levelBoost: true, label: "工作日晚下班积攒的额外工时" };
-    case "大小周":
-      return { hoursPerYear: 208, levelBoost: true, label: "大小周额外吞掉的周六" };
-    case "单休":
-    case "单休，但每天工时还算正常":
-      return { hoursPerYear: 416, levelBoost: true, label: "单休少掉的完整周末" };
-    case "996 / 长期高强度加班":
-    case "长期高强度加班":
-    case "长期高强度加班（如 996）":
-      return { hoursPerYear: 1664, levelBoost: true, label: "996 榨出来的夜晚和周末" };
-    case "排班 / 倒班":
-    case "排班 / 倒班，整体工时还算正常":
-      return { hoursPerYear: 0, levelBoost: false, label: "倒班带来的生物钟损耗" };
-    case "工作时间不固定 / 经常临时加班":
-    case "工作时间不固定，经常临时加班":
-      return { hoursPerYear: 312, levelBoost: true, label: "临时加班偷走的私人时间" };
-    default:
-      return { hoursPerYear: 0, levelBoost: false, label: "" };
-  }
-};
-
 type WorkhorsePersona = {
   name: string;
   copy: string;
@@ -100,7 +76,7 @@ type WorkhorsePersona = {
 
 const chooseWorkhorsePersona = (answers: Answers, years: number, takeHomeSalary: number): WorkhorsePersona => {
   const wish = answers.postExitWish || "";
-  const hasHeavyOvertime = getOvertimeProfile(answers.workSchedule).levelBoost;
+  const hasHeavyOvertime = ["大小周", "单休"].includes(answers.workSchedule || "");
   const hasLongTenure = years >= 5;
   const hasLowSalary = takeHomeSalary > 0 && takeHomeSalary < 8000;
   const hasHighSalary = takeHomeSalary >= 20000;
@@ -143,7 +119,7 @@ const chooseWorkhorsePersona = (answers: Answers, years: number, takeHomeSalary:
   if (/宅家|躺.*爽/.test(wish)) {
     if (hasHeavyOvertime) {
       return {
-        name: "996 缺觉熊（冬眠中",
+        name: "996缺觉难民（冬眠中",
         copy: "加班把睡眠全偷走了。现在我要把卧室窗帘拉死，通讯录全员静音，甲方与狗不得入内。把这 " + years + " 年的觉一次性睡回来，醒了才算新生。"
       };
     }
@@ -337,13 +313,15 @@ const chooseRoast = (answers: Answers, years: number, amount: number) => {
 const getRuleReason = (mode: string) => {
   switch (mode) {
     case "n":
-      return "公司原因不续签或解除时，通常围绕经济补偿 N 估算。";
+      return "该情形按经济补偿 N 估算。";
     case "nPlusOne":
-      return "公司单方解除或协商场景里，N 和 N+1 常是谈判锚点。";
+      return "该情形按经济补偿 N 加 1 个月代通知金估算。";
     case "twoN":
-      return "若构成违法解除，可能进入 2N 赔偿争议。";
+      return "该情形按违法解除赔偿金 2N 估算。";
     case "zeroRisk":
-      return "主动辞职或严重违纪争议大，可能从 0 到 N 都要看证据。";
+      return "该情形通常没有经济补偿，按 0 元估算。";
+    case "zeroOrN":
+      return "是否属于法定被迫解除情形会影响结果，可能从 0 到 N。";
     case "zeroOrTwoN":
       return "过错是否成立、严重程度和解除程序都会影响结果，可能从 0 到 2N。";
     default:
@@ -356,26 +334,64 @@ const buildSalaryBaseFormula = (takeHomeSalary: number, bonusMonths: number) => 
   return `${formatMoney(takeHomeSalary)} 到手 × 1.2 估税前${bonusText}`;
 };
 
-const buildCompensationFormula = (rule: string, years: number, monthly: number, range: { low: number; high: number }) => {
-  const base = `${formatMoney(monthly)} × ${years} 年`;
-  if (rule.includes("N+1")) return `${base}，再参考 +1 个月工资，得到当前区间。`;
-  if (rule.includes("2N")) return `${base}，违法解除时可能翻到 2N。`;
-  if (rule.includes("0")) return `${base}，但该类型证据风险高，所以区间从 ${formatMoney(range.low)} 起。`;
-  return `${base}，结合规则浮动到当前区间。`;
+const buildCompensationFormula = (mode: string, years: number, monthly: number, range: { low: number; high: number }) => {
+  const nFormula = `${formatMoney(monthly)} × ${years}`;
+  switch (mode) {
+    case "n":
+      return `${nFormula}，并在估算结果上小幅浮动。`;
+    case "nPlusOne":
+      return `${formatMoney(monthly)} ×（${years} + 1），并在估算结果上小幅浮动。`;
+    case "twoN":
+      return `${formatMoney(monthly)} × 2 × ${years}，并在估算结果上小幅浮动。`;
+    case "zeroRisk":
+      return "按 0 元估算。";
+    case "zeroOrN":
+      return `不属于法定被迫解除情形时可能为 0；符合时按 ${formatMoney(monthly)} × ${years} 估算。`;
+    case "zeroOrTwoN":
+      return `过错成立时可能为 0；若构成违法解除，则按 ${formatMoney(monthly)} × 2 × ${years} 估算。`;
+    default:
+      return `${nFormula}，当前信息不足，估算区间为 ${formatMoney(range.low)} 至 ${formatMoney(range.high)}。`;
+  }
 };
 
-const amountRange = (mode: string, base: number, monthly: number) => {
+type CompensationAmountRange = {
+  low: number;
+  high: number;
+  rule: string;
+  alternativeLow?: number;
+  alternativeHigh?: number;
+};
+
+const amountRange = (mode: string, base: number, monthly: number): CompensationAmountRange => {
   switch (mode) {
     case "n":
       return { low: base * 0.95, high: base * 1.08, rule: "N" };
-    case "nPlusOne":
-      return { low: base, high: base + monthly, rule: "N / N+1" };
-    case "twoN":
-      return { low: base, high: base * 2, rule: "N / 2N" };
+    case "nPlusOne": {
+      const target = base + monthly;
+      return { low: target * 0.95, high: target * 1.08, rule: "N+1" };
+    }
+    case "twoN": {
+      const target = base * 2;
+      return { low: target * 0.95, high: target * 1.08, rule: "2N" };
+    }
     case "zeroRisk":
-      return { low: 0, high: Math.max(base, monthly), rule: "0 / N 争议区间" };
+      return { low: 0, high: 0, rule: "无经济补偿" };
+    case "zeroOrN":
+      return {
+        low: 0,
+        high: base,
+        rule: "0 / N 争议区间",
+        alternativeLow: base * 0.95,
+        alternativeHigh: base * 1.08
+      };
     case "zeroOrTwoN":
-      return { low: 0, high: base * 2, rule: "0 / 2N 争议区间" };
+      return {
+        low: 0,
+        high: base * 2,
+        rule: "0 / 2N 争议区间",
+        alternativeLow: base * 2 * 0.95,
+        alternativeHigh: base * 2 * 1.08
+      };
     case "range":
     default:
       return { low: base * 0.7, high: base + monthly, rule: "N / N+1 / 需进一步判断" };
@@ -446,10 +462,12 @@ export const calculateCompensation = (answers: Answers): CalculationResult => {
     baseCompensation,
     lowAmount: range.low,
     highAmount: range.high,
+    alternativeLowAmount: range.alternativeLow,
+    alternativeHighAmount: range.alternativeHigh,
     ruleHint: range.rule,
     ruleReason: getRuleReason(termination.resultMode),
     salaryBaseFormula: buildSalaryBaseFormula(takeHomeSalary, bonusMonths),
-    compensationFormula: buildCompensationFormula(range.rule, serviceYears, adjustedMonthlySalary, range),
+    compensationFormula: buildCompensationFormula(termination.resultMode, serviceYears, adjustedMonthlySalary, range),
     terminationHint: termination.compensationHint,
     terminationInferredType: termination.inferredType,
     terminationNote: termination.note,
@@ -457,7 +475,7 @@ export const calculateCompensation = (answers: Answers): CalculationResult => {
     levelCopy: persona.copy,
     roast: chooseRoast(answers, serviceYears, midpoint),
     equivalents: chooseWishEquivalents(midpoint, answers.postExitWish, answers.customCity || answers.city),
-    needsFurtherReview: termination.id === "unclear" || termination.riskLevel === "critical" || termination.resultMode === "zeroOrTwoN",
+    needsFurtherReview: termination.id === "unclear" || termination.riskLevel === "critical" || termination.resultMode === "zeroOrN" || termination.resultMode === "zeroOrTwoN",
     terminationReasonId: termination.id
   };
 };
@@ -466,4 +484,5 @@ export const currentMonthValue = () => {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
 };
+
 

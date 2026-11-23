@@ -1,11 +1,11 @@
-const personaImageFileByName: Record<string, string> = {
+﻿const personaImageFileByName: Record<string, string> = {
   "工位出逃饿鬼": "1_1工位出逃饿鬼.png",
   "加班饿狼（已出笼版": "1_2加班饿狼（已出笼版.png",
   "快乐讨债吗喽": "2_1快乐讨债吗喽.png",
   "前司假期难民（烟花破防版": "2_2前司假期难民（烟花破防版.png",
   "窝囊费特种兵": "2_3窝囊废特种兵.png",
   "离职停机躺尸王（峡谷复活版": "3_1离职停机躺尸王（峡谷复活版.png",
-  "996 缺觉熊（冬眠中": "3_3996睡眠难民（冬眠中.png",
+  "996缺觉难民（冬眠中": "3_3996睡眠难民（冬眠中.png",
   "脆皮牛马重装者（硬拉新生中": "4_1脆皮牛马重装者（硬拉新生中.png",
   "健身房复仇者（撸铁版": "4_2健身房复仇者（撸铁版.png",
   "工位陈年健身怪（回炉复建中": "4_3工位陈年健身怪（回炉复建中.png",
@@ -47,3 +47,4 @@ export const getPersonaImageSrc = (personaName: string) =>
 
 export const getPersonaStickerImageSrc = (personaName: string) =>
   `/persona_images2/${encodeURIComponent(getPersonaImageFile(personaName))}`;
+

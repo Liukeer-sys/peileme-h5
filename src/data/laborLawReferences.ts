@@ -30,6 +30,21 @@ export const laborLawArticles: Record<string, LaborLawArticle> = {
       "对劳动合同的无效或者部分无效有争议的，由劳动争议仲裁机构或者人民法院确认。"
     ]
   },
+  article32: {
+    id: "article32",
+    title: "《劳动合同法》第三十二条",
+    lines: [
+      "劳动者拒绝用人单位管理人员违章指挥、强令冒险作业的，不视为违反劳动合同。",
+      "劳动者对危害生命安全和身体健康的劳动条件，有权对用人单位提出批评、检举和控告。"
+    ]
+  },
+  article36: {
+    id: "article36",
+    title: "《劳动合同法》第三十六条",
+    lines: [
+      "用人单位与劳动者协商一致，可以解除劳动合同。"
+    ]
+  },
   article37: {
     id: "article37",
     title: "《劳动合同法》第三十七条",
@@ -90,6 +105,19 @@ export const laborLawArticles: Record<string, LaborLawArticle> = {
       "用人单位依照本条第一款规定裁减人员，在六个月内重新招用人员的，应当通知被裁减的人员，并在同等条件下优先招用被裁减的人员。"
     ]
   },
+  article42: {
+    id: "article42",
+    title: "《劳动合同法》第四十二条",
+    lines: [
+      "劳动者有下列情形之一的，用人单位不得依照本法第四十条、第四十一条的规定解除劳动合同：",
+      "(一)从事接触职业病危害作业的劳动者未进行离岗前职业健康检查，或者疑似职业病病人在诊断或者医学观察期间的；",
+      "(二)在本单位患职业病或者因工负伤并被确认丧失或者部分丧失劳动能力的；",
+      "(三)患病或者非因工负伤，在规定的医疗期内的；",
+      "(四)女职工在孕期、产期、哺乳期的；",
+      "(五)在本单位连续工作满十五年，且距法定退休年龄不足五年的；",
+      "(六)法律、行政法规规定的其他情形。"
+    ]
+  },
   article44: {
     id: "article44",
     title: "《劳动合同法》第四十四条",
@@ -101,6 +129,13 @@ export const laborLawArticles: Record<string, LaborLawArticle> = {
       "(四)用人单位被依法宣告破产的；",
       "(五)用人单位被吊销营业执照、责令关闭、撤销或者用人单位决定提前解散的；",
       "(六)法律、行政法规规定的其他情形。"
+    ]
+  },
+  article45: {
+    id: "article45",
+    title: "《劳动合同法》第四十五条",
+    lines: [
+      "劳动合同期满，有本法第四十二条规定情形之一的，劳动合同应当续延至相应的情形消失时终止。但是，本法第四十二条第二项规定丧失或者部分丧失劳动能力劳动者的劳动合同的终止，按照国家有关工伤保险的规定执行。"
     ]
   },
   article46: {
@@ -203,9 +238,9 @@ const references: Record<string, LaborLawPack> = {
   forced_violence_or_restriction: {
     leafId: "forced_violence_or_restriction",
     result: "N",
-    summary: "单位以暴力、威胁、非法限制人身自由等方式强迫劳动，劳动者可立即解除并通常可主张经济补偿。",
+    summary: "单位以暴力、威胁或非法限制人身自由等手段强迫劳动，劳动者可立即解除，无需事先告知，并通常可主张经济补偿。",
     citations: [
-      { articleId: "article38", highlights: ["暴力、威胁或者非法限制人身自由", "违章指挥、强令冒险作业"] },
+      { articleId: "article38", highlights: ["暴力、威胁或者非法限制人身自由"] },
       { articleId: "article46", highlights: ["(一)"] },
       { articleId: "article47" }
     ]
@@ -213,20 +248,33 @@ const references: Record<string, LaborLawPack> = {
   forced_dangerous_work: {
     leafId: "forced_dangerous_work",
     result: "N",
-    summary: "单位违章指挥、强令冒险作业，劳动者可立即解除并通常可主张经济补偿。",
+    summary: "单位违章指挥、强令冒险作业且危及劳动者人身安全时，劳动者可立即解除，无需事先告知，并通常可主张经济补偿。",
     citations: [
+      { articleId: "article32", highlights: ["违章指挥、强令冒险作业"] },
       { articleId: "article38", highlights: ["违章指挥、强令冒险作业"] },
       { articleId: "article46", highlights: ["(一)"] },
       { articleId: "article47" }
     ]
   },
-  forced_other_reason: {
-    leafId: "forced_other_reason",
-    result: "N",
-    summary: "你选择了其他被迫离职原因，若能证明单位存在违法、违约或严重过错，通常可围绕经济补偿 N 主张权利。",
+  forced_other_or_unclear: {
+    leafId: "forced_other_or_unclear",
+    result: "0 / N",
+    summary: "公司原因暂时无法归入明确的法定被迫解除情形，需要结合具体行为和证据判断；符合第三十八条等法定情形时可能涉及经济补偿 N，否则未必产生补偿。",
     citations: [
       { articleId: "article38" },
       { articleId: "article46", highlights: ["(一)"] },
+      { articleId: "article47" }
+    ]
+  },
+  fault_reason_other_or_unclear: {
+    leafId: "fault_reason_other_or_unclear",
+    result: "0 / 2N",
+    summary: "公司主张的过错理由不明确，需核对解除通知、事实证据、制度依据和解除程序；法定严重过错成立时可能无补偿，理由或证据、程序站不住时可能进入违法解除 2N 争议。",
+    citations: [
+      { articleId: "article39" },
+      { articleId: "article43" },
+      { articleId: "article48" },
+      { articleId: "article87" },
       { articleId: "article47" }
     ]
   },
@@ -273,6 +321,16 @@ const references: Record<string, LaborLawPack> = {
     citations: [
       { articleId: "article48" },
       { articleId: "article87" },
+      { articleId: "article47" }
+    ]
+  },
+  company_proposed_mutual_termination: {
+    leafId: "company_proposed_mutual_termination",
+    result: "N",
+    summary: "用人单位提出并与劳动者协商一致解除劳动合同的，通常可主张经济补偿 N；具体方案还应看补偿金额、付款时间和协议条款。",
+    citations: [
+      { articleId: "article36" },
+      { articleId: "article46", highlights: ["(二)"] },
       { articleId: "article47" }
     ]
   },
@@ -336,6 +394,42 @@ const references: Record<string, LaborLawPack> = {
       { articleId: "article47" }
     ]
   },
+  nofault_medical_article42_protected: {
+    leafId: "nofault_medical_article42_protected",
+    result: "2N",
+    summary: "你属于法律特别保护的情形，公司不能因为“医疗期满后无法从事原工作，或公司另行安排的工作”而解除劳动合同；如果仍然解除，可能构成违法解除。",
+    citations: [
+      { articleId: "article40", highlights: ["(一)"] },
+      { articleId: "article42", highlights: ["不得依照本法第四十条、第四十一条的规定解除劳动合同"] },
+      { articleId: "article47" },
+      { articleId: "article48" },
+      { articleId: "article87" }
+    ]
+  },
+  nofault_incompetent_article42_protected: {
+    leafId: "nofault_incompetent_article42_protected",
+    result: "2N",
+    summary: "你属于法律特别保护的情形，公司不能因为“经过培训或调整岗位后，仍不能胜任工作”而解除劳动合同；如果仍然解除，可能构成违法解除。",
+    citations: [
+      { articleId: "article40", highlights: ["(二)"] },
+      { articleId: "article42", highlights: ["不得依照本法第四十条、第四十一条的规定解除劳动合同"] },
+      { articleId: "article47" },
+      { articleId: "article48" },
+      { articleId: "article87" }
+    ]
+  },
+  nofault_major_change_article42_protected: {
+    leafId: "nofault_major_change_article42_protected",
+    result: "2N",
+    summary: "你属于法律特别保护的情形，公司不能因为“客观情况发生重大变化，双方未能协商变更劳动合同”而解除劳动合同；如果仍然解除，可能构成违法解除。",
+    citations: [
+      { articleId: "article40", highlights: ["(三)"] },
+      { articleId: "article42", highlights: ["不得依照本法第四十条、第四十一条的规定解除劳动合同"] },
+      { articleId: "article47" },
+      { articleId: "article48" },
+      { articleId: "article87" }
+    ]
+  },
   nofault_not_listed_excuse: {
     leafId: "nofault_not_listed_excuse",
     result: "2N",
@@ -356,12 +450,25 @@ const references: Record<string, LaborLawPack> = {
       { articleId: "article47" }
     ]
   },
+  layoff_article42_protected: {
+    leafId: "layoff_article42_protected",
+    result: "2N",
+    summary: "劳动者符合特殊保护情形时，单位不得依据经济性裁员规定解除；仍然解除的，可能构成违法解除。",
+    citations: [
+      { articleId: "article41", highlights: ["提前三十日向工会或者全体职工说明情况"] },
+      { articleId: "article42", highlights: ["不得依照本法第四十条、第四十一条的规定解除劳动合同"] },
+      { articleId: "article48" },
+      { articleId: "article87" },
+      { articleId: "article47" }
+    ]
+  },
   layoff_notice_to_union_or_all_no: {
     leafId: "layoff_notice_to_union_or_all_no",
     result: "2N",
     summary: "经济性裁员未履行法定提前说明或程序，可能构成违法解除。",
     citations: [
       { articleId: "article41", highlights: ["提前三十日向工会或者全体职工说明情况"] },
+      { articleId: "article46", highlights: ["(四)"] },
       { articleId: "article48" },
       { articleId: "article87" },
       { articleId: "article47" }
@@ -374,6 +481,19 @@ const references: Record<string, LaborLawPack> = {
     citations: [
       { articleId: "article44", highlights: ["(一)"] },
       { articleId: "article46", highlights: ["(五)"] },
+      { articleId: "article47" }
+    ]
+  },
+  contract_expired_protected_status: {
+    leafId: "contract_expired_protected_status",
+    result: "2N",
+    summary: "劳动合同期满时存在特殊保护情形的，合同通常应续延至相应情形消失；公司直接终止可能构成违法终止。",
+    citations: [
+      { articleId: "article44", highlights: ["(一)"] },
+      { articleId: "article42" },
+      { articleId: "article45", highlights: ["劳动合同应当续延至相应的情形消失时终止"] },
+      { articleId: "article48" },
+      { articleId: "article87" },
       { articleId: "article47" }
     ]
   },
@@ -415,27 +535,27 @@ const references: Record<string, LaborLawPack> = {
 };
 
 const faultPotLawConfigs: Record<string, { subject: string; citations: LaborLawCitation[] }> = {
-  "试用期没过，说我是不合格的样本呜呜": {
+  "试用期没通过": {
     subject: "试用期不符合录用条件",
     citations: [{ articleId: "article39", highlights: ["(一)"] }]
   },
-  "说我违反制度，而且是严重违纪的级别": {
+  "严重违反公司制度": {
     subject: "严重违反规章制度",
     citations: [{ articleId: "article39", highlights: ["(二)"] }]
   },
-  "说我工作捅了大篓子，重创了公司": {
+  "严重失职，造成重大损失": {
     subject: "严重失职或营私舞弊并造成重大损害",
     citations: [{ articleId: "article39", highlights: ["(三)"] }]
   },
-  "说我脚踏两家公司，没空给本单位干活了": {
+  "还在其他单位工作": {
     subject: "双重劳动关系严重影响本职工作或拒不改正",
     citations: [{ articleId: "article39", highlights: ["(四)"] }]
   },
-  "说我签劳动合同的时候涉及欺骗，我的形象已塌房": {
+  "入职时提供了虚假信息": {
     subject: "订立劳动合同时存在欺诈等导致合同无效的争议",
     citations: [{ articleId: "article39", highlights: ["(五)"] }]
   },
-  "说我现在摊上大事，涉及刑事问题": {
+  "被依法追究刑事责任": {
     subject: "被依法追究刑事责任",
     citations: [{ articleId: "article39", highlights: ["(六)"] }]
   }
@@ -467,11 +587,12 @@ const buildCurrentFaultLaborLawPack = (leafId: string, answers?: Answers): Labor
     return {
       leafId,
       result: "0",
-      summary: `公司主张的是“${potConfig.subject}”。如果事实、制度依据和解除程序都成立，单位可能按过错性解除处理，通常无经济补偿。`,
+      summary: `公司主张的是“${potConfig.subject}”。如果事实、制度依据和解除程序都成立，单位可能按过错性解除处理，通常无经济补偿。但若事实不成立、程度被夸大或程序违法，可能进入违法解除 2N 争议。`,
       citations: [
         ...baseCitations,
         { articleId: "article48" },
-        { articleId: "article47" }
+        { articleId: "article47" },
+        { articleId: "article87" }
       ]
     };
   }
@@ -524,33 +645,34 @@ const ensureArticle46Before47 = (citations: LaborLawCitation[]) => {
   ordered.splice(nextArticle47Index, 0, article46);
   return ordered;
 };
+
+const getArticleNumber = (articleId: string) => {
+  const matched = articleId.match(/\d+/);
+  return matched ? Number(matched[0]) : Number.MAX_SAFE_INTEGER;
+};
+
+const sortCitationsByArticleNumber = (citations: LaborLawCitation[]) =>
+  [...citations].sort((left, right) => getArticleNumber(left.articleId) - getArticleNumber(right.articleId));
+
 const withRequiredReferenceArticles = (pack: LaborLawPack): LaborLawPack => {
   const existing = new Set(pack.citations.map((citation) => citation.articleId));
   const required: LaborLawCitation[] = [];
   const involvesTwoN = pack.result.includes("2N");
   const isFaultDismissal = faultDismissalLeafIds.has(pack.leafId);
+  const isArticle42Protected = pack.leafId.endsWith("_article42_protected");
 
-  if (!isFaultDismissal && !existing.has("article46")) required.push({ articleId: "article46" });
+  if (!isFaultDismissal && !isArticle42Protected && !existing.has("article46")) required.push({ articleId: "article46" });
   if (!existing.has("article47")) required.push({ articleId: "article47" });
   if (involvesTwoN && !existing.has("article48")) required.push({ articleId: "article48" });
   if (involvesTwoN && !existing.has("article87")) required.push({ articleId: "article87" });
 
-  const citations = ensureArticle46Before47(required.length ? [...pack.citations, ...required] : pack.citations);
-  return citations === pack.citations ? pack : { ...pack, citations };
+  const citations = sortCitationsByArticleNumber(
+    ensureArticle46Before47(required.length ? [...pack.citations, ...required] : pack.citations)
+  );
+  return { ...pack, citations };
 };
 
 export const getLaborLawPack = (leafId?: string, answers?: Answers) =>
   withRequiredReferenceArticles((leafId ? buildCurrentFaultLaborLawPack(leafId, answers) ?? references[leafId] : undefined) ?? fallbackLaborLawPack);
 
 export const getLaborLawArticle = (articleId: string) => laborLawArticles[articleId];
-
-
-
-
-
-
-
-
-
-
-

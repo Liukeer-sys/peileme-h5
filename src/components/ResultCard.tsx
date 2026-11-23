@@ -10,6 +10,7 @@ type ResultCardProps = {
   onSticker: (equivalentId: string) => void;
   postExitWish?: string;
   onReselectWish: () => void;
+  reasonStepCount: number;
   selectionSummary?: import("react").ReactNode;
   children?: import("react").ReactNode;
 };
@@ -24,6 +25,26 @@ const renderLevelCopy = (copy: string) =>
       part
     )
   );
+
+const renderFormulaWithNMarker = (formula: string, serviceYears: number) => {
+  const nValue = String(serviceYears);
+  const candidates = [`× ${nValue}`, `（${nValue}`];
+  const matched = candidates
+    .map((token) => ({ token, index: formula.lastIndexOf(token) }))
+    .filter(({ index }) => index >= 0)
+    .sort((left, right) => right.index - left.index)[0];
+
+  if (!matched) return formula;
+
+  const insertAt = matched.index + matched.token.length;
+  return (
+    <>
+      {formula.slice(0, insertAt)}
+      <small className="formula-n-marker">（N）</small>
+      {formula.slice(insertAt)}
+    </>
+  );
+};
 
 function AutoFitPersonaName({ name }: { name: string }) {
   const nameRef = useRef<HTMLHeadingElement | null>(null);
@@ -70,9 +91,27 @@ function AutoFitPersonaName({ name }: { name: string }) {
 
   return <h2 ref={nameRef} title={name}>{name}</h2>;
 }
-function AutoFitAmountRange({ lowAmount, highAmount }: { lowAmount: number; highAmount: number }) {
+function AutoFitAmountRange({
+  lowAmount,
+  highAmount,
+  alternativeLowAmount,
+  alternativeHighAmount,
+  alternativeDisputeLabel
+}: {
+  lowAmount: number;
+  highAmount: number;
+  alternativeLowAmount?: number;
+  alternativeHighAmount?: number;
+  alternativeDisputeLabel?: string;
+}) {
   const amountRef = useRef<HTMLDivElement | null>(null);
-  const label = `${formatMoney(lowAmount)} - ${formatMoney(highAmount)}`;
+  const hasAlternativeRange = alternativeLowAmount !== undefined && alternativeHighAmount !== undefined;
+  const mainLabel = hasAlternativeRange
+    ? `${formatMoney(0)} 或 ${formatMoney(alternativeLowAmount)} - ${formatMoney(alternativeHighAmount)}`
+    : lowAmount === 0 && highAmount === 0
+      ? formatMoney(0)
+      : `${formatMoney(lowAmount)} - ${formatMoney(highAmount)}`;
+  const label = alternativeDisputeLabel ? `${mainLabel}（${alternativeDisputeLabel}）` : mainLabel;
 
   useLayoutEffect(() => {
     const element = amountRef.current;
@@ -84,7 +123,8 @@ function AutoFitAmountRange({ lowAmount, highAmount }: { lowAmount: number; high
         element.style.fontSize = "";
         let size = Number.parseFloat(window.getComputedStyle(element).fontSize) || 52;
         element.style.fontSize = `${size}px`;
-        while (element.scrollWidth > element.clientWidth && size > 36) {
+        const minimumSize = hasAlternativeRange ? 28 : 36;
+        while (element.scrollWidth > element.clientWidth && size > minimumSize) {
           size -= 1;
           element.style.fontSize = `${size}px`;
         }
@@ -99,9 +139,22 @@ function AutoFitAmountRange({ lowAmount, highAmount }: { lowAmount: number; high
       resizeObserver.disconnect();
       window.removeEventListener("resize", fitAmount);
     };
-  }, [label]);
+  }, [hasAlternativeRange, label]);
 
-  return <div className="amount-range" ref={amountRef} title={label}>{label}</div>;
+  return (
+    <div className={`amount-range${hasAlternativeRange ? " is-discrete" : ""}`} ref={amountRef} title={label}>
+      {hasAlternativeRange ? (
+        <>
+          <span className="amount-range-main">
+            <span>{formatMoney(0)}</span>
+            <span className="amount-range-or">或</span>
+            <span>{formatMoney(alternativeLowAmount)} - {formatMoney(alternativeHighAmount)}</span>
+          </span>
+          {alternativeDisputeLabel && <span className="amount-range-dispute">（{alternativeDisputeLabel}）</span>}
+        </>
+      ) : mainLabel}
+    </div>
+  );
 }
 
 function AutoFitEquivalentName({ name }: { name: string }) {
@@ -179,6 +232,70 @@ const splitLifestyleCopy = (copy?: string) => {
     roast: copy.slice(firstSentence[0].length).trim()
   };
 };
+
+function OrphanAwareRoast({ text }: { text: string }) {
+  const textRef = useRef<HTMLSpanElement | null>(null);
+
+  useLayoutEffect(() => {
+    const element = textRef.current;
+    if (!element) return;
+    let frame = 0;
+
+    const readLines = () => {
+      const textNode = element.firstChild;
+      if (!(textNode instanceof Text)) return [] as string[];
+      const lines: Array<{ top: number; text: string }> = [];
+      let offset = 0;
+
+      Array.from(textNode.data).forEach((character) => {
+        const range = document.createRange();
+        const nextOffset = offset + character.length;
+        range.setStart(textNode, offset);
+        range.setEnd(textNode, nextOffset);
+        const rect = range.getBoundingClientRect();
+        offset = nextOffset;
+        if (!rect.width && !rect.height) return;
+
+        const currentLine = lines.find((line) => Math.abs(line.top - rect.top) < 1);
+        if (currentLine) currentLine.text += character;
+        else lines.push({ top: rect.top, text: character });
+      });
+
+      return lines.sort((left, right) => left.top - right.top).map((line) => line.text);
+    };
+
+    const isSingleCharacterPeriodLine = (line = "") => {
+      const compactLine = line.replace(/\s/g, "");
+      return Array.from(compactLine).length === 2 && compactLine.endsWith("。");
+    };
+
+    const fitOrphanEnding = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        element.style.letterSpacing = "";
+        const initialLines = readLines();
+        if (!isSingleCharacterPeriodLine(initialLines[initialLines.length - 1])) return;
+
+        for (let spacing = -0.1; spacing >= -2; spacing -= 0.1) {
+          element.style.letterSpacing = `${spacing.toFixed(1)}px`;
+          if (readLines().length < initialLines.length) return;
+        }
+
+        element.style.letterSpacing = "";
+      });
+    };
+
+    fitOrphanEnding();
+    void document.fonts.ready.then(fitOrphanEnding);
+    window.addEventListener("resize", fitOrphanEnding);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("resize", fitOrphanEnding);
+    };
+  }, [text]);
+
+  return <span className="equivalent-lifestyle-roast" ref={textRef}>{text}</span>;
+}
 
 const renderHighlightedEquivalentLead = (lead: string, count: number) => {
   const countText = String(count);
@@ -314,10 +431,29 @@ export function EquivalentIcon({ id, category, name }: { id: string; category: s
   );
 }
 
-export default function ResultCard({ result, onSticker, postExitWish, onReselectWish, selectionSummary, children }: ResultCardProps) {
+type RuleItemProps = {
+  children: import("react").ReactNode;
+};
+
+function RuleItem({ children }: RuleItemProps) {
+  return <li>{children}</li>;
+}
+
+function CalculationFooter() {
+  return (
+    <div className="calculation-note-stage">
+      <p className="legal-note calculation-note-copy">
+        本结果仅为离职赔偿预评估，不构成正式法律意见。具体金额和风险需结合材料进一步判断。
+      </p>
+    </div>
+  );
+}
+export default function ResultCard({ result, onSticker, postExitWish, onReselectWish, reasonStepCount, selectionSummary, children }: ResultCardProps) {
   const [equivalentIndex, setEquivalentIndex] = useState(0);
   const [personaImageFailed, setPersonaImageFailed] = useState(false);
   const experienceRef = useRef<HTMLElement | null>(null);
+
+
   const personaScrollTarget = useMotionValue(0);
   const personaSpring = useSpring(personaScrollTarget, { stiffness: 245, damping: 10.5, mass: 0.68 });
   const heroScale = useTransform(personaSpring, [0, 1], [1, 0.89]);
@@ -344,6 +480,7 @@ export default function ResultCard({ result, onSticker, postExitWish, onReselect
     let frame = 0;
 
     const updatePersonaMotion = () => {
+      if (scrollParent.scrollLeft !== 0) scrollParent.scrollLeft = 0;
       window.cancelAnimationFrame(frame);
       frame = window.requestAnimationFrame(() => {
         const motionDistance = Math.max(220, scrollParent.clientHeight * 0.42);
@@ -369,6 +506,13 @@ export default function ResultCard({ result, onSticker, postExitWish, onReselect
     if (result.equivalents.length < 2) return;
     setEquivalentIndex((current) => (current + 1) % result.equivalents.length);
   };
+
+  const calculationRules = [
+    <><b>经济补偿年限 N：</b>{result.serviceYears}（按 {result.serviceYears} 个月工资计算）</>,
+    <><b>估算月工资基数：</b>{formatMoney(result.adjustedMonthlySalary)}（{result.salaryBaseFormula}）</>,
+    <><b>可能适用规则：</b>{result.ruleHint}</>,
+    <><b>赔偿计算公式：</b>{renderFormulaWithNMarker(result.compensationFormula, result.serviceYears)}</>,
+  ];
 
   return (
     <section className="result-stack interactive-result" ref={experienceRef}>
@@ -413,7 +557,19 @@ export default function ResultCard({ result, onSticker, postExitWish, onReselect
         <div className="persona-sheet-summary">
           <div className="worth-summary">
             <div className="eyebrow">你的牛马身价（离职赔偿金）</div>
-            <AutoFitAmountRange lowAmount={result.lowAmount} highAmount={result.highAmount} />
+            <AutoFitAmountRange
+              lowAmount={result.lowAmount}
+              highAmount={result.highAmount}
+              alternativeLowAmount={result.alternativeLowAmount}
+              alternativeHighAmount={result.alternativeHighAmount}
+              alternativeDisputeLabel={
+                result.ruleHint === "0 / N 争议区间"
+                  ? "0/N 争议"
+                  : result.ruleHint === "0 / 2N 争议区间"
+                    ? "0/2N 争议"
+                    : undefined
+              }
+            />
           </div>
 
           {postExitWish && (
@@ -422,23 +578,21 @@ export default function ResultCard({ result, onSticker, postExitWish, onReselect
                 <span>离职后，你选择了：</span>
                 <strong>{postExitWish}</strong>
               </div>
-              <button type="button" onClick={onReselectWish}>重选</button>
+              <button className="result-reset-button" type="button" onClick={onReselectWish}>重选</button>
             </div>
           )}
 
           <div className="equivalent-grid" aria-label="赔偿金额等价物">
             {currentEquivalent && (
               <div className="equivalent-pill" key={currentEquivalent.id}>
+                <button className="equivalent-change-button" type="button" onClick={changeEquivalent}>换一换</button>
                 <div className="equivalent-lifestyle-copy">
                   <div className="equivalent-lifestyle-lead">
                     {renderHighlightedEquivalentLead(lifestyleCopy.lead, currentEquivalent.count)}
                   </div>
-                  {lifestyleCopy.roast && <span>{lifestyleCopy.roast}</span>}
+                  {lifestyleCopy.roast && <OrphanAwareRoast text={lifestyleCopy.roast} />}
                 </div>
                 <div className="equivalent-side-actions">
-                  <div className="equivalent-buttons">
-                    <button className="equivalent-change-button" type="button" onClick={changeEquivalent}>换一换</button>
-                  </div>
                   <div className="equivalent-icon" aria-hidden="true">
                     <EquivalentIcon id={currentEquivalent.id} category={currentEquivalent.category} name={currentEquivalent.name} />
                   </div>
@@ -454,7 +608,7 @@ export default function ResultCard({ result, onSticker, postExitWish, onReselect
               onClick={() => currentEquivalent && onSticker(currentEquivalent.id)}
               disabled={!currentEquivalent}
             >
-              生成我的牛马身份贴纸
+              生成我的牛马身份卡
             </button>
             <button
               className="calculation-details-link"
@@ -466,23 +620,43 @@ export default function ResultCard({ result, onSticker, postExitWish, onReselect
           </div>
         </div>
 
-        <div className="info-card persona-calculation-details" id="calculation-details">
-          <div className="card-label">计算过程与规则说明</div>
+        <div className="info-card persona-calculation-details module-section-card" id="calculation-details">
+          <div className="module-section-header">
+            <div className="feature-badge raised-layer raised-layer-square" aria-hidden="true">算</div>
+            <div className="module-section-heading">
+              <h2>计算过程与规则说明</h2>
+              <p>你的赔偿是怎么算出来的？</p>
+            </div>
+          </div>
           {selectionSummary}
-          <div className="card-label calculation-breakdown-label">具体计算过程与规则</div>
-          <ul className="rule-list">
-            <li>工作年限 N：约 {result.serviceYears} 年</li>
-            <li>估算月工资基数：{formatMoney(result.adjustedMonthlySalary)}（{result.salaryBaseFormula}）</li>
-            <li>可能适用规则：{result.ruleHint}</li>
-            <li>原因：{result.ruleReason}</li>
-            <li>赔偿计算公式：{result.compensationFormula}</li>
-          </ul>
-          <p className="legal-note">本结果仅为离职赔偿预评估，不构成正式法律意见。具体金额和风险需结合材料进一步判断。</p>
-        </div>
-      </section>
+          <div className={`calculation-rule-motion ${reasonStepCount % 2 === 0 ? "line-from-left" : "line-from-right"}`}>
+            <ul className="rule-list calculation-rule-copy">
+              {calculationRules.map((rule, index) => (
+                <RuleItem key={index}>{rule}</RuleItem>
+              ))}
+            </ul>
+            <CalculationFooter />
+          </div>
+        </div>      </section>
       {children && <div className="persona-sticky-tail">{children}</div>}
     </section>
   );
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 

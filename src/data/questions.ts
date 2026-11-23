@@ -34,8 +34,8 @@ export const baseQuestions: BaseQuestion[] = [
     message: "下面哪种最接近你的实际工作节奏？",
     kind: "options",
     options: [
-      "基本双休，很少加班",
-      "双休，但不定期加班",
+      "双休不加班",
+      "双休偶尔加班",
       "大小周",
       "单休"
     ]

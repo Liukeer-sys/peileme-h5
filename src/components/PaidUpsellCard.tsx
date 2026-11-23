@@ -1,9 +1,18 @@
-﻿import { useMemo, useState } from "react";
-import { buildEvidenceChecklist, getEvidenceCompleteness, priorityLabels } from "../data/evidenceChecklist";
+﻿import { useEffect, useMemo, useRef, useState } from "react";
+import { motion } from "motion/react";
+import { buildEvidenceChecklist } from "../data/evidenceChecklist";
 import { getLaborLawArticle, getLaborLawPack, type LaborLawArticle, type LaborLawCitation } from "../data/laborLawReferences";
+import { getTerminationReasonNode, rootTerminationReasonNode } from "../data/terminationReasonFlow";
 import type { Answers } from "../types";
 import type { CalculationResult } from "../utils/calculate";
-import { formatMoney } from "../utils/calculate";
+import { loadEvidenceProgress, restoreEvidenceSelections, saveEvidenceProgress } from "../utils/storage";
+import LegalCaseGallery, { CaseSectionIcon } from "./LegalCaseGallery";
+import EvidenceChecklistView from "./EvidenceChecklistView";
+import EvidencePreparation from "./EvidencePreparation";
+import XiaoPeiAvatar from "./XiaoPeiAvatar";
+import DocumentReview from "./DocumentReview";
+import ModuleUnlockDialog from "./ModuleUnlockDialog";
+import { getPresentedCases, formatPresentedCases } from "../data/legalCasePresentation";
 
 type PaidModuleKey = "caseLawPack" | "evidencePack" | "documentReview";
 type CaseLawSectionKey = "laws";
@@ -17,17 +26,9 @@ type LegalCaseReference = {
   evidence: string[];
 };
 
-type ActiveLegalCase = {
-  articleTitle: string;
-  line: string;
-  highlight: string;
-  cases: LegalCaseReference[];
-};
-
 type ExpandedLinkedArticle = {
   article: LaborLawArticle;
   sourceArticleId: string;
-  sourceArticleTitle: string;
 };
 
 type PaidUpsellCardProps = {
@@ -36,7 +37,6 @@ type PaidUpsellCardProps = {
   showIntro?: boolean;
 };
 
-const hrOfferTypes = ["给 N", "给 N+1", "给 2N", "只给工资不赔偿", "要求当天签字", "其他条件"];
 
 const caseLawSections: Array<{
   key: CaseLawSectionKey;
@@ -64,8 +64,14 @@ const noCaseReferenceArticleIds = new Set(["article46", "article47", "article48"
 const noHighlightArticleIds = new Set(["article47"]);
 
 const articleTitleBadges: Record<string, string> = {
-  article46: "赔偿情形官方清单",
-  article47: "计算赔偿官方方法"
+  article39: "公司主张的解除理由",
+  article40: "公司主张的解除理由",
+  article41: "公司主张的裁员理由",
+  article42: "特殊保护限制",
+  article46: "需补偿的合法解除情况",
+  article47: "赔偿通用计算规则",
+  article48: "违法解除后，你可以怎么选",
+  article87: "2N 赔偿依据"
 };
 
 const getArticleTitleBadge = (articleId: string) => articleTitleBadges[articleId];
@@ -80,10 +86,10 @@ const getCitationHighlights = (citation: LaborLawCitation) =>
     ? []
     : citation.highlights?.length ? citation.highlights : defaultHighlightsByArticle[citation.articleId] ?? [];
 
+const normalizeLawText = (value: string) => value.replace(/[（]/g, "(").replace(/[）]/g, ")");
+
 const nestedLawTargets = [
-  { text: '第二十六条', articleId: 'article26' },
-  { text: '第八十七条', articleId: 'article87' },
-  { text: '第四十七条', articleId: 'article47' }
+  { text: '第二十六条', articleId: 'article26' }
 ];
 
 const getCitationCaseReferences = (citation: LaborLawCitation, highlight: string, summary: string): LegalCaseReference[] => {
@@ -251,15 +257,9 @@ const buildLegalDownloadItems = (legalPack: ReturnType<typeof getLaborLawPack>) 
 const renderInlineLinkedLawText = (
   line: string,
   sourceArticleId: string,
-  sourceArticleTitle: string,
-  onLinkedArticle: (article: LaborLawArticle, sourceArticleId: string, sourceArticleTitle: string) => void
+  onLinkedArticle: (article: LaborLawArticle, sourceArticleId: string) => void
 ) => {
-  const linkTargets = [
-    { text: '第四十七条', articleId: 'article47' },
-    { text: "第二十六条", articleId: "article26" },
-    { text: "第八十七条", articleId: "article87" }
-  ];
-  const target = linkTargets.find((item) => line.includes(item.text));
+  const target = nestedLawTargets.find((item) => line.includes(item.text));
   const article = target ? getLaborLawArticle(target.articleId) : undefined;
   if (!target || !article) return line;
 
@@ -274,13 +274,13 @@ const renderInlineLinkedLawText = (
         tabIndex={0}
         onClick={(event) => {
           event.stopPropagation();
-          onLinkedArticle(article, sourceArticleId, sourceArticleTitle);
+          onLinkedArticle(article, sourceArticleId);
         }}
         onKeyDown={(event) => {
           if (event.key !== "Enter" && event.key !== " ") return;
           event.preventDefault();
           event.stopPropagation();
-          onLinkedArticle(article, sourceArticleId, sourceArticleTitle);
+          onLinkedArticle(article, sourceArticleId);
         }}
       >
         {target.text}
@@ -293,86 +293,165 @@ const renderInlineLinkedLawText = (
 const renderLawLine = (
   line: string,
   citation: LaborLawCitation,
-  articleTitle: string,
-  summary: string,
-  onCaseReference: (caseReference: ActiveLegalCase) => void,
-  onLinkedArticle: (article: LaborLawArticle, sourceArticleId: string, sourceArticleTitle: string) => void
+  onLinkedArticle: (article: LaborLawArticle, sourceArticleId: string) => void
 ) => {
-  const matchedHighlight = getCitationHighlights(citation).find((highlight) => line.includes(highlight));
+  const normalizedLine = normalizeLawText(line);
+  const matchedHighlight = getCitationHighlights(citation).find((highlight) => normalizedLine.includes(normalizeLawText(highlight)));
 
   if (matchedHighlight) {
-    if (noCaseReferenceArticleIds.has(citation.articleId)) {
-      return (
-        <p className="legal-article-line highlighted" key={line}>
-          <span className="legal-highlight-label">重点</span>
-          {renderInlineLinkedLawText(line, citation.articleId, articleTitle, onLinkedArticle)}
-        </p>
-      );
-    }
-
     return (
-      <button
-        className="legal-article-line highlighted legal-article-button"
-        key={line}
-        type="button"
-        onClick={() =>
-          onCaseReference({
-            articleTitle,
-            line,
-            highlight: matchedHighlight,
-            cases: getCitationCaseReferences(citation, matchedHighlight, summary)
-          })
-        }
-      >
-        <span className="legal-highlight-label">重点</span>
-        <span>{renderInlineLinkedLawText(line, citation.articleId, articleTitle, onLinkedArticle)}</span>
-        <span className="legal-case-tip">点我看案例参考</span>
-      </button>
+      <p className="legal-article-line highlighted" key={line}>
+        {renderInlineLinkedLawText(line, citation.articleId, onLinkedArticle)}
+      </p>
     );
   }
 
   return (
     <p className="legal-article-line" key={line}>
-      {renderInlineLinkedLawText(line, citation.articleId, articleTitle, onLinkedArticle)}
+      {renderInlineLinkedLawText(line, citation.articleId, onLinkedArticle)}
     </p>
   );
 };
 
-const getSelectedReasonPath = (answers: Answers, result: CalculationResult) => {
-  const rawText = answers.terminationReasonText || result.terminationHint;
-  const seen = new Set<string>();
-  return rawText
-    .split(/\n+/)
-    .map((item) => item.trim())
-    .filter(Boolean)
-    .filter((item) => item !== result.terminationInferredType)
-    .filter((item) => {
-      if (seen.has(item)) return false;
-      seen.add(item);
-      return true;
-    });
+type SelectedReasonStep = {
+  question: string;
+  answer: string;
+  side: "left" | "right";
 };
 
-export function SelectedReasonCard({ result, answers }: Omit<PaidUpsellCardProps, "showIntro">) {
-  const selectedReasonPath = useMemo(() => getSelectedReasonPath(answers, result), [answers, result]);
+const withSelectedReasonSides = (steps: Array<Omit<SelectedReasonStep, "side">>): SelectedReasonStep[] =>
+  steps.map((step, index) => ({ ...step, side: index % 2 === 0 ? "right" : "left" }));
+
+const getSelectedReasonQuestion = (nodeId: string, question: string) =>
+  nodeId.startsWith("ARTICLE_42_") ? "是否属于首保户的特殊情况？" : question;
+
+const getSelectedReasonSteps = (answers: Answers, result: CalculationResult): SelectedReasonStep[] => {
+  const steps: Array<Omit<SelectedReasonStep, "side">> = [];
+  let node = rootTerminationReasonNode;
+  const visited = new Set<string>();
+
+  while (node && !visited.has(node.id)) {
+    visited.add(node.id);
+    const answer = answers.followUps[node.id];
+    if (!answer) break;
+
+    steps.push({ question: getSelectedReasonQuestion(node.id, node.question), answer });
+    const option = node.options.find((item) => item.label === answer);
+    if (!option?.nextId) break;
+
+    const nextNode = getTerminationReasonNode(option.nextId);
+    if (!nextNode) break;
+    node = nextNode;
+  }
+
+  if (steps.length > 0) return withSelectedReasonSides(steps);
+
+  const rawText = answers.terminationReasonText || result.terminationHint;
+  return withSelectedReasonSides(
+    rawText
+      .split(/\n+/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .filter((item) => item !== result.terminationInferredType)
+      .map((answer, index) => ({ question: `第 ${index + 1} 步选择`, answer }))
+  );
+};
+
+export const getSelectedReasonStepCount = (answers: Answers, result: CalculationResult) =>
+  getSelectedReasonSteps(answers, result).length;
+
+const getSelectedReasonCopySize = (answer: string) => {
+  if (answer.length <= 8) return "is-compact";
+  if (answer.length <= 20) return "is-medium";
+  return "is-long";
+};
+
+const getSelectedReasonTurnX = (answer: string, side: SelectedReasonStep["side"]) => {
+  const size = getSelectedReasonCopySize(answer);
+  const inset = size === "is-compact" ? 45 : size === "is-medium" ? 24 : 12;
+  return side === "right" ? 100 - inset : inset;
+};
+
+const buildSelectedReasonRoadPath = (turnXs: number[]) => {
+  if (turnXs.length === 0) return "";
+
+  const rowHeight = 76;
+  let path = `M -4 0 H ${turnXs[0]}`;
+
+  turnXs.forEach((turnX, index) => {
+    const bottom = (index + 1) * rowHeight;
+    path += index % 2 === 0
+      ? ` A 10 38 0 0 1 ${turnX} ${bottom}`
+      : ` A 10 38 0 0 0 ${turnX} ${bottom}`;
+    if (index < turnXs.length - 1) path += ` H ${turnXs[index + 1]}`;
+  });
+
+  return `${path} H ${turnXs.length % 2 === 0 ? 104 : -4}`;
+};
+
+type SelectedReasonStepViewProps = {
+  step: SelectedReasonStep;
+  index: number;
+};
+
+function SelectedReasonStepView({ step, index }: SelectedReasonStepViewProps) {
   return (
-    <div className="selected-reason-card">
-      <span>你刚刚选择的是：</span>
-      <div className="selected-reason-path">
-        {selectedReasonPath.map((item, index) => (
-          <div className="selected-reason-step" key={`${item}-${index}`}>
-            {index > 0 && <small aria-hidden="true">↓</small>}
-            <b>{item}</b>
-          </div>
-        ))}
-      </div>
-      <div className="selected-reason-conclusion">
-        结论：<strong>{result.terminationInferredType}</strong>
+    <div className={`selected-reason-step is-${step.side} ${getSelectedReasonCopySize(step.answer)}`} role="listitem">
+      <span className="selected-reason-marker" aria-hidden="true">{index + 1}</span>
+      <div className="selected-reason-step-copy">
+        <small>{step.question}</small>
+        <b>{step.answer}</b>
       </div>
     </div>
   );
 }
 
+type SelectedReasonConclusionViewProps = {
+  answer: string;
+  side: SelectedReasonStep["side"];
+};
+
+function SelectedReasonConclusionView({ answer, side }: SelectedReasonConclusionViewProps) {
+  return (
+    <div className={`selected-reason-conclusion is-${side} ${getSelectedReasonCopySize(answer)}`} role="listitem">
+      <span className="selected-reason-marker selected-reason-marker-final" aria-hidden="true">✓</span>
+      <div className="selected-reason-conclusion-copy">
+        结论：<strong>{answer}</strong>
+      </div>
+    </div>
+  );
+}
+
+export function SelectedReasonCard({ result, answers }: Omit<PaidUpsellCardProps, "showIntro">) {
+  const selectedReasonSteps = useMemo(() => getSelectedReasonSteps(answers, result), [answers, result]);
+  const nodeCount = selectedReasonSteps.length + 1;
+  const conclusionSide: SelectedReasonStep["side"] = selectedReasonSteps.length % 2 === 0 ? "right" : "left";
+  const roadTurnXs = useMemo(
+    () => [
+      ...selectedReasonSteps.map((step) => getSelectedReasonTurnX(step.answer, step.side)),
+      getSelectedReasonTurnX(result.terminationInferredType, conclusionSide),
+    ],
+    [conclusionSide, result.terminationInferredType, selectedReasonSteps]
+  );
+  const roadPath = useMemo(() => buildSelectedReasonRoadPath(roadTurnXs), [roadTurnXs]);
+
+  return (
+    <div className="selected-reason-card">
+      <span>你刚刚选择的是：</span>
+      <div className="selected-reason-road">
+        <svg className="selected-reason-road-line" viewBox={`0 0 100 ${nodeCount * 76}`} preserveAspectRatio="none" aria-hidden="true">
+          <path className="selected-reason-road-dash" d={roadPath} vectorEffect="non-scaling-stroke" />
+        </svg>
+        <div className="selected-reason-path" role="list">
+          {selectedReasonSteps.map((step, index) => (
+            <SelectedReasonStepView step={step} index={index} key={`${step.question}-${step.answer}-${index}`} />
+          ))}
+          <SelectedReasonConclusionView answer={result.terminationInferredType} side={conclusionSide} />
+        </div>
+      </div>
+    </div>
+  );
+}
 export function PaidNextStepCard() {
   return (
     <div className="paid-intro paid-card paid-next-step-card">
@@ -381,6 +460,75 @@ export function PaidNextStepCard() {
   );
 }
 
+type EvidencePrintDocumentProps = {
+  checklist: ReturnType<typeof buildEvidenceChecklist>;
+  selectedEvidence: Record<string, boolean>;
+  reasonText: string;
+  generatedAt: string;
+};
+
+export function EvidencePrintDocument({ checklist, selectedEvidence, reasonText, generatedAt }: EvidencePrintDocumentProps) {
+  const { sections } = checklist;
+  const allItems = sections.flatMap((section) => section.items);
+  const preparedCount = allItems.filter((item) => selectedEvidence[item.id]).length;
+
+  return (
+    <article className="evidence-print-root" aria-hidden="true">
+      <header className="evidence-print-header">
+        <div>
+          <span>赔了么 · 离职材料整理</span>
+          <h1>{checklist.title ?? "离职证据准备清单"}</h1>
+          <p>{reasonText || checklist.leafText}</p>
+        </div>
+        <div className="evidence-print-progress">
+          <strong>{preparedCount}/{allItems.length}</strong>
+          <span>{checklist.savedLabel ? checklist.savedLabel + "材料" : "已准备材料"}</span>
+        </div>
+      </header>
+
+      <p className="evidence-pack-tip"><CaseSectionIcon kind="tip" />{checklist.userTip}</p>
+
+      <div className="evidence-print-sections">
+        {sections.map((section) => (
+          <section className="evidence-print-section" key={section.id}>
+            <header>
+              <h2>{section.title}</h2>
+            </header>
+            <div>
+              {section.items.map((item) => (
+                <article className="evidence-print-item" key={item.id}>
+                  <span className={selectedEvidence[item.id] ? "evidence-print-check is-ready" : "evidence-print-check"}>
+                    {selectedEvidence[item.id] ? "✓" : "□"}
+                  </span>
+                  <span className="evidence-print-number">{String(allItems.indexOf(item) + 1).padStart(2, "0")}</span>
+                  <div>
+                    <h3>{item.name}{item.priority === "optional" && <em>有则保留</em>}</h3>
+                    <EvidencePreparation item={item} />
+                  </div>
+                </article>
+              ))}
+            </div>
+          </section>
+        ))}
+      </div>
+
+      {checklist.supplementaryEvidence?.map(section => (
+        <section className="evidence-print-section" key={section.id}>
+          <header><h2>{section.title}</h2>{section.description && <p>{section.description}</p>}</header>
+          {section.items.map((item, index) => <article className="evidence-print-item evidence-print-supplement" key={item.id}>
+            <span className="evidence-print-number">{String(index + 1).padStart(2, "0")}</span>
+            <div><h3>{item.name}</h3><EvidencePreparation item={item} /></div>
+          </article>)}
+        </section>
+      ))}
+      <footer className="evidence-print-footer">
+        {checklist.reminder && <p>{checklist.reminder}</p>}
+        <span>生成时间：{generatedAt}</span>
+        <p>本清单用于材料整理参考，不构成正式法律意见。涉及人身安全时，请优先确保安全并及时联系有关部门或专业人士。</p>
+      </footer>
+    </article>
+  );
+}
 export function PaidIntroCard(props: Omit<PaidUpsellCardProps, "showIntro">) {
   return (
     <>
@@ -390,42 +538,20 @@ export function PaidIntroCard(props: Omit<PaidUpsellCardProps, "showIntro">) {
   );
 }
 export default function PaidUpsellCard({ result, answers, showIntro = true }: PaidUpsellCardProps) {
-  const [hrOfferType, setHrOfferType] = useState(hrOfferTypes[1]);
-  const [hrOfferAmount, setHrOfferAmount] = useState("");
-  const [uploadedFiles, setUploadedFiles] = useState<string[]>([]);
   const [selectedEvidence, setSelectedEvidence] = useState<Record<string, boolean>>({});
+  const [evidenceHydratedKey, setEvidenceHydratedKey] = useState("");
+  const [evidenceSaveFailed, setEvidenceSaveFailed] = useState(false);
   const [paidModules, setPaidModules] = useState<Record<PaidModuleKey, boolean>>({
     caseLawPack: false,
     evidencePack: false,
     documentReview: false
   });
   const [paywallModule, setPaywallModule] = useState<PaidModuleKey | null>(null);
-  const [activeLegalCase, setActiveLegalCase] = useState<ActiveLegalCase | null>(null);
   const [expandedLinkedArticles, setExpandedLinkedArticles] = useState<ExpandedLinkedArticle[]>([]);
-  const [activeLinkedArticle, setActiveLinkedArticle] = useState<LaborLawArticle | null>(null);
   const [toast, setToast] = useState("");
 
-  const expectedAmount = Math.round((result.lowAmount + result.highAmount) / 2);
-  const numericOffer = Number(hrOfferAmount || 0);
-  const hrScore = useMemo(() => {
-    if (hrOfferType === "给 2N") return 92;
-    if (hrOfferType === "只给工资不赔偿") return 12;
-    if (hrOfferType === "要求当天签字") return 24;
-    if (numericOffer > 0) return Math.max(8, Math.min(96, Math.round((numericOffer / Math.max(expectedAmount, 1)) * 100)));
-    if (hrOfferType === "给 N+1") return 78;
-    if (hrOfferType === "给 N") return 62;
-    return 42;
-  }, [expectedAmount, hrOfferType, numericOffer]);
-
-  const hrVerdict =
-    hrScore >= 80
-      ? "方案力度还行，但签字前要看有没有放弃追责、保密、竞业和付款时间的坑。"
-      : hrScore >= 50
-        ? "不是完全没给，但离你理论上应得的金额或安全签署条件还有距离。"
-        : "警报偏高。别被“今天签就打款”带节奏，先看条款，再谈金额。";
-
   const evidenceChecklist = useMemo(() => buildEvidenceChecklist(result, answers), [answers, result]);
-  const evidenceCompleteness = getEvidenceCompleteness(evidenceChecklist, selectedEvidence);
+  const visibleEvidenceSelections = evidenceHydratedKey === evidenceChecklist.key ? selectedEvidence : {};
   const legalPack = useMemo(() => getLaborLawPack(result.terminationReasonId, answers), [answers, result.terminationReasonId]);
   const rootLegalCitations = useMemo(() => {
     const nestedArticleIds = new Set<string>();
@@ -439,7 +565,10 @@ export default function PaidUpsellCard({ result, answers, showIntro = true }: Pa
     });
     return legalPack.citations.filter((citation) => !nestedArticleIds.has(citation.articleId));
   }, [legalPack]);
-  const selectedReasonPath = useMemo(() => getSelectedReasonPath(answers, result), [answers, result]);
+  const selectedReasonPath = useMemo(
+    () => getSelectedReasonSteps(answers, result).map((step) => step.answer),
+    [answers, result]
+  );
   const displayedCaseLawSections = useMemo(
     () =>
       caseLawSections.map((section) => ({
@@ -451,17 +580,46 @@ export default function PaidUpsellCard({ result, answers, showIntro = true }: Pa
       })),
     [legalPack]
   );
+  useEffect(() => {
+    const progress = loadEvidenceProgress(result.terminationReasonId);
+    setSelectedEvidence(restoreEvidenceSelections(progress, evidenceChecklist));
+    setEvidenceSaveFailed(false);
+    setPaidModules((current) => ({
+      ...current,
+      evidencePack: Boolean(progress?.evidencePackUnlocked)
+    }));
+    setEvidenceHydratedKey(evidenceChecklist.key);
+  }, [result.terminationReasonId, evidenceChecklist]);
+
+  useEffect(() => {
+    if (evidenceHydratedKey !== evidenceChecklist.key) return;
+    const updatedAt = new Date().toISOString();
+    try {
+      saveEvidenceProgress({
+        version: 1,
+        terminationReasonId: result.terminationReasonId,
+        checklistKey: evidenceChecklist.key,
+        selectedEvidence,
+        evidencePackUnlocked: paidModules.evidencePack,
+        updatedAt
+      });
+      setEvidenceSaveFailed(false);
+    } catch {
+      setEvidenceSaveFailed(true);
+    }
+  }, [evidenceHydratedKey, evidenceChecklist.key, paidModules.evidencePack, result.terminationReasonId, selectedEvidence]);
+
 
   const showToast = (message: string) => {
     setToast(message);
     window.setTimeout(() => setToast(""), 1800);
   };
 
-  const expandLinkedArticle = (article: LaborLawArticle, sourceArticleId: string, sourceArticleTitle: string) => {
+  const expandLinkedArticle = (article: LaborLawArticle, sourceArticleId: string) => {
     const expansionId = 'linked-' + sourceArticleId + '-' + article.id;
     setExpandedLinkedArticles((current) => {
       if (current.some((item) => item.sourceArticleId === sourceArticleId && item.article.id === article.id)) return current;
-      return [...current, { article, sourceArticleId, sourceArticleTitle }];
+      return [...current, { article, sourceArticleId }];
     });
     window.setTimeout(() => document.getElementById(expansionId)?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 0);
   };
@@ -481,17 +639,12 @@ export default function PaidUpsellCard({ result, answers, showIntro = true }: Pa
           id={'linked-' + linkedArticle.sourceArticleId + '-' + linkedArticle.article.id}
           key={linkedArticle.sourceArticleId + '-' + linkedArticle.article.id}
         >
-          <div className={'legal-linked-origin'}>
-            <span>嵌套法条</span>
-            <b>由{linkedArticle.sourceArticleTitle.replace('《劳动合同法》', '')}中的链接展开</b>
-          </div>
-          <h3>{linkedArticle.article.title}</h3>
+          <h3>{linkedArticle.article.title.replace(/^《[^》]+》\s*/, "")}</h3>
           {linkedArticle.article.lines.map((line) => (
             <p className={'legal-article-line'} key={line}>
               {renderInlineLinkedLawText(
                 line,
                 linkedArticle.article.id,
-                linkedArticle.article.title,
                 expandLinkedArticle
               )}
             </p>
@@ -510,13 +663,7 @@ export default function PaidUpsellCard({ result, answers, showIntro = true }: Pa
   const unlockModule = (module: PaidModuleKey) => {
     setPaidModules((current) => ({ ...current, [module]: true }));
     setPaywallModule(null);
-    showToast("已 mock 解锁，完整内容先给你演示出来。");
-  };
-
-  const handleFileChange = (files: FileList | null) => {
-    if (!files?.length) return;
-    setUploadedFiles((current) => [...current, ...Array.from(files).map((file) => file.name)]);
-    showToast("文件已放进待审清单，后续这里接 OCR / 大模型。");
+    showToast("已解锁，感谢支持！");
   };
 
   const toggleEvidence = (item: string) => {
@@ -527,7 +674,8 @@ export default function PaidUpsellCard({ result, answers, showIntro = true }: Pa
     const content = displayedCaseLawSections
       .map((section) => [section.title, ...section.downloadItems.map((item, index) => `${index + 1}. ${item}`)].join("\n"))
       .join("\n\n");
-    const blob = new Blob([`赔了么案例法条包\n\n${content}`], { type: "text/plain;charset=utf-8" });
+    const caseContent = formatPresentedCases(getPresentedCases(result.terminationReasonId, answers).cases);
+    const blob = new Blob([`赔了么案例法条包\n\n${content}${caseContent ? `\n\n参考案例\n\n${caseContent}` : ""}`], { type: "text/plain;charset=utf-8" });
     const url = window.URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
@@ -537,149 +685,144 @@ export default function PaidUpsellCard({ result, answers, showIntro = true }: Pa
     showToast("案例法条包已开始下载。");
   };
 
+  const downloadEvidencePack = () => {
+    const previousTitle = document.title;
+    const restoreTitle = () => {
+      document.title = previousTitle;
+      window.removeEventListener("afterprint", restoreTitle);
+    };
+    const dateLabel = new Date().toISOString().slice(0, 10);
+    document.title = `赔了么-离职证据准备清单-${dateLabel}`;
+    window.addEventListener("afterprint", restoreTitle, { once: true });
+    showToast("正在打开 PDF 保存界面，请选择“存储为 PDF”。");
+    window.setTimeout(() => window.print(), 80);
+    window.setTimeout(restoreTitle, 30000);
+  };
+
   return (
     <section className="paid-section paid-upgrade-section">
       {showIntro && <PaidIntroCard result={result} answers={answers} />}
 
-      <article className={paidModules.caseLawPack ? "paid-card paid-feature-card lavender active" : "paid-card paid-feature-card paid-preview-card lavender active"}>
-        <div className="feature-badge">法</div>
-        <h2>案例法条包</h2>
-        <p className="paid-module-lead">你的这种情况对应劳动法：</p>
+      <article className={paidModules.caseLawPack ? "paid-card paid-feature-card module-section-card lavender active" : "paid-card paid-feature-card module-section-card paid-preview-card lavender active"}>
+        <div className="module-section-header">
+          <div className="feature-badge raised-layer raised-layer-square" aria-hidden="true">法</div>
+          <div className="module-section-heading">
+            <h2>案例法条包</h2>
+            <p>你这种情况对应的劳动法与相关案例</p>
+          </div>
+        </div>
         <div className="case-law-delivery">
           <div className="legal-pack-summary">
             <p>{legalPack.summary}</p>
-            <span>以下法条是根据你的情况，从《劳动合同法》中筛选出来的适配条款。</span>
           </div>
           <div className={paidModules.caseLawPack ? "paid-unlocked-content" : "paid-preview-lock locked-output"}>
-          {rootLegalCitations.map((citation) => {
+          <section className="legal-pack-section" aria-label="与你情况相关的法条（由《劳动合同法》中筛选）">
+          <div className="legal-pack-section-heading">
+            <h3>与你情况相关的法条（由《劳动合同法》中筛选）</h3>
+            <span>{rootLegalCitations.filter(citation => getLaborLawArticle(citation.articleId)).length} 条法条</span>
+          </div>
+          <div className="legal-articles-deck">
+          {rootLegalCitations.map((citation, citationIndex) => {
             const article = getLaborLawArticle(citation.articleId);
             if (!article) return null;
 
             return (
-              <article className="legal-article-card" key={citation.articleId}>
-                <h3>
-                  <span>{article.title}</span>
-                  {getArticleTitleBadge(article.id) && <em className="legal-article-title-badge">{getArticleTitleBadge(article.id)}</em>}
-                </h3>
-                {article.lines.map((line) => renderLawLine(line, citation, article.title, legalPack.summary, setActiveLegalCase, expandLinkedArticle))}
-                {renderExpandedLinkedArticles(citation.articleId)}
+              <article
+                className={`legal-article-card legal-article-card--showcase legal-article-card--${citationIndex % 2 === 0 ? "yellow" : "blue"}`}
+                key={citation.articleId}
+              >
+                <div className="legal-article-layout">
+                  <aside className="legal-article-index" aria-hidden="true">
+                    <strong>{String(citationIndex + 1).padStart(2, "0")}</strong>
+                  </aside>
+                  <div className="legal-article-content">
+                    <h3 className={getArticleTitleBadge(article.id) ? "has-title-badge" : undefined}>
+                      <span>{article.title}</span>
+                      {getArticleTitleBadge(article.id) && <em className="legal-article-title-badge">{getArticleTitleBadge(article.id)}</em>}
+                    </h3>
+                    <div className="legal-article-rule" aria-hidden="true" />
+                    <div className="legal-article-copy">
+                      {article.lines.map((line) =>
+                        renderLawLine(
+                          line,
+                          citation,
+                          expandLinkedArticle
+                        )
+                      )}
+                    </div>
+                    {renderExpandedLinkedArticles(citation.articleId)}
+                  </div>
+                </div>
               </article>
             );
           })}
           </div>
+          </section>
+          <LegalCaseGallery result={result} answers={answers} />
+          </div>
           {paidModules.caseLawPack ? (
-            <button className="download-pack-button" type="button" onClick={downloadCaseLawPack}>
+            <button className="download-pack-button raised-layer raised-layer-primary" type="button" onClick={downloadCaseLawPack}>
               下载案例法条包
             </button>
           ) : (
-            <button className="download-pack-button" type="button" onClick={() => setPaywallModule("caseLawPack")}>
+            <button className="download-pack-button raised-layer raised-layer-primary" type="button" onClick={() => setPaywallModule("caseLawPack")}>
               解锁完整案例法条包
             </button>
           )}
         </div>
-        {!paidModules.caseLawPack && <button className="paid-preview-cta" type="button" onClick={() => setPaywallModule("caseLawPack")}>解锁完整案例法条包</button>}
+        {!paidModules.caseLawPack && <button className="paid-preview-cta raised-layer raised-layer-primary" type="button" onClick={() => setPaywallModule("caseLawPack")}>解锁完整案例法条包</button>}
       </article>
 
-      <article className={paidModules.evidencePack ? "paid-card paid-feature-card active" : "paid-card paid-feature-card paid-preview-card active"}>
-        <div className="feature-badge">证</div>
-        <h2>离职证据包</h2>
-        <p className="paid-module-lead">我需要准备什么证据？</p>
-        <div className="evidence-meter"><span style={{ width: `${evidenceCompleteness}%` }} />证据完整度：{evidenceCompleteness}%</div>
+      <article className={paidModules.evidencePack ? "paid-card paid-feature-card module-section-card active" : "paid-card paid-feature-card module-section-card paid-preview-card active"}>
+        <div className="module-section-header">
+          <div className="feature-badge raised-layer raised-layer-square" aria-hidden="true">证</div>
+          <div className="module-section-heading">
+            <h2>离职证据包</h2>
+            <p>需要准备什么证据？</p>
+          </div>
+        </div>
+        <div className="legal-pack-summary evidence-pack-intro">
+          <p>{evidenceChecklist.userTip}</p>
+        </div>
         {paidModules.evidencePack ? (
           <>
-            <div className="review-output">
-              <strong>重点要证明</strong>
-              {evidenceChecklist.proofFocus.slice(0, 4).map((focus) => <span key={focus}>{focus}</span>)}
-              <b>{evidenceChecklist.userTip}</b>
-              {evidenceChecklist.riskTip && <span>{evidenceChecklist.riskTip}</span>}
-            </div>
-            <div className="evidence-card-list paid-unlocked-content">
-              {[...evidenceChecklist.commonEvidence, ...evidenceChecklist.reasonEvidence].map((section) => (
-                <details className="evidence-card" key={section.id} open={section.id === "termination_fact" || section.id === evidenceChecklist.reasonEvidence[0]?.id}>
-                  <summary>
-                    <strong>{section.title}</strong>
-                    <span>{section.description}</span>
-                  </summary>
-                  <div className="evidence-chip-list">
-                    {section.items.map((item) => (
-                      <label className="evidence-chip" key={item.id} title={`${item.purpose} 可上传：${item.examples.join("、")}`}>
-                        <input type="checkbox" checked={Boolean(selectedEvidence[item.id])} onChange={() => toggleEvidence(item.id)} />
-                        <span>{item.name}</span>
-                        <em>{priorityLabels[item.priority]}</em>
-                      </label>
-                    ))}
-                  </div>
-                </details>
-              ))}
-            </div>
-            <div className="review-output">
-              <strong>证据包摘要</strong>
-              <span>已按你的离职原因生成基础证据和个性化证据清单。</span>
-              <span>勾选已有材料后，可以先看证据完整度；未勾选的必备项就是下一步要补的重点。</span>
+            <EvidenceChecklistView key={evidenceChecklist.key} checklist={evidenceChecklist}
+              selected={visibleEvidenceSelections} onToggle={toggleEvidence} />
+            <div className="evidence-download-panel evidence-download-simple">
+              {evidenceSaveFailed && <small className="evidence-storage-warning" role="alert">
+                进度未能保存到当前设备，刷新后可能丢失。可先下载清单留存。
+              </small>}
+              <button className="download-pack-button raised-layer raised-layer-primary" type="button" onClick={downloadEvidencePack}>下载证据准备清单（PDF）</button>
             </div>
           </>
         ) : (
-          <div className="evidence-preview-panel">
-            <strong>重点要证明</strong>
-            {evidenceChecklist.proofFocus.slice(0, 2).map((focus) => <span key={focus}>{focus}</span>)}
-            <b>{evidenceChecklist.userTip}</b>
+          <div className="legal-pack-section evidence-preview-panel">
+            <div className="legal-pack-section-heading"><h3>{evidenceChecklist.title ?? "证据准备清单"}</h3></div>
             <div className="evidence-preview-tags">
-              {[...evidenceChecklist.commonEvidence, ...evidenceChecklist.reasonEvidence].slice(0, 4).map((section) => (
-                <em key={section.id}>{section.title}</em>
-              ))}
+              {evidenceChecklist.sections[0].items.map(item => <em key={item.id}>{item.name}</em>)}
             </div>
           </div>
         )}
-        {!paidModules.evidencePack && <button className="paid-preview-cta" type="button" onClick={() => setPaywallModule("evidencePack")}>解锁完整离职证据包</button>}
+        {!paidModules.evidencePack && <button className="paid-preview-cta raised-layer raised-layer-primary" type="button" onClick={() => setPaywallModule("evidencePack")}>解锁完整离职证据包</button>}
       </article>
 
-      <article className={paidModules.documentReview ? "paid-card paid-feature-card lavender active" : "paid-card paid-feature-card paid-preview-card lavender active"}>
-        <div className="compact-conscience-head">
-          <div className="feature-badge">签</div>
-          <div>
-            <p className="paid-module-lead">HR给的文件能不能签？</p>
-            <h2>离职文件签署决策</h2>
+      <article className="paid-card paid-feature-card module-section-card document-review-module lavender active">
+        <div className="module-section-header">
+          <div className="feature-badge raised-layer raised-layer-square" aria-hidden="true">签</div>
+          <div className="module-section-heading">
+            <h2>签前文件检查</h2>
+            <p>HR给的文件能不能签？</p>
           </div>
         </div>
-        <p className="compact-conscience-copy">上传解除协议、离职协议或 HR 聊天截图，先看有没有“签了就亏”的风险条款。</p>
-        <div className="inline-fields compact-inline-fields">
-          <select value={hrOfferType} onChange={(event) => setHrOfferType(event.target.value)}>
-            {hrOfferTypes.map((item) => (
-              <option key={item}>{item}</option>
-            ))}
-          </select>
-          <input
-            value={hrOfferAmount}
-            inputMode="numeric"
-            placeholder="HR 报价金额，可不填"
-            onChange={(event) => setHrOfferAmount(event.target.value)}
-          />
-        </div>
-        <div className="score-box conscience-score compact-score-box">
-          <strong>HR 良心指数：{hrScore} / 100</strong>
-          <span>你当前测算中位数：{formatMoney(expectedAmount)}</span>
-          <span>HR 条件：{hrOfferType}{numericOffer > 0 ? `，${formatMoney(numericOffer)}` : ""}</span>
-          <b>{hrVerdict}</b>
-        </div>
-        <label className="upload-box compact-upload">
-          <input type="file" multiple accept="image/*,.pdf" onChange={(event) => handleFileChange(event.target.files)} />
-          <span>{uploadedFiles.length ? `已选择 ${uploadedFiles.length} 个文件` : "上传 HR 文件 / 截图 / PDF"}</span>
-        </label>
-        {uploadedFiles.length > 0 && (
-          <div className="document-list compact-list">
-            {uploadedFiles.slice(0, 3).map((file) => (
-              <span key={file}>已上传：{file}</span>
-            ))}
-          </div>
-        )}
-        <div className={paidModules.documentReview ? "review-output" : "review-output locked-output"}>
-          <strong>整体结论：不建议直接签</strong>
-          <span>可能涉及放弃追责、确认自愿离职、遗漏奖金和年假折算。</span>
-          <span>建议明确补偿金额、付款时间、社保公积金和工资奖金结清方式。</span>
-          {!paidModules.documentReview && <button type="button" onClick={() => setPaywallModule("documentReview")}>解锁签署风险分析</button>}
-        </div>
-        {!paidModules.documentReview && <button className="paid-preview-cta" type="button" onClick={() => setPaywallModule("documentReview")}>解锁签署风险分析</button>}
+        <DocumentReview unlocked={paidModules.documentReview} onUnlock={() => setPaywallModule("documentReview")} />
       </article>
+
+      <EvidencePrintDocument
+        checklist={evidenceChecklist}
+        selectedEvidence={visibleEvidenceSelections}
+        reasonText={selectedReasonPath.join(" → ")}
+        generatedAt={new Intl.DateTimeFormat("zh-CN", { dateStyle: "long", timeStyle: "short" }).format(new Date())}
+      />
 
       <p className="legal-note paid-legal-note">
         本功能仅提供离职协议风险初步识别和材料整理参考，不构成正式法律意见。重大争议或高金额案件建议咨询专业律师。
@@ -687,83 +830,10 @@ export default function PaidUpsellCard({ result, answers, showIntro = true }: Pa
 
       {toast && <div className="paid-toast">{toast}</div>}
 
-      {paywallModule && (
-        <div className="paywall-overlay" role="dialog" aria-modal="true">
-          <div className="paywall-modal paid-card">
-            <div className="card-label">付费内容预览</div>
-            <h2>解锁后查看完整分析</h2>
-            <p>当前先用 mock 解锁演示完整内容，后续这里可以接入微信支付 / 支付宝支付。</p>
-            <button className="primary-button" type="button" onClick={() => unlockModule(paywallModule)}>mock 解锁</button>
-            <button className="ghost-button" type="button" onClick={() => setPaywallModule(null)}>先不解锁</button>
-          </div>
-        </div>
-      )}
+      {paywallModule && <ModuleUnlockDialog onClose={() => setPaywallModule(null)} onConfirm={() => unlockModule(paywallModule)} />}
 
-      {activeLegalCase && (
-        <div className="paywall-overlay" role="dialog" aria-modal="true">
-          <div className="paywall-modal paid-card">
-            <div className="card-label">案例参考</div>
-            <h2>{activeLegalCase.articleTitle}</h2>
-            <p className="legal-selected-line">
-              <strong>你点的是：{activeLegalCase.highlight}</strong>
-              <span>{activeLegalCase.line}</span>
-            </p>
-            <div className="legal-case-reference-list">
-              {activeLegalCase.cases.map((item) => (
-                <article className="legal-case-reference-card" key={item.title}>
-                  <h3>{item.title}</h3>
-                  <p><b>场景：</b>{item.scenario}</p>
-                  <p><b>争议重点：</b>{item.focus}</p>
-                  <p><b>建议证据：</b>{item.evidence.join("、")}</p>
-                </article>
-              ))}
-            </div>
-            <button className="primary-button" type="button" onClick={() => setActiveLegalCase(null)}>返回法条</button>
-          </div>
-        </div>
-      )}
-
-      {activeLinkedArticle && (
-        <div className="paywall-overlay" role="dialog" aria-modal="true">
-          <div className="paywall-modal paid-card">
-            <div className="card-label">嵌套法条</div>
-            <h2>{activeLinkedArticle.title}</h2>
-            <div className="legal-article-list linked-article-lines">
-              {activeLinkedArticle.lines.map((line) => (
-                <p className="legal-article-line" key={line}>{line}</p>
-              ))}
-            </div>
-            <button className="primary-button" type="button" onClick={() => setActiveLinkedArticle(null)}>返回第三十九条</button>
-          </div>
-        </div>
-      )}
     </section>
   );
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 

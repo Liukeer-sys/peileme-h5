@@ -3,6 +3,10 @@ node_modules/
 
 # Build output
 dist/
+.vercel/
+work/vercel-demo/
+work/document-review-smoke/
+work/file-input-smoke/
 
 # Environment variables
 .env

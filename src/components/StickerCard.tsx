@@ -5,12 +5,15 @@ import { getEquivalentIconSrc } from "../data/equivalentIconMap";
 import type { CalculationResult } from "../utils/calculate";
 import { getPersonaPunchline, getPersonaStickerImageSrc } from "../utils/persona";
 import { createQrDataUrl, getShareUrl } from "../utils/shareQr";
+import demoQr from "../assets/sticker-demo-qr.gif";
 
 type StickerCardProps = {
   result: CalculationResult;
   equivalentId: string | null;
   onClose: () => void;
 };
+
+const stickerSerifFont = "'Peileme Noto Serif SC', 'Noto Serif SC', 'Source Han Serif SC', 'Songti SC', STSong, SimSun, serif";
 
 const pileOffsets = [
   { x: 0, y: 0, r: 0 },
@@ -128,8 +131,9 @@ export default function StickerCard({ result, equivalentId, onClose }: StickerCa
   const shareUrl = useMemo(getShareUrl, []);
 
   useEffect(() => {
+    if (!shareUrl) return;
     let active = true;
-    void createQrDataUrl(shareUrl, 6).then((dataUrl) => {
+    void createQrDataUrl(shareUrl, 6).catch(() => "").then((dataUrl) => {
       if (active) setQrDataUrl(dataUrl);
     });
     return () => {
@@ -141,6 +145,9 @@ export default function StickerCard({ result, equivalentId, onClose }: StickerCa
     if (!featuredEquivalent || isSaving) return;
     setIsSaving(true);
     try {
+      await document.fonts.load("700 32px 'Peileme Noto Serif SC'");
+      await document.fonts.ready;
+
       const canvas = document.createElement("canvas");
       const width = 1080;
       const height = 1440;
@@ -149,11 +156,7 @@ export default function StickerCard({ result, equivalentId, onClose }: StickerCa
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
 
-      const bg = ctx.createLinearGradient(0, 0, width, height);
-      bg.addColorStop(0, "#d8c6a3");
-      bg.addColorStop(0.48, "#ead6aa");
-      bg.addColorStop(1, "#efe4c9");
-      ctx.fillStyle = bg;
+      ctx.fillStyle = "#f1ebdb";
       ctx.fillRect(0, 0, width, height);
 
       ctx.fillStyle = "rgba(255,255,255,0.28)";
@@ -192,39 +195,45 @@ export default function StickerCard({ result, equivalentId, onClose }: StickerCa
 
       ctx.textAlign = "left";
       ctx.fillStyle = "rgba(255,255,255,0.74)";
-      ctx.font = "800 32px 'Microsoft YaHei', sans-serif";
+      ctx.font = `800 32px ${stickerSerifFont}`;
       ctx.fillText("你的牛马身份", 96, 850);
       ctx.fillStyle = "#ffffff";
       let levelFontSize = 58;
-      ctx.font = `950 ${levelFontSize}px 'Microsoft YaHei', sans-serif`;
+      ctx.font = `950 ${levelFontSize}px ${stickerSerifFont}`;
       while (ctx.measureText(result.level).width > 888 && levelFontSize > 32) {
         levelFontSize -= 2;
-        ctx.font = `950 ${levelFontSize}px 'Microsoft YaHei', sans-serif`;
+        ctx.font = `950 ${levelFontSize}px ${stickerSerifFont}`;
       }
       ctx.fillText(result.level, 96, 914);
 
       ctx.fillStyle = "#ffffff";
-      ctx.font = "900 29px 'Microsoft YaHei', sans-serif";
+      ctx.font = `900 29px ${stickerSerifFont}`;
       const punchlineLines = getWrappedLines(ctx, punchline, 880, 2);
       const punchlineStartY = 986 - ((punchlineLines.length - 1) * 20);
       punchlineLines.forEach((line, index) => ctx.fillText(line, 96, punchlineStartY + index * 40));
 
       ctx.textAlign = "left";
       ctx.fillStyle = "#6d7785";
-      ctx.font = "850 32px 'Microsoft YaHei', sans-serif";
+      ctx.font = `850 32px ${stickerSerifFont}`;
       ctx.fillText("你的牛马身价约等于", 74, 1164);
-      ctx.fillStyle = "#29384d";
-      ctx.font = "950 80px 'Microsoft YaHei', sans-serif";
-      ctx.fillText(`${featuredEquivalent.count}${featuredEquivalent.unit}`, 74, 1250);
-      ctx.font = "900 34px 'Microsoft YaHei', sans-serif";
+      ctx.fillStyle = "#4a3518";
+      const worthText = `${featuredEquivalent.count}${featuredEquivalent.unit}`;
+      let worthFontSize = 72;
+      ctx.font = `950 ${worthFontSize}px ${stickerSerifFont}`;
+      while (ctx.measureText(worthText).width > 320 && worthFontSize > 48) {
+        worthFontSize -= 2;
+        ctx.font = `950 ${worthFontSize}px ${stickerSerifFont}`;
+      }
+      ctx.fillText(worthText, 74, 1250);
+      ctx.font = `900 34px ${stickerSerifFont}`;
       drawWrappedText(ctx, featuredEquivalent.name, 74, 1302, 330, 42, 2);
 
       const iconSrc = getEquivalentIconSrc(featuredEquivalent.id, featuredEquivalent.name);
       if (iconSrc) {
         try {
           const image = await loadImage(iconSrc);
-          const iconSize = 310;
-          const baseX = 330;
+          const iconSize = 292;
+          const baseX = 339;
           const baseY = 1098;
           for (let index = pileCount - 1; index >= 0; index -= 1) {
             const offset = pileOffsets[index] || pileOffsets[pileOffsets.length - 1];
@@ -242,23 +251,23 @@ export default function StickerCard({ result, equivalentId, onClose }: StickerCa
         }
       }
       if (equivalentCount > maxVisiblePile) {
-        ctx.fillStyle = "rgba(47,41,54,0.9)";
-        roundRect(ctx, 564, 1302, 114, 56, 28);
+        ctx.fillStyle = "rgba(74,53,24,0.9)";
+        roundRect(ctx, 555, 1294, 114, 56, 28);
         ctx.fill();
         ctx.fillStyle = "#ffffff";
         ctx.textAlign = "center";
-        ctx.font = "900 27px 'Microsoft YaHei', sans-serif";
-        ctx.fillText(`×${featuredEquivalent.count}`, 621, 1339);
+        ctx.font = `900 27px ${stickerSerifFont}`;
+        ctx.fillText(`×${featuredEquivalent.count}`, 612, 1331);
       }
 
-      const finalQrDataUrl = qrDataUrl || await createQrDataUrl(shareUrl, 8);
-      const qrImage = await loadImage(finalQrDataUrl);
+      const qrSource = qrDataUrl || (shareUrl ? await createQrDataUrl(shareUrl, 8).catch(() => demoQr) : demoQr);
+      const qrImage = await loadImage(qrSource);
       ctx.drawImage(qrImage, 810, 1148, 154, 154);
       ctx.textAlign = "center";
-      ctx.fillStyle = "#29384d";
-      ctx.font = "900 25px 'Microsoft YaHei', sans-serif";
+      ctx.fillStyle = "#4a3518";
+      ctx.font = `900 25px ${stickerSerifFont}`;
       ctx.fillText("扫码测测", 887, 1340);
-      ctx.font = "900 22px 'Microsoft YaHei', sans-serif";
+      ctx.font = `900 22px ${stickerSerifFont}`;
       ctx.fillText("你的牛马身份", 887, 1373);
 
       const link = document.createElement("a");
@@ -316,7 +325,7 @@ export default function StickerCard({ result, equivalentId, onClose }: StickerCa
             </section>
 
             <section className="sticker-qr">
-              {qrDataUrl ? <img src={qrDataUrl} alt="测试二维码" /> : <div className="sticker-qr-loading" />}
+              <img src={qrDataUrl || demoQr} alt={qrDataUrl ? "分享二维码" : "演示用二维码"} />
               <strong>扫码测测</strong>
               <span>你的牛马身份</span>
             </section>
@@ -325,11 +334,12 @@ export default function StickerCard({ result, equivalentId, onClose }: StickerCa
 
         <div className="sticker-actions">
           <button className="save-sticker-button" type="button" onClick={saveSticker} disabled={isSaving || !featuredEquivalent}>
-            {isSaving ? "正在生成图片" : "保存图片发朋友圈/状态"}
+            {isSaving ? "正在生成图片" : "保存你的牛马身份卡"}
           </button>
-          <p>人格是主角，身价和测试入口都收在下方。</p>
+          <p>欢迎转发给朋友一起测着玩，看看大家的牛马身价和身份。</p>
         </div>
       </div>
     </div>
   );
 }
+

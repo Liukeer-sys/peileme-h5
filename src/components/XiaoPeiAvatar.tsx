@@ -1,5 +1,10 @@
-import type { CSSProperties } from "react";
+import { useState, type CSSProperties } from "react";
 import type { XiaoPeiAvatarState } from "../constants/xiaopeiAvatarStates";
+import questionAvatar from "../assets/xiaopei/question.png";
+import smirkAvatar from "../assets/xiaopei/smirk.png";
+import roastAvatar from "../assets/xiaopei/roast.png";
+import shockedAvatar from "../assets/xiaopei/shocked.png";
+import normalAvatar from "../assets/xiaopei/normal.png";
 
 type XiaoPeiAvatarProps = {
   state: XiaoPeiAvatarState;
@@ -19,18 +24,41 @@ const stateLabel: Record<XiaoPeiAvatarState, string> = {
 };
 
 const avatarImageByState: Record<XiaoPeiAvatarState, string> = {
-  idle: "发问1.png",
-  smirk: "得意1.png",
-  eye_roll: "吐槽1.png",
-  shocked: "震惊1.png",
-  angry: "吐槽1.png",
-  calculating: "正常1.png",
-  warning: "吐槽1.png",
-  result: "得意1.png"
+  idle: questionAvatar,
+  smirk: smirkAvatar,
+  eye_roll: roastAvatar,
+  shocked: shockedAvatar,
+  angry: roastAvatar,
+  calculating: normalAvatar,
+  warning: roastAvatar,
+  result: smirkAvatar
 };
 
+function AvatarImage({ src, size }: { src: string; size: number }) {
+  const [failureCount, setFailureCount] = useState(0);
+  const currentSrc = failureCount === 0 ? src : normalAvatar;
+
+  // 备用图片也失败时使用不依赖网络的占位，避免无限重试和整块留白。
+  if (failureCount >= 2 || (failureCount === 1 && src === normalAvatar)) {
+    return <span className="xiaopei-face xiaopei-face-fallback" aria-hidden="true">赔</span>;
+  }
+  return (
+    <img
+      className="xiaopei-face"
+      src={currentSrc}
+      width={size}
+      height={size}
+      loading="eager"
+      decoding="async"
+      alt=""
+      aria-hidden="true"
+      onError={() => setFailureCount((count) => count + 1)}
+    />
+  );
+}
+
 export default function XiaoPeiAvatar({ state, showName = false, size = 34 }: XiaoPeiAvatarProps) {
-  const imageSrc = `/head/${encodeURIComponent(avatarImageByState[state])}`;
+  const imageSrc = avatarImageByState[state] || questionAvatar;
 
   return (
     <div
@@ -40,7 +68,7 @@ export default function XiaoPeiAvatar({ state, showName = false, size = 34 }: Xi
       role="img"
     >
       {showName && <span className="xiaopei-name">小赔</span>}
-      <img className="xiaopei-face" src={imageSrc} alt="" aria-hidden="true" />
+      <AvatarImage key={imageSrc} src={imageSrc} size={size} />
     </div>
   );
 }

@@ -2268,7 +2268,7 @@ export const travelEquivalents = makeItems("see_the_world", "去看看世界", [
     name: "东京之旅",
     unitPrice: 15000,
     unit: "趟",
-    text: "够你去 {count} 趟东京。把晚上的时间交给主厨，再也别献给老板。",
+    text: "够你去 {count} 趟东京。把晚上的时间交给 omakase 主厨，再也别献给老板。",
     tier: "high",
     tags: ["tokyo", "omakase", "travel"]
   },
@@ -2341,10 +2341,10 @@ export const travelEquivalents = makeItems("see_the_world", "去看看世界", [
 export const upgradeEquivalents = makeItems("self_upgrade", "装备升级", [
   {
     id: "rtx_5090_d_v2",
-    name: "RTX 5090 D v2 显卡",
+    name: "RTX 5090 显卡",
     unitPrice: 16500,
     unit: "张",
-    text: "够你买 {count} 张 RTX 5090 D v2 显卡。白天学新技能，晚上开全画质奖励一下自己。",
+    text: "够你买 {count} 张 RTX 5090 显卡。白天学新技能，晚上开全画质奖励一下自己。",
     tier: "high",
     tags: ["gpu", "computer"]
   },

@@ -12,7 +12,7 @@ export type TerminationType = {
   inferredType: string;
   riskLevel: "low" | "medium" | "high" | "critical" | "unknown";
   compensationHint: string;
-  resultMode: "n" | "nPlusOne" | "twoN" | "zeroRisk" | "zeroOrTwoN" | "range";
+  resultMode: "n" | "nPlusOne" | "twoN" | "zeroRisk" | "zeroOrN" | "zeroOrTwoN" | "range";
   followUpQuestions: FollowUpQuestion[];
   note: string;
 };
@@ -120,7 +120,7 @@ export const getTerminationType = (id?: string) =>
       id: leaf.id,
       label: leaf.label,
       inferredType: leaf.inferredType,
-      riskLevel: leaf.resultMode === "twoN" ? "high" : leaf.resultMode === "zeroRisk" || leaf.resultMode === "zeroOrTwoN" ? "critical" : "medium",
+      riskLevel: leaf.resultMode === "twoN" ? "high" : leaf.resultMode === "zeroRisk" || leaf.resultMode === "zeroOrN" || leaf.resultMode === "zeroOrTwoN" ? "critical" : "medium",
       compensationHint: leaf.compensationHint,
       resultMode: leaf.resultMode,
       followUpQuestions: [],
